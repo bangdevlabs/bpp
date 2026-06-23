@@ -6,17 +6,21 @@
 // compiler's own stdout while compiling it, captured and checked by
 // tests/test_regalloc_linscan.sh.
 //
-// Same three shapes as the earlier stages' fixtures — their intervals
-// were already hand-derived and verified there; this file's own
+// Same four shapes as the earlier stages' fixtures — their intervals
+// were already hand-derived and verified there (statement-level
+// positions, with live-range splitting where a gap exists — see
+// tests/test_regalloc_intervals.bpp's own comments); this file's own
 // comments re-derive the expected slot assignments from those
 // already-confirmed [start_pos, end_pos] ranges by hand-tracing
 // regalloc_linear_scan's own algorithm (sort by start, scan, expire,
 // assign-or-spill).
 
-// vi: a=0,b=1,x=2,y=3, all interval [0,0] (tied start_pos -- scan
-// keeps their original var_idx-ascending order). None expires before
-// the next is assigned (0 < 0 is false), so all four get distinct
-// slots in order: a->0, b->1, x->2, y->3.
+// vi: a=0 [0,1], b=1 [0,2], x=2 [1,2], y=3 [2,3]. Sort by start_pos:
+// a(0), b(0,tie keeps var_idx order), x(1), y(2). a->slot0. b->slot1
+// (a hasn't expired: end1<start0 false). x(start1): a's end1<1 false,
+// b's end2<1 false -- nothing expires, x->slot2. y(start2): a's
+// end1<2 TRUE -- a expires, slot0 freed; b's end2<2 false; x's
+// end2<2 false. y takes the just-freed slot0.
 __rg_asn_straightline(a, b) -> word {
     auto x, y;
     x = a + 1;
@@ -24,8 +28,25 @@ __rg_asn_straightline(a, b) -> word {
     return y;
 }
 
-// vi: n=0,i=1,sum=2, all interval [0,4] (tied start_pos again, same
-// reasoning) -> n->0, i->1, sum->2.
+// vi: n -> [0,3] and [5,6] (split); i -> [1,3] and [5,6] (split); sum
+// -> [2,6] (contiguous). _rg_sort_order_by_start is a selection sort
+// that swaps on every strictly-smaller match, not just the eventual
+// minimum -- with a tie at start_pos=5 (n's 2nd interval and i's 2nd
+// interval) followed by a non-adjacent smaller element (sum, start2)
+// further along, the tied pair's RELATIVE order can flip from their
+// original insertion order. Hand-tracing the exact algorithm (not
+// assumed stable) gives scan order [n1, i1, sum, i2, n2] -- i's
+// second interval BEFORE n's second interval, reversed from insertion
+// order. n1(start0)->slot0. i1(start1): n1 hasn't expired -> slot1.
+// sum(start2): nothing expired -> slot2. i2(start5): n1(end3) and
+// i1(end3) both expire (slot0, slot1 freed, in that push order) ->
+// LIFO free_slots hands i2 the most recently freed, slot1 (i1's own
+// old slot). n2(start5): nothing new expired -> takes the remaining
+// free slot0 (n1's own old slot). Net effect: each variable's split
+// pieces happen to land back on their OWN original slot here, not
+// because splitting guarantees that, but because no OTHER variable's
+// interval was competing for it at the right moment in this specific
+// case.
 __rg_asn_loop(n) -> word {
     auto i, sum;
     i = 0;
@@ -37,15 +58,25 @@ __rg_asn_loop(n) -> word {
     return sum;
 }
 
-// vi: a=0 [0,2], q=2 [1,1], p=1 [2,2]. Scan order by start_pos: a, q,
-// p. a->slot 0. q->slot 1 (a hasn't expired: end 2 < start 1 is
-// false). At p's turn (start_pos=2): q's end_pos (1) < p's start_pos
-// (2) is TRUE -- q expires, slot 1 returns to the free pool; a's end
-// (2) < 2 is false, a stays active. p then takes the just-freed slot
-// 1 -- THE SAME slot q held. This is the load-bearing check: p and q
-// share a physical slot because their intervals never overlap, the
-// exact thing B3 cannot see (it only counts total references, with no
-// notion of when a variable is alive).
+// vi: a -> [0,2] and [4,4] (split around the if-arm's mutually-
+// exclusive sibling); q -> [2,3]; p -> [4,5]. _rg_sort_order_by_start's
+// swap-on-every-smaller-match selection sort (see __rg_asn_loop's own
+// comment on this -- it isn't simple insertion-order-stable once a
+// non-adjacent smaller element appears between a tied pair) puts q
+// (start2) ahead of a's[4,4] AND p (both start4), and resolves THEIR
+// tie as p before a's[4,4] -- hand-traced exact scan order: a's[0,2],
+// q, p, a's[4,4].
+//
+// a's[0,2] -> slot0. q(start2): a's[0,2] hasn't expired (end2<2
+// false) -- nothing expires, q -> slot1. p(start4): a's[0,2]'s end2<4
+// TRUE -- it expires, slot0 freed; q's end3<4 TRUE -- it expires too,
+// slot1 freed. p takes slot1 (LIFO free_slots: the most recently
+// freed, q's own old slot) -- THE SAME slot q held. This is the
+// load-bearing check: p and q share a physical slot because their
+// intervals never overlap, the exact thing B3 cannot see (it only
+// counts total references, with no notion of when a variable is
+// alive). a's[4,4](start4): nothing new expired -- takes the
+// remaining free slot0 (its own earlier slot).
 __rg_asn_nonoverlap(a) -> word {
     auto p, q;
     if (a > 0) {
@@ -56,15 +87,23 @@ __rg_asn_nonoverlap(a) -> word {
     return q;
 }
 
+// A call with no arguments that just returns 0 -- exists purely to
+// keep __rg_asn_spill NON-LEAF (cg_fn_leaf clears on any T_CALL),
+// since the budget passed to regalloc_linear_scan mirrors B3's own
+// leaf/non-leaf distinction (10 vs 14) for a fair comparison. Without
+// this, a parameter-only function with no calls is leaf and gets
+// budget 14, needing 15 params instead of 11 to force a spill.
+static _rg_spill_noop() -> word { return 0; }
+
 // 11 parameters, all read only in the closing sum -> all 11 share the
-// SAME [0, N] interval (tied start AND end). Against budget=10
-// (today's shadow-mode stand-in for the a64 non-leaf integer pool,
-// hardcoded in bpp_codegen.bsm's call site), the first 10 (var_idx
-// 0..9, scan order ties keep var_idx-ascending order) fill every slot;
-// the 11th (var_idx 10) arrives with nothing free and no active
-// interval whose end_pos exceeds its own (every end_pos is tied) --
-// so it, not an earlier one, is the one that spills.
+// SAME [0, N] interval (tied start AND end). Against budget=10 (the
+// non-leaf integer pool, forced by the no-op call above), the first
+// 10 (var_idx 0..9, scan order ties keep var_idx-ascending order) fill
+// every slot; the 11th (var_idx 10) arrives with nothing free and no
+// active interval whose end_pos exceeds its own (every end_pos is
+// tied) -- so it, not an earlier one, is the one that spills.
 __rg_asn_spill(a, b, c, d, e, f, g, h, i, j, k) -> word {
+    _rg_spill_noop();
     return a + b + c + d + e + f + g + h + i + j + k;
 }
 

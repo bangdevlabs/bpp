@@ -264,6 +264,27 @@ honestly rather than dismissed — four new unconditional per-function passes
 (CFG + liveness + RPO + intervals) have a real, small, non-zero cost.
 Revisit if a future stage's win doesn't clearly outweigh it.
 
+**Update, same day** — Stage C was rebuilt twice more after the above
+measurement (statement-level granularity, then live-range splitting —
+see the commit this paragraph ships with for why: a real false-
+regression found via `regalloc_compare_vs_b3`'s own systematic sweep,
+traced to block-level granularity collapsing many sequential
+definitions onto one shared position). Each rebuild adds real, if
+small, work per statement:
+
+```
+AFTER  (+ instr. granularity + splitting): bootstrap min 0.28s, median 0.30s (10 runs)
+```
+
+Still small in absolute terms (~0.02-0.03s over the pre-arc baseline),
+and the analysis it buys is real (the systematic B3 comparison's
+regression count dropped from 567 false positives to 27 genuine
+budget-limited cases across the compiler's own self-compile — see the
+commit message for the full trace). Continue watching this number as
+later stages add work; Stage E (the actual codegen swap) is the point
+where this cost needs to be weighed against a real measured win, not
+before.
+
 ### Autovectorisation + outlining (parallel)
 
 | Benchmark | Measures | Run | Good |

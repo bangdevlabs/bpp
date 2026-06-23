@@ -51,6 +51,12 @@ struct CfgBlock {
     stmts,      // arr_new()-style growable array of statement-node pointers
     succ_a,     // -1 if none
     succ_b,     // -1 if none
+    dead,       // 1 if unreachable BY CONSTRUCTION (the tail allocated
+                // right after a T_RET/T_BREAK/T_CONTINUE) -- never link
+                // ANY successor to it, even though it starts with the
+                // same succ_a<0 && succ_b<0 shape a genuinely open block
+                // has. See _rg_link_fallthrough's own comment for the
+                // phantom-edge bug this field exists to prevent.
     use_bits,   // read in this block before any def in the SAME block
     def_bits,   // written somewhere in this block
     live_in,    // live at block entry
@@ -86,10 +92,31 @@ static _rg_new_block() {
     b.stmts = arr_new();
     b.succ_a = -1;
     b.succ_b = -1;
+    b.dead = 0;
     b.use_bits = 0;
     b.def_bits = 0;
     b.live_in = 0;
     b.live_out = 0;
+    return idx;
+}
+
+// Allocate the "unreachable tail" block that follows a T_RET/T_BREAK/
+// T_CONTINUE. Execution can never actually fall into it (the statement
+// right before it always transfers control away unconditionally), so
+// it is marked dead immediately — _rg_link_fallthrough must never wire
+// a real edge to it, even though right after allocation it has the
+// exact same succ_a<0 && succ_b<0 shape a genuinely still-open block
+// has. Found by hand-tracing stb/stbdraw.bsm's blend_px (four
+// sequential early-return ifs): without this, _rg_link_fallthrough
+// linked each dead tail to the NEXT if's join block, fabricating a
+// phantom edge that made every later variable look live across the
+// whole chain — corrupting liveness for the rest of the function, not
+// just at that one tail.
+static _rg_new_dead_block() {
+    auto idx, b: CfgBlock;
+    idx = _rg_new_block();
+    b = arr_struct_at(rg_blocks, idx);
+    b.dead = 1;
     return idx;
 }
 
@@ -121,7 +148,7 @@ static void _rg_set_succ(blk, a, b_) {
 static void _rg_link_fallthrough(blk, target) {
     auto b: CfgBlock;
     b = arr_struct_at(rg_blocks, blk);
-    if (b.succ_a < 0 && b.succ_b < 0) { b.succ_a = target; }
+    if (b.dead == 0 && b.succ_a < 0 && b.succ_b < 0) { b.succ_a = target; }
 }
 
 // Build the CFG for one statement, updating rg_cur_block to whatever
@@ -202,10 +229,10 @@ static _rg_build_stmt(nd) {
         if (arr_len(rg_break_stack) > 0) {
             _rg_set_succ(rg_cur_block, arr_last(rg_break_stack), -1);
         }
-        rg_cur_block = _rg_new_block();   // unreachable tail, kept so a
-                                          // statement after `break;` in
-                                          // the same arm still has
-                                          // somewhere safe to land
+        // Dead tail, kept so a statement after `break;` in the same
+        // arm still has somewhere safe to land — but never linkable
+        // (see _rg_new_dead_block's own comment).
+        rg_cur_block = _rg_new_dead_block();
         return 0;
     }
 
@@ -214,14 +241,14 @@ static _rg_build_stmt(nd) {
         if (arr_len(rg_continue_stack) > 0) {
             _rg_set_succ(rg_cur_block, arr_last(rg_continue_stack), -1);
         }
-        rg_cur_block = _rg_new_block();
+        rg_cur_block = _rg_new_dead_block();
         return 0;
     }
 
     if (t == T_RET) {
         _rg_emit(nd);
         _rg_set_succ(rg_cur_block, -1, -1);
-        rg_cur_block = _rg_new_block();
+        rg_cur_block = _rg_new_dead_block();
         return 0;
     }
 
@@ -666,76 +693,177 @@ regalloc_name_wants_rpo_dump(fn_name) {
 // ── Stage C — live-interval construction ────────────────────────────
 //
 // Flattens per-block liveness (Stage B) into one [start_pos, end_pos]
-// range per variable, in RPO POSITION units (the index a block sits at
-// within the rpo array regalloc_compute_rpo returns — NOT the block's
-// own allocation index, which the RPO sidequest proved isn't faithful
-// to real emission order).
+// range per variable, in STATEMENT-LEVEL position units: a monotonic
+// counter that advances once per STATEMENT, walking blocks in RPO
+// order and each block's own statements in source order — not one
+// position per BLOCK. A long straight-line block with many sequential
+// definitions and no branching (e.g. stb/stbdraw.bsm's blend_px: 13
+// assignments in one block) would otherwise collapse every one of
+// those variables onto the SAME shared position, making the linear-
+// scan stage see them as all simultaneously live when most never
+// coexist — found as a real false-regression in blend_px (B3 promoted
+// x/y/src_color; linear-scan spilled them because the "spill furthest"
+// heuristic picked them as the worst-end-pos victims once 16 unrelated
+// variables all looked equally and simultaneously alive).
 //
-// Deliberate simplification for this increment: ONE interval per
-// variable, covering every RPO position where it's touched at all
-// (present in live_in, live_out, use_bits, OR def_bits) — even if
-// there's a "gap" in the middle where it's genuinely dead (e.g. a local
-// reused for two unrelated purposes far apart in the function). A
-// conservative (wider-than-necessary) interval is never a CORRECTNESS
-// bug for a future linear-scan stage — it only misses a register-
-// sharing opportunity a gap-aware interval (live-range splitting)
-// could exploit. That refinement is separable future work, not built
-// speculatively now. Block granularity (not per-instruction) is the
-// same kind of deliberate simplification CfgBlock's own use_bits/
-// def_bits already made for Stage B.
+// Within one block, the liveness BETWEEN two statements is
+// reconstructed backward from the block's own live_out (Stage B's
+// already-correct per-block answer): walk the block's statements in
+// REVERSE, tracking what's live immediately after each one (a
+// statement's own use/def transforms that set exactly like the
+// block-level dataflow equation does, just at one-statement
+// granularity instead of one-block), then tag each variable's
+// interval forward in increasing position order.
+//
+// Live-range SPLITTING: a variable can get MORE THAN ONE LiveInterval.
+// `touched(k)` (computed in regalloc_compute_intervals below) already
+// incorporates full liveness at position k, not just literal use/def
+// at that one statement — so if a variable is absent from touched(k)
+// for some k strictly between two positions where it IS present, it
+// is genuinely dead there (the analysis already proved it, this isn't
+// a guess), and the two sides become separate intervals instead of
+// one wide one spanning the gap.
+//
+// This matters at instruction granularity specifically because of how
+// RPO orders mutually-exclusive branches: the DFS that builds RPO
+// (regalloc_compute_rpo) fully explores one arm (including anything
+// nested inside it) before backtracking to a sibling arm, so a sibling
+// that's a SHORT, mutually-exclusive alternative to a long nested
+// branch can land far away in linear-position terms even though the
+// two never execute together. Found in stb/stbdraw.bsm's blend_px: an
+// early `if (sa==255) { put_px(x,y,src_color); return; }` and the
+// function's final straight-line block both use x/y/src_color, but
+// the early-return arm's RPO position falls AFTER the final block's —
+// a single contiguous interval for x would (and, before splitting,
+// did) span both, making linear-scan see x as alive across a stretch
+// where it's actually dead. Splitting on detected gaps fixes this
+// without needing to reorder RPO itself.
 struct LiveInterval {
     var_idx,
-    start_pos,   // RPO position of first touch
-    end_pos      // RPO position of last touch
+    start_pos,   // statement-level position of first touch (this interval)
+    end_pos      // statement-level position of last touch (this interval)
 }
 
-// Grows `starts`/`ends` to 64 -1 slots (one per trackable variable
-// index — the same single-word-bitset cap every earlier stage uses)
-// and folds in one block's touched-bits at RPO position `pos`.
-static void _rg_touch_interval(starts, ends, vi, pos) {
-    auto cur;
-    cur = arr_get(starts, vi);
-    if (cur < 0 || pos < cur) { arr_set(starts, vi, pos); }
-    cur = arr_get(ends, vi);
-    if (pos > cur) { arr_set(ends, vi, pos); }
+// Per-variable splitting state, tracked across the whole forward scan.
+// open == 0 means no interval is currently open for this variable.
+struct _RgSplitState {
+    open,
+    start_pos,
+    last_pos     // the most recent position this variable was touched at
+}
+
+// Folds variable `vi` being touched at position `pos` into its
+// splitting state, emitting (allocating into `intervals`) a finished
+// LiveInterval whenever a gap is detected (this touch is not
+// immediately adjacent to the last one) before opening the next one.
+static void _rg_touch_interval(states, intervals, vi, pos) {
+    auto st: _RgSplitState, it: LiveInterval;
+    st = arr_struct_at(states, vi);
+    if (st.open == 0) {
+        st.open = 1;
+        st.start_pos = pos;
+        st.last_pos = pos;
+        return;
+    }
+    if (pos == st.last_pos + 1) {
+        st.last_pos = pos;
+        return;
+    }
+    // Gap detected -- close the interval that just ended, open a new
+    // one starting here.
+    it = arr_struct_at(intervals, arr_struct_alloc(intervals));
+    it.var_idx = vi;
+    it.start_pos = st.start_pos;
+    it.end_pos = st.last_pos;
+    st.start_pos = pos;
+    st.last_pos = pos;
+}
+
+// Closes every variable's still-open interval at the end of the scan
+// (called once, after every position has been touched).
+static void _rg_close_all_intervals(states, intervals) {
+    auto vi, st: _RgSplitState, it: LiveInterval;
+    vi = 0;
+    while (vi < 64) {
+        st = arr_struct_at(states, vi);
+        if (st.open != 0) {
+            it = arr_struct_at(intervals, arr_struct_alloc(intervals));
+            it.var_idx = vi;
+            it.start_pos = st.start_pos;
+            it.end_pos = st.last_pos;
+        }
+        vi++;
+    }
 }
 
 // Computes live intervals for every variable touched anywhere in
-// `blocks`, walking `rpo` (regalloc_compute_rpo's own output) in order
-// so each block's position is simply its index within that array.
-// Returns an arr_struct of LiveInterval — Stage D (linear-scan) is the
-// first consumer; still nothing in codegen reads this.
+// `blocks`, walking `rpo` (regalloc_compute_rpo's own output) in
+// block order and each block's own statement list in source order.
+// Returns an arr_struct of LiveInterval (possibly several per
+// variable — see the live-range-splitting comment above) — Stage D
+// (linear-scan) is the first consumer; still nothing in codegen reads
+// this.
 regalloc_compute_intervals(blocks, rpo) {
-    auto starts, ends, i, blk, b: CfgBlock, touched, vi, intervals, it: LiveInterval, n;
+    auto states, i, blk, b: CfgBlock, vi, intervals, n;
+    auto k, nstmts, su, sd, cur, live_after, su_cache, sd_cache, pos, touched;
+    auto st: _RgSplitState;
     n = arr_len(rpo);
-    starts = arr_new(); ends = arr_new();
+    states = arr_struct_new(sizeof(_RgSplitState), 64);
     vi = 0;
-    while (vi < 64) { starts = arr_push(starts, -1); ends = arr_push(ends, -1); vi++; }
+    while (vi < 64) {
+        st = arr_struct_at(states, arr_struct_alloc(states));
+        st.open = 0;
+        vi++;
+    }
+    intervals = arr_struct_new(sizeof(LiveInterval), 8);
 
+    pos = 0;
     i = 0;
     while (i < n) {
         blk = arr_get(rpo, i);
         b = arr_struct_at(blocks, blk);
-        touched = b.live_in | b.live_out | b.use_bits | b.def_bits;
-        vi = 0;
-        while (vi < 64) {
-            if ((touched & (1 << vi)) != 0) { _rg_touch_interval(starts, ends, vi, i); }
-            vi++;
+        nstmts = arr_len(b.stmts);
+
+        // Pass 1 (backward): reconstruct each statement's own
+        // "live immediately after" set from the block's live_out, and
+        // cache each statement's own use/def alongside it (computed
+        // once here, reused in pass 2 below instead of recomputing).
+        live_after = arr_new(); su_cache = arr_new(); sd_cache = arr_new();
+        k = 0;
+        while (k < nstmts) {
+            live_after = arr_push(live_after, 0);
+            su_cache = arr_push(su_cache, 0);
+            sd_cache = arr_push(sd_cache, 0);
+            k++;
         }
+        cur = b.live_out;
+        k = nstmts - 1;
+        while (k >= 0) {
+            su, sd = _rg_stmt_use_def(arr_get(b.stmts, k));
+            arr_set(live_after, k, cur);
+            arr_set(su_cache, k, su);
+            arr_set(sd_cache, k, sd);
+            cur = su | (cur & ~sd);
+            k--;
+        }
+
+        // Pass 2 (forward): touch each variable at its OWN statement's
+        // global position, not the block's.
+        k = 0;
+        while (k < nstmts) {
+            touched = arr_get(su_cache, k) | arr_get(sd_cache, k) | arr_get(live_after, k);
+            vi = 0;
+            while (vi < 64) {
+                if ((touched & (1 << vi)) != 0) { _rg_touch_interval(states, intervals, vi, pos + k); }
+                vi++;
+            }
+            k++;
+        }
+        pos = pos + nstmts;
         i++;
     }
 
-    intervals = arr_struct_new(sizeof(LiveInterval), 8);
-    vi = 0;
-    while (vi < 64) {
-        if (arr_get(starts, vi) >= 0) {
-            it = arr_struct_at(intervals, arr_struct_alloc(intervals));
-            it.var_idx = vi;
-            it.start_pos = arr_get(starts, vi);
-            it.end_pos = arr_get(ends, vi);
-        }
-        vi++;
-    }
+    _rg_close_all_intervals(states, intervals);
     return intervals;
 }
 
@@ -979,4 +1107,94 @@ regalloc_name_wants_asn_dump(fn_name) {
     pfx_len = 9;   // length of "__rg_asn_"
     if (unpack_l(fn_name) < pfx_len) { return 0; }
     return buf_eq(vbuf + unpack_s(fn_name), "__rg_asn_", pfx_len);
+}
+
+// ── Stage D validation — systematic comparison against B3 ───────────
+//
+// Before Stage E can read linear-scan's decisions for anything real,
+// the plan's own gate requires confirming it is never WORSE than B3 —
+// not just internally consistent. This runs unconditionally (every
+// function, every compile) so the full test suite + every real game
+// sweeps it for free, instead of checking a handful of hand-picked
+// functions.
+
+// Returns the slot Stage D assigned to variable `vi`, or -1 if it was
+// spilled (or never touched — same thing for comparison purposes).
+// Live-range splitting (Stage C) means variable `vi` may now own
+// SEVERAL entries in `assigns` — one per split sub-interval, each with
+// its own independently-decided slot. Returns the first slot >= 0
+// found across all of them (preferring "got a real slot somewhere"
+// over the first entry specifically) — -1 only if every sub-interval
+// for `vi` spilled. Good enough for this comparison's purpose
+// (B3 has no notion of split intervals at all, so the fairest
+// comparison is "did linear-scan get vi into SOME register at all").
+static _rg_assign_slot_for(assigns, vi) {
+    auto n, i, asn: RegAssign, found;
+    n = arr_struct_count(assigns);
+    found = -1;
+    i = 0;
+    while (i < n) {
+        asn = arr_struct_at(assigns, i);
+        if (asn.var_idx == vi && asn.slot >= 0) { return asn.slot; }
+        if (asn.var_idx == vi) { found = asn.slot; }
+        i++;
+    }
+    return found;
+}
+
+// Does variable `vi`'s name (looked up in `var_names`, the same
+// cg_vars array B3 itself reads) start with the inliner's mangled-slot
+// prefix "_inl"? Those slots (e.g. "_inl1_packed") are pre-registered
+// by _inline_register_callsite_slots (bpp_dispatch.bsm) BEFORE the
+// callee's body is actually spliced into the caller's tree — B3 reads
+// their reference count from a number the inliner injects directly
+// into cg_var_refs from a static analysis of the CALLEE's body, never
+// from walking the caller's own AST. RegAlloc v2's CFG is built from
+// the caller's REAL body (still un-spliced at this point in the
+// pipeline — splicing happens later, during emission), so it
+// genuinely cannot see these variables' uses yet — not a bug in this
+// arc, a pipeline-ordering gap. Excluded from the comparison below
+// until a future increment moves this analysis after inline splicing
+// (or splices first, then analyses) instead of before it.
+static _rg_is_mangled_inline_slot(var_names, vi) {
+    auto nm;
+    nm = arr_get(var_names, vi);
+    if (unpack_l(nm) < 4) { return 0; }
+    return buf_eq(vbuf + unpack_s(nm), "_inl", 4);
+}
+
+// Compares Stage D's assignment against B3's actual decision
+// (`b3_promote` is cg_var_promote itself — arr_get(b3_promote, vi) >= 0
+// means B3 promoted vi to a register). Prints one REGRESSION line per
+// offending variable and returns the count: a variable B3 promoted
+// that linear-scan spilled is the ONE outcome Stage E must never
+// introduce when it eventually replaces B3's decision with this one.
+// The reverse (linear-scan promotes something B3 spilled, or two
+// variables sharing a slot) is the whole POINT of this arc, not a
+// regression — only checked in the b3-promoted -> linear-scan-spilled
+// direction. `var_names` (cg_vars) is consulted to skip the inliner's
+// mangled slots — see _rg_is_mangled_inline_slot's own comment for why
+// those are a known, out-of-scope gap rather than a real regression.
+regalloc_compare_vs_b3(assigns, b3_promote, var_names, fn_name) {
+    auto n, vi, b3_slot, ls_slot, worse;
+    n = arr_len(b3_promote);
+    worse = 0;
+    vi = 0;
+    while (vi < n) {
+        b3_slot = arr_get(b3_promote, vi);
+        if (b3_slot >= 0 && _rg_is_mangled_inline_slot(var_names, vi) == 0) {
+            ls_slot = _rg_assign_slot_for(assigns, vi);
+            if (ls_slot < 0) {
+                diag_str("REGRESSION ");
+                diag_buf(vbuf + unpack_s(fn_name), unpack_l(fn_name));
+                diag_str(": B3 promoted var ");
+                diag_int(vi);
+                diag_str(" but linear-scan spilled it");
+                diag_newline();
+                worse = worse + 1;
+            }
+        }
+        vi++;
+    }
+    return worse;
 }
