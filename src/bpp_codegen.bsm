@@ -2945,7 +2945,7 @@ static _inline_param_is_written(body_arr, bcnt, pname) {
 // done with them (mirrors the original single-function's own free()
 // sequence — this split changes no allocation lifetimes, only where the
 // code lives).
-_cg_inline_splice_prelude(call_node, fidx) -> (word, word, word, ptr) {
+_cg_inline_splice_prelude(call_node, fidx) -> (word, word, word, ptr, word, word) {
     auto cn: Node;
     auto callsite_id, inl_callee, inl_body, inl_bcnt;
     auto inl_params, inl_pcnt;
@@ -3172,7 +3172,39 @@ _cg_inline_splice_prelude(call_node, fidx) -> (word, word, word, ptr) {
     free(mangled_locals_buf);
     free(mangled_params_buf);
     free(bind_needed);
-    return names_buf, args_buf, total_names, ret_stmt;
+    // nested_ids/nk let the caller's own tail (cg_emit_inline_multi /
+    // cg_emit_inline_multi_assign) continue stamping nested-call ids
+    // onto its OWN clone of the trailing return expression(s) — see
+    // _inline_stamp_nested and _inline_register_nested's matching
+    // discovery-side extension. nk is wherever this loop's own
+    // per-statement stamping left off; the tail picks up from there so
+    // the two sides consume nested_ids in one continuous, agreed-upon
+    // sequence.
+    return names_buf, args_buf, total_names, ret_stmt, nested_ids, nk;
+}
+
+// Stamps any nested-call ids remaining in `nested_ids` (continuing from
+// position `nk`) onto a freshly-cloned subtree — the trailing-return-
+// expression twin of the stamping loop inside _cg_inline_splice_prelude
+// (which only covers statements 0..bcnt-2). Used by both inline-splice
+// tails below, right after each one's own `ast_clone_subst` call on a
+// piece of the trailing return, so a nested call hiding inside the
+// RETURN EXPRESSION itself (moon_filter.bsm's moon_process: `return
+// moog_slope(...)`) gets the same treatment a nested call inside an
+// earlier statement already does. Returns the advanced `nk`.
+static _inline_stamp_nested(cloned, nested_ids, nk) {
+    auto nested_found, i, nn: Node;
+    if (nested_ids == 0) { return nk; }
+    nested_found = arr_new();
+    nested_found = _inline_find_nested_calls(cloned, nested_found);
+    i = 0;
+    while (i < arr_len(nested_found)) {
+        nn = arr_get(nested_found, i);
+        nn.e = arr_get(nested_ids, nk);
+        nk++;
+        i++;
+    }
+    return nk;
 }
 
 // Single-value / void inline splice (Phase B2 + S4 P3b + VI-2 unified).
@@ -3183,17 +3215,20 @@ _cg_inline_splice_prelude(call_node, fidx) -> (word, word, word, ptr) {
 cg_emit_inline_multi(call_node, fidx) {
     auto names_buf, args_buf, total_names, ret_stmt: Node;
     auto pp: ChipPrimitives;
-    auto _inl_s, ret_clone, final_ety, is_void_splice;
+    auto _inl_s, ret_clone, final_ety, is_void_splice, nested_ids, nk;
     pp = cg_prim;
     _inl_s = call(pp.cur_text_pos);   // .bug: text offset where this inlined body begins
-    names_buf, args_buf, total_names, ret_stmt = _cg_inline_splice_prelude(call_node, fidx);
+    names_buf, args_buf, total_names, ret_stmt, nested_ids, nk = _cg_inline_splice_prelude(call_node, fidx);
     is_void_splice = (ret_stmt.ntype != T_RET);
     if (is_void_splice != 0) {
         // No value to leave in acc — the statement-context caller discards it.
         final_ety = 0;
     } else {
-        // Final T_RET expression — emit value into acc.
+        // Final T_RET expression — emit value into acc. Stamp any nested
+        // call hiding inside it (e.g. `return moog_slope(...)`) before
+        // emitting — see _inline_stamp_nested.
         ret_clone = ast_clone_subst(ret_stmt.a, names_buf, total_names, args_buf);
+        nk = _inline_stamp_nested(ret_clone, nested_ids, nk);
         final_ety = call(pp.emit_node, ret_clone);
     }
     _bug_inl_record(_inl_s, call(pp.cur_text_pos), fidx);   // .bug: record this inlined range
@@ -3218,13 +3253,21 @@ cg_emit_inline_multi_assign(call_node, fidx, targets, tcount) {
     auto names_buf, args_buf, total_names, ret_stmt: Node;
     auto pp: ChipPrimitives;
     auto _inl_s, k, rexprs, rclone, rrty, tnode: Node, tvi, toff, tis_f;
+    auto nested_ids, nk;
     pp = cg_prim;
     _inl_s = call(pp.cur_text_pos);
-    names_buf, args_buf, total_names, ret_stmt = _cg_inline_splice_prelude(call_node, fidx);
+    names_buf, args_buf, total_names, ret_stmt, nested_ids, nk = _cg_inline_splice_prelude(call_node, fidx);
     rexprs = ret_stmt.b;
     k = 0;
     while (k < tcount) {
         rclone = ast_clone_subst(*(rexprs + k * 8), names_buf, total_names, args_buf);
+        // Stamp any nested call hiding inside THIS result expression —
+        // see _inline_stamp_nested. _inline_find_nested_calls's own
+        // T_RET case (consulted by the matching discovery-side walk in
+        // _inline_register_nested) visits results 0..tcount-1 in this
+        // same order, so nk's running position stays in sync across
+        // every iteration of this loop.
+        nk = _inline_stamp_nested(rclone, nested_ids, nk);
         tnode = *(targets + k * 8);
         tvi = cg_var_idx(tnode.a);
         toff = arr_get(cg_var_off, tvi);

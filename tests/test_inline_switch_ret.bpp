@@ -1,0 +1,93 @@
+// skip-c: native multi-value return banking (quad -> (float,float,float,float))
+// test_inline_switch_ret.bpp — two new inliner increments, found
+// re-disassembling stb/stbfilter.bsm's moog_slope and
+// tools/moon_filter/moon_filter.bsm's moon_process:
+//
+// 1. _inline_normalize_switch_ret: a function whose body ENDS in a
+//    switch where every arm (and the else arm) is exactly one `return`
+//    statement now normalises to a single trailing return of a nested
+//    ternary chain, mirroring _inline_normalize_guard's existing
+//    if/return/return -> ternary rewrite for a different trailing
+//    shape. Lets such a function (previously rejected outright at the
+//    "last statement must be T_RET" gate) become inline-eligible at
+//    all.
+// 2. The nested-inline discovery/consumption walk (_inline_register_
+//    nested / cg_emit_inline_multi's tail) now also covers a call
+//    hiding INSIDE the trailing return expression itself (`return
+//    g(...);`), not just calls in earlier statements — needed because
+//    a single-statement-body function whose ENTIRE body is `return
+//    g(...)` (mirrors moon_process's exact shape: one assignment, then
+//    a return that IS the only call) previously could never nest a
+//    call living inside that one return.
+
+struct Pair { lo: float, hi: float }
+
+// Mirrors moog_taps: a multi-return leaf with a multi-use param
+// (s used twice), forcing the binding splice — the actual nested
+// target the switch-ret candidate below calls into its return.
+quad(s: float, x: float) -> (float, float, float, float) {
+    return s + x, s - x, s * x, s + x * 2.0;
+}
+
+// Mirrors moog_slope exactly: a leading statement, then a trailing
+// switch where every arm returns one of the leading statement's
+// results, picked by an integer parameter.
+pick_quad(p: word, x: float, which: word) -> float {
+    auto pp: Pair, a: float, b: float, c: float, d: float;
+    pp = p;
+    a, b, c, d = quad(pp.lo, x);
+    switch (which) {
+        1    { return a; }
+        2    { return b; }
+        3    { return c; }
+        else { return d; }
+    }
+}
+
+// Mirrors moon_process exactly: the body's ENTIRE content is `pp = p;
+// return <call into the switch-ret candidate above>;` — the nested
+// call lives inside the trailing return, the shape gap 2 targets.
+wrap_pick(p: word, x: float) -> float {
+    auto pp: Pair;
+    pp = p;
+    return pick_quad(p, x, 2);
+}
+
+main() {
+    auto p, r: float;
+    p = malloc(16);
+    auto pp: Pair;
+    pp = p;
+    pp.lo = 3.0;
+    pp.hi = 0.0;
+
+    // quad(3.0, 2.0) = (5.0, 1.0, 6.0, 7.0) -- a=5 b=1 c=6 d=7
+    r = pick_quad(p, 2.0, 1);
+    if (r != 5.0) { return 1; }
+    r = pick_quad(p, 2.0, 2);
+    if (r != 1.0) { return 2; }
+    r = pick_quad(p, 2.0, 3);
+    if (r != 6.0) { return 3; }
+    r = pick_quad(p, 2.0, 99);     // else arm
+    if (r != 7.0) { return 4; }
+
+    // wrap_pick always asks for arm 2 (b = s - x = 3 - 2 = 1.0).
+    r = wrap_pick(p, 2.0);
+    if (r != 1.0) { return 5; }
+
+    // Vary inputs across a loop, proving no stale binding/nested-id
+    // state leaks across calls or across the two distinct call sites.
+    auto k;
+    for (k = 0; k < 3; k++) {
+        auto kx: float;
+        kx = k + 1.0;
+        pp.lo = k + 5.0;
+        r = wrap_pick(p, kx);
+        // b = s - x = (k+5) - (k+1) = 4.0, constant regardless of k —
+        // proves wrap_pick re-reads pp.lo fresh each call, not a
+        // stale value from a previous splice.
+        if (r != 4.0) { return 10 + k; }
+    }
+
+    return 0;
+}

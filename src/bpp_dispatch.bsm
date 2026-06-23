@@ -5419,7 +5419,26 @@ static _inline_count_nodes(nd) {
     // body. T_ASSIGN.a = lhs, .b = rhs (cg_b3_walk:1113). T_MEMST.a
     // = addr, .b = value (cg_b3_walk:1114). T_RET.a = return expr.
     // T_DECL stands alone (no child walk in cg_b3_walk:2710).
-    T_ASSIGN   { sum += _inline_count_nodes(n.a) + _inline_count_nodes(n.b); }
+    // Sibling of the T_RET n.c>1 fix above, for the multi-TARGET case
+    // (`a,b,c,d = f()` — n.c is the target array, n.d the count, n.a
+    // aliasing target[0] only; bpp_parser.bsm's parse_assign). Needed
+    // for the new switch-normalized candidates below (moog_slope's
+    // own body opens with exactly this shape) — undercounting a
+    // body's true cost could let an oversized candidate slip past
+    // INLINE_BODY_NODE_CAP. _inline_has_tcall / _inline_param_refs /
+    // _inline_writes_param have the identical n.d>1 blind spot for
+    // T_ASSIGN and are NOT fixed here — every multi-target in every
+    // current candidate's body is a plain local (never a parameter,
+    // never call-containing), so those three stay provably inert;
+    // deferred until a real candidate's shape needs them, not fixed
+    // speculatively.
+    T_ASSIGN {
+        sum += _inline_count_nodes(n.a) + _inline_count_nodes(n.b);
+        if (n.d > 1) {
+            arr = n.c; cnt = n.d;
+            for (i = 1; i < cnt; i++) { sum += _inline_count_nodes(arr[i]); }
+        }
+    }
     // Same const-offset-addressing discount as T_MEMLD above, applied to
     // a struct-field STORE's address (n.a here IS the address directly,
     // not wrapped in another T_MEMLD — a store needs the address, not a
@@ -6202,12 +6221,24 @@ void _inline_register_nested(outer_id, body_arr, body_cnt) {
     // Scope to exactly the statements splice-time's own per-statement
     // loop will clone+walk: when the body ends in T_RET, that trailing
     // statement is handled separately by each tail (cg_emit_inline_multi/
-    // cg_emit_inline_multi_assign), which do NOT consult _inline_nested_ids
-    // — so a nested call hiding inside the RETURN EXPRESSION itself is
-    // deliberately not discovered here (out of scope for this increment;
-    // moog_taps's own `return a,b,c,d;` has no calls in it, matching this
-    // limit exactly). A void body with no trailing T_RET has no such tail
-    // — splice's loop walks ALL body_cnt statements — so scan all of them.
+    // cg_emit_inline_multi_assign) — but it IS now also scanned (see
+    // below), via the SAME `_inline_find_nested_calls` call those tails'
+    // own post-clone stamping (`_inline_stamp_nested`) consumes from in
+    // the identical order. Originally out of scope ("moog_taps's own
+    // `return a,b,c,d;` has no calls in it, matching this limit exactly")
+    // — found mattering for real re-disassembling moon_filter.bsm's
+    // moon_process: `auto pp; pp=p; return moog_slope(pp.flt, in,
+    // pp.slope);` hides its ENTIRE nested call inside the trailing
+    // return, so the old exclusion meant moog_slope (itself made
+    // inlineable by the switch-normalisation above) could never nest
+    // into a caller that spliced moon_process in — confirmed via
+    // bug --disasm: moon_process always re-appeared as a real `bl
+    // moog_slope` inside any outer splice, even though moon_process
+    // ITSELF, compiled standalone, already inlined that exact call
+    // (the ordinary top-level pre-reg walk DOES descend into a trailing
+    // return; only the NESTED path excluded it). A void body with no
+    // trailing T_RET has no such tail — splice's loop walks ALL
+    // body_cnt statements — so scan all of them, unchanged.
     last_stmt = body_arr[body_cnt - 1];
     if (last_stmt.ntype == T_RET) {
         scan_cnt = body_cnt - 1;
@@ -6219,6 +6250,13 @@ void _inline_register_nested(outer_id, body_arr, body_cnt) {
     while (i < scan_cnt) {
         found = _inline_find_nested_calls(body_arr[i], found);
         i++;
+    }
+    // _inline_find_nested_calls already has its own correct T_RET case
+    // (single AND multi-return) — calling it directly on the trailing
+    // statement reuses that, rather than duplicating the n.c>1 branch
+    // here a third time.
+    if (last_stmt.ntype == T_RET) {
+        found = _inline_find_nested_calls(last_stmt, found);
     }
     if (arr_len(found) == 0) { return 0; }
     ids = arr_new();
@@ -6476,6 +6514,114 @@ static _inline_normalize_guard(fn_rec) {
     return 1;
 }
 
+// Normalise a trailing switch-with-every-arm-returning into a single-
+// return nested-ternary chain, IN PLACE — the switch's twin of
+// `_inline_normalize_guard` above. Found re-disassembling
+// stb/stbfilter.bsm's moog_slope (a single call site, never itself
+// inlining):
+//     moog_slope(m, in: float, poles) -> float {
+//         auto (a,b,c,d): float;
+//         a,b,c,d = moog_taps(m, in);
+//         switch (poles) {
+//             1 { return a; } 2 { return b; } 3 { return c; }
+//             else { return d; }
+//         }
+//     }
+// rewrites to a trailing
+//     return (poles == 1) ? a : ((poles == 2) ? b : ((poles == 3) ? c : d));
+// — semantically exact (a switch tries arms in declaration order, first
+// match wins, no fallthrough; the nested ternary tries comparisons in
+// the same order) — letting the existing single-return binding splice
+// (Inc 2) emit it with no new control-flow-aware splice machinery, the
+// same payoff `_inline_normalize_guard` already banked for guard
+// clauses.
+//
+// Kept deliberately narrow (Rule 28), same spirit as the guard
+// normaliser:
+//   - the switch must be the body's LAST statement (any number of
+//     statements may precede it unchanged — moog_slope's own
+//     `a,b,c,d = moog_taps(...)` is exactly such a leading statement)
+//   - value-dispatch form only (`switch (cond) { ... }`, cond != 0) —
+//     the no-expression condition-dispatch form is out of scope
+//   - the condition must be a bare T_VAR or T_LIT: the rewrite reads it
+//     ONCE PER ARM (as the left side of each `==` comparison), so it
+//     must be PROVABLY side-effect-free and repeatable without
+//     introducing a synthesized temp — a T_VAR/T_LIT already is (the
+//     same idempotency bar this session's earlier inline-substitution
+//     work established), anything more complex is rejected rather than
+//     risk duplicating a side effect
+//   - every arm must have exactly one value (no `1, 2 { ... }` combined
+//     arms) and a body of exactly one T_RET with a real expression
+//   - an else arm is mandatory (exhaustiveness — there is no safe
+//     "value" to fall back to without one) with the same one-T_RET shape
+//
+// Each arm's VALUE expression is read exactly once (no duplication
+// concern there — it occupies exactly one position in the resulting
+// tree, same as it occupied exactly one arm in the original switch).
+//
+// Returns 1 if it rewrote the body, 0 otherwise.
+static _inline_normalize_switch_ret(fn_rec) {
+    auto body_arr, body_cnt;
+    auto last: Node, cond: Node;
+    auto arm_values, arm_bodies, arm_count, k, vcnt, bcnt;
+    auto arm_body, arm_ret: Node, else_arr, else_stmt: Node;
+    auto cmp: Node, tern: Node, new_ret: Node, value, eq_start, eq_op;
+    auto arm_vals;
+    body_arr = *(fn_rec + FN_BODY);
+    body_cnt = *(fn_rec + FN_BCNT);
+    if (body_cnt < 1) { return 0; }
+    last = body_arr[body_cnt - 1];
+    if (last.ntype != T_SWITCH) { return 0; }
+    cond = last.a;
+    if (cond == 0) { return 0; }                     // condition-dispatch form
+    if (cond.ntype != T_VAR && cond.ntype != T_LIT) { return 0; }
+    if (last.d == 0 || last.e != 1) { return 0; }     // mandatory, single-stmt else
+    else_arr = last.d;
+    else_stmt = else_arr[0];
+    if (else_stmt.ntype != T_RET || else_stmt.a == 0) { return 0; }
+    arm_count = last.c;
+    if (arm_count < 1) { return 0; }
+    arm_values = last.b;
+    arm_bodies = last.src_tok;
+    // Validate every arm BEFORE mutating anything — all-or-nothing,
+    // same discipline _inline_normalize_guard's own checks use.
+    for (k = 0; k < arm_count; k++) {
+        vcnt = arm_values[k * 2 + 1];
+        if (vcnt != 1) { return 0; }                  // combined-value arm
+        bcnt = arm_bodies[k * 2 + 1];
+        if (bcnt != 1) { return 0; }
+        arm_body = arm_bodies[k * 2];
+        arm_ret = arm_body[0];
+        if (arm_ret.ntype != T_RET || arm_ret.a == 0) { return 0; }
+    }
+    // Build the chain right-to-left: the innermost value is the else
+    // branch; each arm wraps the accumulated value in
+    // `(cond == arm_value) ? arm_return : <accumulated>`.
+    value = else_stmt.a;
+    eq_start = vbuf_pos;
+    poke(vbuf + vbuf_pos, '='); vbuf_pos++;
+    poke(vbuf + vbuf_pos, '='); vbuf_pos++;
+    eq_op = pack(eq_start, 2);
+    for (k = arm_count - 1; k >= 0; k--) {
+        arm_body = arm_bodies[k * 2];
+        arm_ret = arm_body[0];
+        arm_vals = arm_values[k * 2];
+        cmp = make_node(T_BINOP);
+        cmp.a = eq_op;
+        cmp.b = cond;
+        cmp.c = arm_vals[0];
+        tern = make_node(T_TERNARY);
+        tern.a = cmp;
+        tern.b = arm_ret.a;
+        tern.c = value;
+        value = tern;
+    }
+    new_ret = make_node(T_RET);
+    new_ret.a = value;
+    body_arr[body_cnt - 1] = new_ret;
+    return 1;
+}
+
 // Walk the function table and tag every entry that meets the
 // inline criteria. Must run after classify_all_functions so
 // fn_phase is final. Codegens read fn_inlineable when emitting
@@ -6578,6 +6724,16 @@ void classify_inlineable() {
         // multi-return body never matches this pattern — the normaliser looks
         // for a 2-statement if/return/return shape — so it's a safe no-op here.)
         was_guard = _inline_normalize_guard(fn_rec);
+        // Switch-with-every-arm-returning -> nested ternary (this
+        // increment's own normaliser, see its docstring above). Runs
+        // independently of the guard normaliser — different trailing
+        // shape, and (unlike a guard clause) does NOT force tier 3:
+        // a switch-normalised body isn't presumed to be a widely-used
+        // accessor the way arr_struct_at is, so the hotness gate would
+        // wrongly leave a single-cold-call-site candidate like
+        // moog_slope un-registered. It falls through the generic tier
+        // decision below exactly like any other body would.
+        _inline_normalize_switch_ret(fn_rec);
         body_cnt = *(fn_rec + FN_BCNT);
         // Last statement must be T_RET so the splice has an
         // expression value to use.
