@@ -419,14 +419,30 @@ leaves or comparison operators. Four commits, in order:
    benchmark's hot path leans on struct-field arithmetic more than
    comparisons, reported honestly rather than assumed).
 
-`rotary_tick`'s own disassembly: 35 → 25 `fmov` (35 total instructions
-dropped). **What's left, confirmed by re-disassembling after commit 3,
-not guessed:** the remaining `fmov` shuffle is almost entirely on
-expressions with a float LITERAL operand (`r.cur + 0.0001`, `x > 1.5`,
-threshold checks against named constants) — `cg_float_tree_need` has no
-`T_LIT` leaf case on either the arithmetic or comparison path, a third,
-distinct gap from the two closed above. This is now the most-confirmed
-remaining lever (visible directly in the disasm, not inferred) — bigger
-than branch-fusion (skip `cset` when a comparison feeds straight into a
-`cbz`, emitting `fcmp; b.cc` instead of `fcmp; cset; cbz`), which is also
-visible in the same disasm but unmeasured. Neither is started.
+`rotary_tick`'s own disassembly after commit 3: 35 → 25 `fmov`. The
+remaining shuffle was almost entirely on expressions with a float LITERAL
+operand (`r.cur + 0.0001`, `x > 1.5`, threshold checks against named
+constants) — `cg_float_tree_need` had no `T_LIT` leaf case on either the
+arithmetic or comparison path, a third, distinct gap from the two closed
+above.
+
+4. `b81bd23` — extend compute-in-place to float literal leaves. A float
+   literal is always cheap to materialize (no register contention, just
+   a 3-instruction const-pool load); new `emit_fconst_into(dreg, flt_id)`
+   parameterizes the existing `emit_load_float_const`/`cg_emit_lit` const-
+   pool load over the destination instead of the fixed accumulator. Slots
+   into `cg_float_tree_need` generically, so both the arithmetic CIP
+   (commit 2) and the comparison CIP (commit 3) picked it up with zero
+   further changes to either — confirmed by reading both call sites.
+   `13.05 → 12.07 ms` — the single biggest commit of the whole
+   investigation, confirming the disasm-driven prediction that this was
+   the dominant remaining lever.
+
+**Final tally, `rotary_tick`'s own disassembly: 35 → 5 `fmov` (86%
+reduction). `tl_bench`: 15.4 → 12.07 ms min-of-5 (~22% across all four
+commits).** What's left, still visible in the same disasm, still
+unstarted: branch-fusion (skip `cset` when a comparison feeds straight
+into a `cbz`, emitting `fcmp; b.cc` instead of `fcmp; cset; cbz`) — the
+remaining `fcmp`/`cset`/`cbz` triplets in `rotary_tick` are the candidate
+sites. No further float-CIP leaf gap is known; this arc's struct-field/
+comparison/literal trio is, as far as re-disassembly shows, complete.
