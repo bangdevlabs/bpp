@@ -394,3 +394,39 @@ test harness** — `tl_bench` (perf) + `tiny_lofi --render` md5 (correctness) +
 the two suites + byte-stable bootstrap, every step. Use `the_bug` (`--disasm` /
 `--break`, see `docs/manual/debug_with_bug.md`) when a step regresses
 byte-stability. Measure, don't believe.
+
+## Addendum (2026-06-22/23) — the decision rule's answer
+
+Followed the plan's own closing instruction: re-disassembled `rotary_tick`
+(stb/stbrotary.bsm) instead of opening another inliner increment. Found
+the real bottleneck was NOT call overhead at all — it was struct-field
+addressing and F.2.c's compute-in-place gate never covering struct-field
+leaves or comparison operators. Four commits, in order:
+
+1. `e9fbb8d`/`7149082`/`851b8e1` — const-offset addressing: fold a
+   struct-field load/store's `base + literal` address into the
+   instruction's own offset, and skip copying an already-promoted base
+   into the accumulator when the address can read/write through it
+   directly. `tl_bench` 15.4 → 13.76 ms.
+2. `2ad0685` — extend F.2.c's float compute-in-place
+   (`cg_float_tree_need`/`cg_emit_float_into`) to `T_MEMLD` (struct-field)
+   leaves, mirroring the proven integer-CIP precedent. `13.76 → 13.08 ms`.
+3. `60a59cb` — extend compute-in-place to float comparisons (`< > <= >=
+   == !=`), which had no precedent on either side: `_a64_emit_cmp_flt`'s
+   `fcmp d1, d0` is a fixed-register convention, not a hardware
+   requirement, and the save/resolve dance upstream of it exists only to
+   satisfy that convention. `13.08 → 13.05 ms` (within noise — this
+   benchmark's hot path leans on struct-field arithmetic more than
+   comparisons, reported honestly rather than assumed).
+
+`rotary_tick`'s own disassembly: 35 → 25 `fmov` (35 total instructions
+dropped). **What's left, confirmed by re-disassembling after commit 3,
+not guessed:** the remaining `fmov` shuffle is almost entirely on
+expressions with a float LITERAL operand (`r.cur + 0.0001`, `x > 1.5`,
+threshold checks against named constants) — `cg_float_tree_need` has no
+`T_LIT` leaf case on either the arithmetic or comparison path, a third,
+distinct gap from the two closed above. This is now the most-confirmed
+remaining lever (visible directly in the disasm, not inferred) — bigger
+than branch-fusion (skip `cset` when a comparison feeds straight into a
+`cbz`, emitting `fcmp; b.cc` instead of `fcmp; cset; cbz`), which is also
+visible in the same disasm but unmeasured. Neither is started.
