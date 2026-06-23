@@ -1145,7 +1145,7 @@ chip into one spine helper and produced a byte-identical compiler.
 | **B0** | Const-fold + strength reduction (`* 2^k` → `<< k`, etc.) | spine (`bpp_codegen.bsm` const path) | both + C inherits via gcc -O2 |
 | **B1** | Register freelist for T_BINOP left + T_MEMST value | chip primitives | a64: 7 regs (x9..x15) / x64: 1 reg (r11) |
 | **B2** | Trivial inline (single T_RET, ≤5 nodes, ≤3 params) | chip T_CALL fast path | both |
-| **B3** | Local register promotion (Sethi-Ullman walker + chip pool) | spine selector + chip pool | a64: 6 regs (x19..x24) / x64: 5 regs (rbx, r12, r13, r14, r15) |
+| **B3** | Local register promotion (Sethi-Ullman walker + chip pool) | spine selector + chip pool | a64: 10 regs non-leaf / 14 leaf (x19..x28, +x9..x12 leaf-only) / x64: 5 regs (rbx, r12, r13, r14, r15) |
 | **B4** | `: double` 128-bit SIMD + 11 float vec_* + 4 byte vec_* builtins | spine builtin dispatch + chip emit | a64 (NEON 4×f32 / 16×u8), x64 (SSE2 packed f32 / 16×u8), C (float: SSE2/NEON intrinsics; byte: portable scalar struct) |
 | **Hot-path S1–S3k** | unpack_l strength-reduce, hash-table lookups, CSE, builtin lifts, 8-byte packed_eq, `emit_ror32` | spine builtin dispatch + chip primitives | both (one new chip primitive: `emit_ror32`) |
 | **S4** | Cost-model multi-statement inliner | spine `cg_emit_inline_multi` + dispatch's `_inline_pre_reg_walk` | both |
@@ -1235,7 +1235,7 @@ arithmetic, not missing capabilities:
 | Item | a64 | x64 | Why |
 |---|---|---|---|
 | B1 freelist depth | 7 regs | 1 reg | System V leaves x86_64 fewer free caller-saved regs (see B1 above) |
-| B3 budget | 6 regs (x19..x24) | 5 regs (rbx, r12, r13, r14, r15) | System V has 3 fewer callee-saved GP regs than AAPCS64 |
+| B3 budget (non-leaf int) | 10 regs (x19..x28) | 5 regs (rbx, r12, r13, r14, r15) | AAPCS64 reserves 10 plain callee-saved GP regs (x19..x28); SysV leaves only 5 usable (rbp is the real frame pointer here, not spare) — widened from 6 (x19..x24) on 2026-06-23 (`045b806`) after finding 4 unclaimed AAPCS64 registers while scoping RegAlloc v2 |
 | `mem_read_indexed(8)` (`*(arr + i*8)`) | 1 instr `ldr x0, [x0, x1]` | 2 instr (add + load) | x86_64 has no two-register indexed load matching the spine's primitive shape |
 | Bitfield insert | 1 instr `BFI` | 4 instr (load + mask + or + store) | scalar x86_64 has no BFI (AVX has one for SIMD) |
 

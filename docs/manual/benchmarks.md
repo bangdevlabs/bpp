@@ -32,8 +32,8 @@ numbers, and how the headline metrics have evolved over time.
 
 | Benchmark | Measures | Run | Good |
 |---|---|---|---|
-| `examples/bench_codegen.bpp` | biquad (FP serial), lcg (int serial), xform (int throughput) — the canonical codegen gate | `bpp examples/bench_codegen.bpp -o /tmp/bcg && /tmp/bcg` | serial near gcc -O2 parity; throughput as low as possible |
-| oracle | the same three kernels under gcc -O2 | `bpp --c examples/bench_codegen.bpp > /tmp/b.c && cc -O2 -w /tmp/b.c -o /tmp/o2 -lobjc -lm && /tmp/o2` | — |
+| `examples/bench_codegen.bpp` | biquad (FP serial), lcg (int serial), xform (int throughput), manylive (many short-lived locals in sequential phases — the RegAlloc v2 / Stage D motivating shape) | `bpp examples/bench_codegen.bpp -o /tmp/bcg && /tmp/bcg` | serial near gcc -O2 parity; throughput as low as possible; manylive is the one kernel B3 cannot reach parity on (see 2026-06-23 entry below) |
+| oracle | the same kernels under gcc -O2 | `bpp --c examples/bench_codegen.bpp > /tmp/b.c && cc -O2 -w -Wno-error=implicit-function-declaration /tmp/b.c -o /tmp/o2 -lobjc -lm && /tmp/o2` | — |
 | `tools/tiny_lofi/tl_bench.bpp` | a REAL assembled program — the tiny_lofi DAW render (3 s project, call-heavy) | `bpp tools/tiny_lofi/tl_bench.bpp -o /tmp/tlb && /tmp/tlb` | realtime factor ≫ 1× |
 
 ### Real-program codegen — the tiny_lofi finding (2026-06-18)
@@ -200,6 +200,69 @@ worth a permanent entry (added above). Machine noise (not code) explains
 every other delta in either direction — none of the moved numbers
 correspond to a commit that should have touched that benchmark's code
 path.
+
+#### 2026-06-23 (later) — RegAlloc v2 Stages A-D (shadow mode) + the `manylive`
+kernel
+
+Opened the full liveness-based register allocator arc
+(`docs/plans/compiler_boost_roadmap.md` F.2): CFG construction → liveness
+dataflow → RPO linearization → live-interval construction → linear-scan
+assignment (`src/bpp_regalloc.bsm`). All four analysis stages run
+unconditionally on every function, every compile — but their decisions are
+not wired into `cg_var_promote` yet (Stage E, still open), so every
+correctness/codegen-output benchmark in this doc was expected to hold
+byte-for-byte, and did (bootstrap gen1==gen2 byte-identical on the first try
+at every stage, no 1-cycle oscillation — the strongest invariant available,
+confirming the new analysis genuinely affects zero compiled bytes anywhere).
+
+**New kernel — `manylive`** (added to `bench_codegen.bpp`): three
+sequential phases per iteration (5 locals each), each phase fed only by the
+previous phase's last value — 15 locals total, never more than ~5
+simultaneously live. This is the shape B3's reference-count-only heuristic
+cannot handle (it ranks ALL locals by total reference count with no notion
+of *when* each is alive), and the existing three kernels (already at gcc
+-O2 parity) don't exercise it. Oracle recipe needs both
+`-Wno-error=implicit-function-declaration` (clang 16+/Xcode 15+ treats
+`pthread_self`/`__getdirentries64`'s implicit declarations as hard errors,
+not warnings — this was already broken before today, on ANY bench_codegen
+oracle build, not introduced today) and `-lobjc` (the auto-injected
+platform layer references `_objc_getClass` even in a non-GUI program):
+
+```sh
+bpp examples/bench_codegen.bpp -o /tmp/bcg && /tmp/bcg
+bpp --c examples/bench_codegen.bpp > /tmp/bcg.c && \
+  cc -O2 -w -Wno-error=implicit-function-declaration /tmp/bcg.c -o /tmp/bcg_o2 -lobjc -lm && /tmp/bcg_o2
+```
+
+| kernel | ours (min of 3) | gcc -O2 (min of 3) | ratio |
+|---|---|---|---|
+| manylive (20M, many-live) | 142.97 ms | 88.04 ms | **1.62×** |
+
+Checksums matched exactly (`108041794099160` both sides) — correctness
+confirmed independent of the timing gap. The other three kernels held their
+existing parity (not re-tabulated here; see the main "Latest results"
+table). The 1.62× gap is the first QUANTITATIVE confirmation that a real
+register-sharing opportunity exists for Stage D/E to close — B3 cannot see
+that `manylive`'s phase-A locals die before phase B's are born, so with a
+10-slot budget it must spill several of the 15 even though never more than
+~5 are alive at once.
+
+**Compile-time overhead, per Tonify Rule 37** (every perf-relevant change
+must cite `bench_compile.sh` — this entry was missed in the Stage A-D
+commits themselves and is recorded here after the fact):
+
+```
+AFTER  (Stages A-D, cb2d145):  bootstrap min 0.27s, median 0.28s (10 runs)
+BEFORE (045b806, pre-RegAlloc-v2): bootstrap min 0.26s, median 0.27s (10 runs)
+```
+
+Built BEFORE from a disposable `git worktree` at `045b806` for a clean
+side-by-side (binary sizes: 1032402 bytes before vs 1050018 bytes after).
+A ~0.01s difference at this run count is at the edge of machine noise, but
+it repeated in two separate 7-run and 10-run samples, so it is reported
+honestly rather than dismissed — four new unconditional per-function passes
+(CFG + liveness + RPO + intervals) have a real, small, non-zero cost.
+Revisit if a future stage's win doesn't clearly outweigh it.
 
 ### Autovectorisation + outlining (parallel)
 

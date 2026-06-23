@@ -2442,12 +2442,21 @@ Three layers, all automatic:
   when a call would clobber them. You get this for free.
 - **B3 — local promotion.** The hottest locals (by reference count, with refs
   *inside a loop* weighted 1000×) are promoted to callee-saved registers
-  (a64 `x19..x24`). So a loop-invariant array base or bound used once per
-  iteration lives in a register, not the frame.
+  (a64 `x19..x28` — widened from `x19..x24` on 2026-06-23 after finding 4
+  unclaimed AAPCS64 registers). So a loop-invariant array base or bound used
+  once per iteration lives in a register, not the frame.
 - **Wider budget in leaf functions.** A function that makes **no calls** can
   also hold locals in caller-saved `x9..x12` — nothing clobbers them
-  mid-function — lifting the budget from 6 to 10. A leaf kernel with ten hot
-  accumulators keeps them all in registers instead of spilling four.
+  mid-function — lifting the budget from 10 to 14. A leaf kernel with
+  fourteen hot accumulators keeps them all in registers instead of spilling.
+- **RegAlloc v2 (in progress).** B3 ranks variables by total reference
+  count with no notion of *when* each is alive — two locals that never
+  coexist still compete for the same promotion budget. A real liveness-based
+  allocator (CFG → liveness → live intervals → linear-scan, `src/
+  bpp_regalloc.bsm`) is being built to close that gap; as of 2026-06-23 it
+  runs in shadow mode (computed and dump-verified, not yet wired into the
+  bytes a program compiles to). See `docs/plans/compiler_boost_roadmap.md`
+  F.2 for the staged design.
 
 **What you do:** keep hot loops leaf (no calls in the inner loop), and the
 compiler keeps your working set in registers.
