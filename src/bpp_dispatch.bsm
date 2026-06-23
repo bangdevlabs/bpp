@@ -6397,9 +6397,25 @@ _inline_collect_locals(body_arr, body_cnt, out_buf) {
 // ceiling on raw `node_count(body)` — no call site, no caller
 // hotness, no const-arg bonus can push a body past it. LLVM
 // uses 50 for `OptSizeThreshold`; xorshift64 (the original S4
-// anchor) is ~31 nodes.
-//
+// anchor) is ~31 nodes. Stays untouched for the single-return case —
+// every existing candidate was vetted against this exact number.
 const INLINE_BODY_NODE_CAP = 50;
+// Separate, deliberately scoped cap for MULTI-RETURN bodies only (Inc 6,
+// docs/plans/inliner_arc.md). `moog_taps` (stb/stbfilter.bsm — 4 ladder
+// taps computed and returned together, the multi-return ABI doing
+// exactly what it's for) measures body_cost=62 after the const-offset-
+// addressing counting fix above (was 84 before it) — still over the
+// shared 50-node cap. A SCOPED cap, not a global raise: a multi-return
+// body inherently does ~N parallel computations in one call (that's the
+// whole point of returning N values instead of making N separate calls),
+// so it structurally deserves more room than a single-return leaf —
+// raising the SHARED cap instead would have widened every single-return
+// candidate's blast radius for a problem only multi-return bodies have.
+// 70 keeps a small, deliberate margin over the one real, measured
+// candidate (62) rather than a round guess at "big enough" — there is
+// exactly one consumer driving this number today; revisit it, with its
+// own measurement, when a second one needs more room.
+const INLINE_MULTIRET_NODE_CAP = 70;
 // Tighter cap for bodies that inline a peek/poke builtin: a thin single-
 // instruction wrapper (read_u16 ≈ 5 nodes) is size-neutral to inline, but a
 // bigger builtin-using body bloats at EVERY call site (measured +13% binary in
@@ -6605,7 +6621,12 @@ void classify_inlineable() {
         // because `_inline_count_nodes` returns 99 for them
         // (control-flow inlining is out of scope per Q1).
         body_cost = _inline_count_nodes_body(body_arr, body_cnt);
-        if (body_cost > INLINE_BODY_NODE_CAP) { continue; }
+        // Inc 6: multi-return bodies get the separate, scoped cap (see
+        // its own comment) — single-return bodies are unaffected, exact
+        // same threshold as before this increment.
+        if (ret_arity > 1) {
+            if (body_cost > INLINE_MULTIRET_NODE_CAP) { continue; }
+        } else if (body_cost > INLINE_BODY_NODE_CAP) { continue; }
         // Inc 6: a T_CALL to a target that is ALREADY fn_inlineable does
         // not disqualify this body (it composes — see
         // _inline_has_disqualifying_tcall's own comment). Everything

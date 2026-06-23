@@ -314,8 +314,51 @@ the first bigger/widely-used target needs it.
     compiler's OWN source has a qualifying nested-call shape now too,
     so gen1, built by a compiler without the mechanism yet, differs from
     gen2 onward, which is stable).
-  - **Commit C** (flip `moog_taps` itself) is next: expected to need
-    zero further source changes if B is complete — see the plan doc.
+  - **Commit C ✅ SHIPPED 2026-06-22 — needed two more pieces, not zero**
+    (the plan's "expect zero further source changes" prediction was
+    wrong; corrected here by measurement, not papered over). Direct
+    trace of `classify_inlineable` (temporary, reverted before
+    committing) showed `moog_taps` still rejected at the node-count
+    cap: `body_cost=84` against `INLINE_BODY_NODE_CAP=50`.
+    1. **`perf(inliner): const-offset addressing` (`5cb1c32`)** —
+       `_inline_count_nodes` counted a struct-field/fixed-index load's
+       address (`T_BINOP('+', base, T_LIT)`, the canonical shape
+       `parse_struct_field` always emits) as 3 nodes on top of the load
+       itself, as if the `+` and the offset literal each became their
+       own instruction. They don't — base+constant-offset folds into
+       ONE load/store instruction's addressing mode on both chips, same
+       as a plain `*ptr`. New `_inline_is_const_offset_addr` recognizes
+       the shape; `_inline_count_nodes`'s T_MEMLD/T_MEMST cases count
+       just the base. Drops `moog_taps`'s `body_cost` 84 → 62 — a real,
+       general improvement to the cost model's accuracy (11 of
+       moog_taps's struct-field accesses alone were over half the old
+       total), not a moog_taps-specific carve-out. +48 B, fully green.
+    2. **The scoped multi-return cap** — 62 is still over 50. Considered
+       (user pushback, rightly) and rejected: just raising
+       `INLINE_BODY_NODE_CAP` globally, since that widens blast radius
+       for every single-return candidate too, none of which need it.
+       Considered and rejected: a formula scaling the cap by
+       `ret_arity`, since with exactly ONE real data point (arity 4 →
+       62) any per-arity coefficient is equally unfalsifiable — curve-
+       fitting through one point, dressed up as a formula instead of a
+       constant, not more principled than the constant. Shipped: a
+       SEPARATE `INLINE_MULTIRET_NODE_CAP = 70`, gated on `ret_arity > 1`
+       only — single-return bodies keep exactly the original 50,
+       untouched. The real, principled fix (LLVM-style: weight each AST
+       node by its actual instruction cost instead of flat 1-each) is
+       bigger than this evidence justifies building today; the struct-
+       addressing fix above is a step in that direction, not the whole
+       thing.
+    Verified: `bug --disasm` on `moog_slope`/`moog_tick` shows **zero
+    `bl`** at the `moog_taps` call site in both — full inlining, finally.
+    Audio export md5 unchanged. 200/0/12 native, 160/0/52 C-emit,
+    bootstrap byte-stable. **tl_bench: NO measurable movement** (~15.3-
+    15.5 ms min-of-5, same noise band as before Commit C) — eliminating
+    this one `bl` per channel per sample was not a measurable fraction
+    of `tl_render`'s real cost. This is itself the answer to Part 2's
+    decision rule below: `ours` did NOT converge toward `flat`, so the
+    remaining gap is NOT primarily inliner-shaped at this point — see
+    Part 2's first branch.
 
 **Target:** ~16.6 → ~4.5 ms (the hand-inlined `tl_bench_flat` number, as it
 stood pre-rotary); Inc 3b took the first step (16.9 → 15.3), float-leaf the
@@ -323,19 +366,26 @@ second (15.3 → 13.1 ms, *before* the rotary insert existed). The rotary
 (slice 5, 2026-06-22) then added its own per-sample `bl` back, and re-syncing
 `tl_bench`/`tl_bench_flat` to the real post-rotary, post-stereo project
 re-based the table at **15.29 ms (ours) / 5.06 ms (flat) / 3.26 ms (oracle)**
-— Inc 5 shipped the multi-return mechanism against THIS baseline and (as
-explained above) measured no movement: 15.29 → ~15.4 ms, noise. The flat/
-oracle pair is unaffected by Inc 5 either way (neither file calls
-`moog_taps`). Re-measure `ours` again once the nested-inline architecture
-lands — that's the piece that actually lets `moog_taps` (and `rotary_tick`,
-itself blocked the same way once it has a callee in scope) collapse into
-their callers. The gap past that point is Frontier 2 (RegAlloc v2 /
-liveness, roadmap F.2, `docs/plans/compiler_boost_roadmap.md`). Decision
-rule: re-measure `ours` vs `flat` after the nested-inline architecture ships
-— if `ours` is still far from `flat`, more inlining is the lever; if `ours`
-converges but `flat` stays ~1.5x behind `oracle`, disassemble `flat`'s hot
-loop first (accumulator-shuttle gap, cheap, vs. true register-pressure gap,
-the expensive CFG+liveness build) before picking which one to open.
+— Inc 5 shipped the multi-return mechanism against THIS baseline and
+measured no movement (15.29 → ~15.4 ms, noise). Inc 6 (Commits A-C) then
+shipped the nested-inline architecture AND got `moog_taps` to fully
+collapse into `moog_tick`/`moog_slope` (zero `bl`, confirmed by disasm) —
+and STILL measured no movement (~15.3-15.5 ms min-of-5). Two increments in
+a row closing real, verified inliner gaps with zero `tl_bench` effect is
+itself the signal: the remaining `ours`-vs-`flat` gap is concentrated
+somewhere call-overhead elimination doesn't reach — most likely
+`moog_slope`'s own `switch` dispatch, `rotary_tick`'s if/else, or
+`tl_channel_process`'s surrounding loop structure, none of which the
+inliner can touch without first extending past the existing control-flow
+gate (a materially bigger, separately-scoped project, not a natural next
+increment of this one). Per the plan's own decision rule: **re-disassemble
+`tl_bench`'s actual hot loop before opening anything else** — find out
+empirically where the remaining cycles go rather than assuming it's "more
+inlining" just because that's the tool already in hand. The flat/oracle
+gap (~1.5-1.6x) is unchanged by any of this (neither `tl_bench_flat` nor
+the oracle calls `moog_taps`) and remains Frontier 2's territory (RegAlloc
+v2 / liveness, roadmap F.2, `docs/plans/compiler_boost_roadmap.md`) —
+unopened, ungated change from before.
 
 ## Discipline
 
