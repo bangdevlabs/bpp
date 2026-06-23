@@ -562,3 +562,103 @@ regalloc_name_wants_live_dump(fn_name) {
     if (unpack_l(fn_name) < pfx_len) { return 0; }
     return buf_eq(vbuf + unpack_s(fn_name), "__rg_live_", pfx_len);
 }
+
+// ── RPO (Reverse Postorder) — Stage C's prerequisite sidequest ──────
+//
+// Stage C needs a LINEAR ORDER over the blocks that's faithful to real
+// emission order, to flatten per-block liveness into per-variable
+// position ranges. A block's own ALLOCATION index (the order
+// _rg_new_block was called in) is NOT that order: any construct whose
+// FIRST arm contains its own nested control flow allocates blocks for
+// the inner construct with indices past blocks ALREADY allocated for
+// what comes after the outer construct's own first arm. Concretely —
+// confirmed by hand-tracing before writing this, not assumed —
+// `while (c) { if (x) { while (y) { ... } } }`: the outer while's
+// continue-block is allocated BEFORE its body is built (so the inner
+// while's header/body/exit/continue all get LARGER indices), yet the
+// inner while's body falls through back to that already-allocated,
+// lower-indexed continue block at the end of every outer iteration —
+// a real, non-cyclic edge from a higher index to a lower one, with no
+// loop or back-edge involved at all.
+//
+// RPO is the standard fix (Poletto & Sarkar 1999's own linear-scan
+// allocator uses exactly this) — it guarantees every block reachable
+// via a forward (non-back) edge appears before its successor,
+// regardless of allocation order. Computed via standard 3-colour DFS:
+// a successor already ON THE CURRENT PATH (IN_PROGRESS) is a back-edge
+// (the defining feature of a loop) and is never recursed into — this
+// is what keeps the DFS terminating on a cyclic graph at all. A
+// successor already FINISHED (DONE) was reached via a different path
+// already (e.g. an if-arm and an else-arm both falling through to the
+// same join block) and isn't re-visited either. RPO = postorder
+// reversed.
+//
+// A block unreachable from the entry (the always-allocated-but-never-
+// linked "tail" right after a T_BREAK/T_CONTINUE/T_RET) is correctly
+// ABSENT from the result — dead code has no business in a linear
+// order, and Stage C's interval construction only walks blocks RPO
+// actually lists.
+const _RG_NOTSEEN = 0; const _RG_INPROG = 1; const _RG_DONE = 2;
+
+static _rg_rpo_visit(blocks, blk, state, postorder) {
+    auto b: CfgBlock, s;
+    arr_set(state, blk, _RG_INPROG);
+    b = arr_struct_at(blocks, blk);
+    if (b.succ_a >= 0) {
+        s = arr_get(state, b.succ_a);
+        if (s == _RG_NOTSEEN) { postorder = _rg_rpo_visit(blocks, b.succ_a, state, postorder); }
+    }
+    if (b.succ_b >= 0) {
+        s = arr_get(state, b.succ_b);
+        if (s == _RG_NOTSEEN) { postorder = _rg_rpo_visit(blocks, b.succ_b, state, postorder); }
+    }
+    arr_set(state, blk, _RG_DONE);
+    postorder = arr_push(postorder, blk);
+    return postorder;
+}
+
+// Returns an arr_new()-style array of block indices in RPO order,
+// starting from block 0 (the function's entry, always allocated first
+// by regalloc_build_cfg).
+regalloc_compute_rpo(blocks) {
+    auto n, state, postorder, i, rpo, k;
+    n = arr_struct_count(blocks);
+    state = arr_new();
+    i = 0;
+    while (i < n) { state = arr_push(state, _RG_NOTSEEN); i++; }
+    postorder = arr_new();
+    postorder = _rg_rpo_visit(blocks, 0, state, postorder);
+    rpo = arr_new();
+    k = arr_len(postorder) - 1;
+    while (k >= 0) {
+        rpo = arr_push(rpo, arr_get(postorder, k));
+        k--;
+    }
+    return rpo;
+}
+
+// Debug dump for the RPO sidequest — prints the block indices in RPO
+// order, one line. Verification tool, same role as the Stage A/B
+// dumps: triggered by the "__rg_rpo_" function-name prefix.
+void regalloc_dump_rpo(rpo, fn_name) {
+    auto n, i;
+    n = arr_len(rpo);
+    diag_str("RPO ");
+    diag_buf(vbuf + unpack_s(fn_name), unpack_l(fn_name));
+    diag_str(": [");
+    i = 0;
+    while (i < n) {
+        diag_int(arr_get(rpo, i));
+        if (i < n - 1) { diag_str(","); }
+        i++;
+    }
+    diag_str("]");
+    diag_newline();
+}
+
+regalloc_name_wants_rpo_dump(fn_name) {
+    auto pfx_len;
+    pfx_len = 9;   // length of "__rg_rpo_"
+    if (unpack_l(fn_name) < pfx_len) { return 0; }
+    return buf_eq(vbuf + unpack_s(fn_name), "__rg_rpo_", pfx_len);
+}

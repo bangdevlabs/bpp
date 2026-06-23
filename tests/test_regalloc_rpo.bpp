@@ -1,0 +1,55 @@
+// test_regalloc_rpo.bpp — RPO sidequest verification fixture (RegAlloc
+// v2, Stage C's prerequisite). Functions named __rg_rpo_* trigger
+// bpp_regalloc.bsm's RPO debug dump at compile time
+// (regalloc_name_wants_rpo_dump) — this file's PURPOSE is the
+// compiler's own stdout while compiling it, captured and checked by
+// tests/test_regalloc_rpo.sh.
+
+// The exact shape that breaks allocation-order linearization (see
+// regalloc_compute_rpo's own comment in bpp_regalloc.bsm): a while
+// loop whose body contains an if whose body contains its OWN while
+// loop. The outer loop's continue-block is allocated BEFORE its body
+// is built, so the inner while's blocks (built while processing that
+// body) get LARGER allocation indices — yet the inner while's
+// surrounding if-join falls through to that already-allocated,
+// lower-indexed continue block at the end of every outer iteration: a
+// real edge from a higher allocation index to a lower one, with no
+// loop or back-edge involved.
+//
+// Block structure (confirmed via the Stage A CFG dump on this exact
+// function, by hand before writing this test):
+//   0=entry  1=outer_header  2=outer_body(if-cond)  3=outer_exit
+//   4=outer_continue  5=if_entry  6=inner_header  7=inner_body
+//   8=inner_exit(if_exit)  9=inner_continue  10=if_join  11=tail
+// Edges (ignoring the two real back-edges, 9->6 and 4->1):
+//   0->1, 1->2, 1->3, 2->5, 2->10, 5->6, 6->7, 6->8, 7->9, 8->10, 10->4.
+// RPO must place every edge's source before its target — in
+// particular 10 before 4, even though 4's ALLOCATION index (4) is
+// lower than 10's.
+__rg_rpo_nested(c, x, y) -> word {
+    auto r;
+    r = 0;
+    while (c > 0) {
+        if (x > 0) {
+            while (y > 0) {
+                r = r + 1;
+                y = y - 1;
+            }
+        }
+        c = c - 1;
+    }
+    return r;
+}
+
+main() {
+    auto r;
+    // y is NOT reset between outer iterations, so only the FIRST
+    // outer iteration's inner loop actually runs (y reaches 0 and
+    // stays there) — r ends at 3, not 6. (Caught by hand-tracing the
+    // arithmetic with put() before writing this assertion — first
+    // draft of this test expected 6 and failed, which was this
+    // test's own bug, not the compiler's.)
+    r = __rg_rpo_nested(2, 1, 3);
+    if (r != 3) { return 1; }
+    return 0;
+}
