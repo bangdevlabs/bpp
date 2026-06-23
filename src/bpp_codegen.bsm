@@ -270,6 +270,10 @@ struct ChipPrimitives {
 
     // ── Float (5) ──
     emit_load_float_const, // (flt_id)           load const → d0
+    emit_fconst_into,      // (dreg, flt_id)     load const → d<dreg> —
+                            //   compute-in-place twin of emit_load_float_const,
+                            //   parameterized over the destination instead of
+                            //   the fixed accumulator
     emit_fcmp,             // (rs1, rs2)         double compare
     emit_fneg,             // ()                 negate result fp reg
     // Type promotions used by T_IF/WHILE/TERNARY (normalize
@@ -3295,6 +3299,18 @@ cg_float_tree_need(nd) {
     p = cg_prim;
     if (nd == 0) { return 999; }
     n = nd; t = n.ntype;
+    // Float literal leaf. The third gap found re-disassembling rotary_tick
+    // (the other two are above and below this case): a literal operand
+    // (`r.cur + 0.0001`, `x > 1.5`) always bailed out of compute-in-place
+    // entirely, on both the arithmetic and comparison paths, because
+    // neither leaf check (cg_float_leaf_kind for T_VAR, the T_MEMLD case
+    // below) recognized T_LIT at all. An int literal in a float tree is
+    // out of scope here (needs a conversion, not just a load) — only a
+    // genuine float literal qualifies.
+    if (t == T_LIT) {
+        if (cg_is_float_lit(n.a) == 0) { return 999; }
+        return 0;             // always materializable directly into dreg
+    }
     if (t == T_VAR) {
         if (cg_float_leaf_kind(nd) < 0) { return 999; }
         return 0;                                    // any leaf: 0 temps
@@ -3369,6 +3385,18 @@ cg_emit_float_into(nd, dreg) {
     auto n: Node, t, vi, off, c0, op_code, lsrc, rsrc, tr, lk, rk;
     p = cg_prim;
     n = nd; t = n.ntype;
+    // Float literal leaf — mirrors cg_float_tree_need's own T_LIT case
+    // (above), which already validated this is a genuine float literal.
+    // Registers it in the same const pool cg_emit_lit's generic path
+    // uses (no dedup there either — mirrored, not introduced here), and
+    // loads it directly into dreg instead of the fixed d0 accumulator.
+    if (t == T_LIT) {
+        auto _flid;
+        _flid = arr_len(cg_flt_tbl);
+        cg_flt_tbl = arr_push(cg_flt_tbl, n.a);
+        call(p.emit_fconst_into, dreg, _flid);
+        return 0;
+    }
     if (t == T_VAR) {
         lk = cg_float_leaf_kind(nd);
         if (lk > 0) {
