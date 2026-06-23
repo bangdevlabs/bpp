@@ -521,6 +521,53 @@ parity band).
    (every GPU/window test green again), 166/0/52 C-emit, audio md5
    unchanged, bench_codegen vs gcc -O2 unchanged.
 
+**Running total at this point: `tl_bench` 15.4 → 11.39 ms (~26%).**
+
+7. `1d68b21` — fixed a separate, genuinely pre-existing bug found while
+   chasing the next lever via fresh re-disassembly of `moog_tick` (one
+   level of nested inlining deeper than `rotary_tick`/`tl_channel_process`
+   — the user explicitly asked to fix it once found, even though it
+   predates today: "mesmo sendo pre-existente vamos consertar").
+   `ast_clone_subst`'s `T_ASSIGN` case never got the same per-element
+   clone the `T_RET` case already has for its own multi-value array —
+   the blanket `cl.c = orig.c` copy left a multi-return assignment's
+   TARGETS (`a, b, c, d = f()`) shared, unrenamed, with the original.
+   A function whose body does exactly this (`moog_tick`'s own
+   `a,b,c,d = moog_taps(m,in); return d;`) returns garbage once IT
+   ITSELF gets inlined one level further out: the renamed clone's
+   untouched target names no longer resolve via `cg_var_idx` in the
+   outer frame, so the float/int unpack decision defaults to integer
+   (`fcvtzs` truncating the result). Confirmed live, not theoretical:
+   `examples/moog_demo.bpp` — the worked example for this exact filter —
+   had been rendering complete silence (peak 0/32767) for as long as
+   `moog_tick` existed, since nothing in the test suite exercises this
+   nested shape. Fixed by mirroring `T_RET`'s own fix exactly. After:
+   peak 17561/32767, audible. `tl_bench`/audio md5 unaffected (`moog_tick`
+   itself isn't on tiny_lofi's render path — `moog_slope` is — so the bug
+   was dormant for the DAW specifically).
+
+8. `99e504e` — the lever the re-disassembly was actually chasing: with
+   commit 7 fixed first (needed to even verify this one), relaxed
+   `_cg_inline_splice_prelude`'s per-param substitution check. It had
+   two blanket exclusions beyond what correctness requires: a FLOAT
+   param ALWAYS bound regardless of the argument's own type (even when
+   already matching, no conversion to skip), and only `T_VAR`/`T_LIT`
+   arguments were eligible at all (a struct-field `T_MEMLD` read always
+   bound too, even though it's exactly as idempotent when its address is
+   the canonical `var + const-offset` shape — `cg_try_const_offset`,
+   already proven elsewhere this session). Found on the exact same
+   `moog_taps` re-disassembly: every struct-field (`mm.s1`..`mm.s4`) and
+   every local (`g`, the running pole result) bound unconditionally,
+   spending a stack round-trip per pole for values already sitting in
+   clean registers or a one-instruction struct load. A second, smaller
+   gap surfaced fixing this one: a freshly-renamed param/local's mangled
+   substitute node needs its real type copied from `cg_var_forced_ty`,
+   or a FURTHER nested splice sees `TY_UNK` and the new type-match check
+   always treats it as a mismatch. `moog_tick`: 119 → 86 instructions
+   (zero stack spills around any of the four poles, confirmed via
+   disasm). **`tl_bench`: 11.39 → 10.16 ms (~10.6%) — the single biggest
+   commit of the whole investigation.**
+
 **Running total across the whole "redisassemble instead of guess" arc:
-`tl_bench` 15.4 → 11.39 ms (~26%).** No further named lever remains; the
+`tl_bench` 15.4 → 10.16 ms (~34%).** No further named lever remains; the
 next one needs another fresh re-disassembly.
