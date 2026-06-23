@@ -329,6 +329,40 @@ Start at F.2.a (extend B3 to float); F.2.c (the full live-interval
 allocator below) stays gated until a/b are measured and a real gap
 remains.
 
+**Fully unblocked 2026-06-23** — both trigger conditions in "When to
+unblock" above are now concretely met, not hypothetical: re-disassembling
+`tl_bench_flat` (the tiny_lofi DSP chain with every function call hand-
+eliminated) measured flat/oracle = 1.44× against `gcc -O2` — a real
+arithmetic-bound gap on a real audio workload that persists with zero
+call overhead in the picture, i.e. exactly "stack traffic as a
+significant fraction of hot-loop time." Separately, auditing
+`games/rts2/rts2_combat.bsm` for the literal "RTS with 1000 units, dense
+ECS" case found `_combat_step`'s auto-acquire loop with 14
+simultaneously-live integers in a non-leaf function (13×13-tile nested
+scan, `RTS_STRESS` runs it at up to 230v230 units/frame) — real, not
+projected. **The full live-interval allocator (CFG → liveness →
+intervals → linear-scan → coalescing, 3-4 week scope per the estimate
+above) is now the open arc; the user explicitly directed it next after
+the day's inliner work closed out.**
+
+Before opening that full arc, one MUCH cheaper, zero-architecture lever
+shipped first (`045b806`, 2026-06-23): B3's ARM64 non-leaf integer
+budget only ever claimed `x19..x24` (6 of the 10 AAPCS64 reserves as
+plain callee-saved, no platform-register meaning) — `x25..x28` sat
+unused. Widened to all 10
+(`src/backend/chip/aarch64/a64_codegen.bsm`'s `_a64_b3_reg_at`),
+directly cutting `_combat_step`'s spill count from 8 of 14 down to 4 of
+14, verified via `bug --disasm` on the REAL function (not just a
+synthetic repro). No equivalent exists on x64 (`rbp` is this backend's
+real frame pointer, not spare) or on either chip's float side (`d8..d15`
+is already the FULL AAPCS64 callee-saved float set). This does NOT
+substitute for the full allocator — it is strictly the "claim
+already-legal unused registers" floor underneath it; the real
+liveness/interval work below is what actually changes the ALLOCATION
+DECISIONS (today's B3 still can't tell two non-overlapping live ranges
+could share one register), not just the register count available to a
+ref-count heuristic.
+
 ### Expected gain
 
 - 10-25% on register-pressure-heavy code (physics, transforms)
