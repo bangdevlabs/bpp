@@ -489,6 +489,9 @@ struct ChipPrimitives {
     emit_self_op_imm,         // (reg, imm, is_sub) — x<reg> = x<reg> +/- imm (in place; `i = i + 1`)
     emit_cmp_branch,          // (cond_id, left_reg, lbl) — cmp + branch-to-lbl-when-false (no cset)
     emit_cmp_branch_rr,       // (cond_id, lreg, rreg, lbl) — cmp two registers directly + branch
+    emit_cmp_flt_branch,      // (cond_id, l_freg, r_freg, lbl) — fcmp two registers directly +
+                              //   branch-to-lbl-when-false (no cset); the float twin of
+                              //   emit_cmp_branch_rr
 }
 
 // Active chip's primitive table. Allocated lazily on first call
@@ -3581,16 +3584,29 @@ cg_try_float_cmp(n, op_l, c0, c1) {
     return 1, cc;
 }
 
-// Emits n's two sides via compute-in-place into fresh SIMD temps, then
-// compares those temps directly into int_dreg (0/1). Precondition:
-// cg_try_float_cmp(n, ...) already validated this fits the budget.
-cg_emit_float_cmp_into(n, int_dreg, cc) {
+// Evaluates both sides of a comparison via compute-in-place into fresh
+// SIMD temps the caller owns (and must free, in reverse order, after
+// consuming them). Precondition: cg_try_float_cmp(n, ...) already
+// validated this fits the budget. Shared by the boolean-materializing
+// path (cg_emit_float_cmp_into) and the branch-fusion path
+// (cg_emit_cmp_to_branch's float case) below.
+cg_float_cmp_operands_into(n) {
     auto p: ChipPrimitives, lt, rt;
     p = cg_prim;
     lt = call(p.simd_temp_alloc);
     cg_emit_float_into(n.b, lt);
     rt = call(p.simd_temp_alloc);
     cg_emit_float_into(n.c, rt);
+    return lt, rt;
+}
+
+// Emits n's two sides via compute-in-place into fresh SIMD temps, then
+// compares those temps directly into int_dreg (0/1). Precondition:
+// cg_try_float_cmp(n, ...) already validated this fits the budget.
+cg_emit_float_cmp_into(n, int_dreg, cc) {
+    auto p: ChipPrimitives, lt, rt;
+    p = cg_prim;
+    lt, rt = cg_float_cmp_operands_into(n);
     call(p.emit_cmp_flt_into, int_dreg, lt, rt, cc);
     call(p.simd_temp_free, rt);
     call(p.simd_temp_free, lt);
@@ -4126,7 +4142,24 @@ cg_emit_cmp_to_branch(cond_node, exit_lbl) {
     if (cond_id < 0) { return 0; }
     lhs_n = n.b;
     lhs_ty = lhs_n.itype;
-    if (is_float_type(lhs_ty)) { return 0; }
+    if (is_float_type(lhs_ty)) {
+        // Float branch fusion — the same idea as the integer path below,
+        // reusing the float-CIP machinery (cg_try_float_cmp validates the
+        // shape + budget; cg_float_cmp_operands_into evaluates both sides
+        // into arbitrary temps) to branch directly off fcmp's flags. No
+        // cset, no boolean materialization: `if (r.cur < r.tgt)` becomes
+        // fcmp + b.cc instead of fcmp + cset + cbz. Found re-disassembling
+        // rotary_tick after the struct-field/comparison/literal float-CIP
+        // trio shipped — these were the last fcmp/cset/cbz triplets left.
+        auto _fb_ok, _fb_cc, _fb_lt, _fb_rt;
+        _fb_ok, _fb_cc = cg_try_float_cmp(n, op_l, c0, c1);
+        if (_fb_ok == 0) { return 0; }
+        _fb_lt, _fb_rt = cg_float_cmp_operands_into(n);
+        call(p.emit_cmp_flt_branch, _fb_cc, _fb_lt, _fb_rt, exit_lbl);
+        call(p.simd_temp_free, _fb_rt);
+        call(p.simd_temp_free, _fb_lt);
+        return 1;
+    }
     if (is_unsigned_type(lhs_ty)) { return 0; }
     // Both operands already in registers (promoted leaves): compare them
     // directly, no copy to scratch — `while (i < n)` becomes `cmp i, n; b.ge`.
