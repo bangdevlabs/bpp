@@ -30,10 +30,14 @@ const TEST_MS  = 250;
 
 main() {
     auto i, p, rc, cb;
+    auto t0, t1, elapsed_ms: float, buf_ms: float;
+    auto elapsed_i: word, floor_n: word, ceiling: word;
 
     audio_set_amplitude(TEST_AMP);
 
+    t0 = _stb_get_time_us();
     rc = audio_tone_test(440, TEST_MS);
+    t1 = _stb_get_time_us();
     if (rc != 0) {
         putmsg("FAIL: audio_tone_test rc = ");
         putnum(rc);
@@ -55,31 +59,75 @@ main() {
     }
 
     // The callback fires once per buffer; with 1024-frame buffers at
-    // 44100 Hz the rate is ~43 Hz, so 250 ms of runtime should yield
-    // roughly 8-16 invocations (generous bounds for scheduling jitter).
-    // Fewer than 8 means CoreAudio took the queue but never drained from
-    // it. The ceiling matters too, not just the floor: the per-buffer
-    // BYTE allocation (AudioQueueAllocateBuffer's size argument) must
-    // track the wire's frame width — when the float-device-boundary
-    // migration widened frames from 4 to 8 bytes without rescaling that
-    // allocation, buffers silently held half as many frames, the
-    // callback fired ~2x as often (observed 85 Hz instead of ~43 Hz via
-    // mini_synth's routing readout), and this floor-only check would
-    // not have caught it (more callbacks still clears >= 8).
+    // 44100 Hz the period is ~23.22 ms. The bound USED TO be a fixed
+    // 8-16 window derived from the requested TEST_MS — investigated
+    // 2026-06-22 after an intermittent failure (cb_count = 17). FIRST
+    // hypothesis, ruled out: a recurrence of the 2026-06-21 float-
+    // device-boundary bug below (frames widened 4 -> 8 bytes without
+    // rescaling the per-buffer allocation, which doubled the callback
+    // rate to ~85 Hz instead of ~43 Hz). Ruled out because the shape
+    // didn't match — that bug is a ~2x effect (cb_count ~30+), not a
+    // borderline 1-over-ceiling overage. ACTUAL cause, confirmed by
+    // measurement: 15/15 fresh single-shot runs under otherwise-quiet
+    // conditions measured cb_count == 16 EXACTLY, i.e. the common case
+    // already sat AT the old ceiling with zero slack, because
+    // `_stb_audio_sleep_ms` calls `usleep`, which is a MINIMUM wait, not
+    // a guarantee — under system load it legitimately overran by a few
+    // ms, and a fixed ceiling with no margin trips on that alone.
+    //
+    // The fix is asymmetric, NOT "derive both bounds from elapsed time" —
+    // that first attempt broke under tests/run_all_c.sh's 6-way parallel
+    // worker pool: elapsed_ms ballooned to ~415 ms there (this thread's
+    // OWN usleep starved by 5 sibling compiles+runs competing for CPU),
+    // but cb_count stayed at 16 — CoreAudio's realtime callback thread
+    // was throttled by the SAME contention, so more wall-clock time
+    // passing did NOT mean more callbacks should have fired. A floor
+    // derived from elapsed time grows with that stall and false-fails;
+    // a ceiling derived from elapsed time does not have this problem
+    // (more legitimate time can only ever justify MORE callbacks, never
+    // fewer, so inflated elapsed_ms only ever loosens the ceiling).
+    //   - FLOOR stays anchored to the REQUESTED TEST_MS (what the test
+    //     intended to wait, not how long the OS actually took to honour
+    //     it) — proves the callback fires at all, independent of how
+    //     loaded the host happens to be.
+    //   - CEILING is anchored to the ACTUAL elapsed time — proves the
+    //     RATE is right. The 2026-06-21 bug ruled out above would STILL
+    //     be caught by this ceiling in any scenario, contended or not —
+    //     its ~2x effect blows past an elapsed-time-derived bound
+    //     regardless of how much slack contention adds to it.
+    buf_ms = 1024.0 * 1000.0 / 44100.0;
+    elapsed_ms = (t1 - t0) / 1000.0;
+    // 3 priming calls happen synchronously in _stb_audio_tone_start,
+    // before the queue even starts — never time-gated, always exactly 3.
+    floor_n = 3.0 + (TEST_MS + 0.0) / buf_ms - 5.0;
+    // +4 (not +3): float->word truncation rounds toward zero, so a
+    // measured value like 16.98 (the common case) would otherwise lose
+    // almost a full unit of the intended margin.
+    ceiling = 3.0 + elapsed_ms / buf_ms + 4.0;
+    if (floor_n < 1) { floor_n = 1; }
+    elapsed_i = elapsed_ms;
+
     cb = _stb_audio_cb_count();
-    if (cb < 8) {
+    if (cb < floor_n) {
         putmsg("FAIL: cb_count = ");
         putnum(cb);
-        putmsg(" (expected ~8-16, got too few)");
+        putmsg(" (expected >= ");
+        putnum(floor_n);
+        putmsg(" from elapsed ");
+        putnum(elapsed_i);
+        putmsg("ms — too few; CoreAudio took the queue but never drained it)");
         putline();
         return 20;
     }
-    if (cb > 16) {
+    if (cb > ceiling) {
         putmsg("FAIL: cb_count = ");
         putnum(cb);
-        putmsg(" (expected ~8-16 at ~43 Hz; this many means the callback");
-        putmsg(" is firing too often — check the per-buffer byte size vs");
-        putmsg(" the wire's frame width)");
+        putmsg(" (expected <= ");
+        putnum(ceiling);
+        putmsg(" from elapsed ");
+        putnum(elapsed_i);
+        putmsg("ms; this many means the callback is firing too often — check");
+        putmsg(" the per-buffer byte size vs the wire's frame width)");
         putline();
         return 21;
     }

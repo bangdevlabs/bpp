@@ -5534,6 +5534,59 @@ static _inline_has_tcall(nd) {
     return 0;
 }
 
+// Inc 6 (nested-inline architecture) — the relaxed sibling of
+// `_inline_has_tcall` used by `classify_inlineable`'s fixpoint. A T_CALL
+// to a target that is ITSELF already `fn_inlineable` does not disqualify
+// the body — it composes (tier 1 via the existing fast-substitute path
+// with zero new machinery; multi-statement/tier-2 via the nested
+// registration `_inline_register_nested` builds). A call to anything
+// else (not yet known inlinable, or never will be) still disqualifies,
+// exactly as `_inline_has_tcall` always has. Same structure throughout,
+// kept as a separate function rather than a mode flag on the original —
+// `_inline_has_tcall` has its own callers with "any call at all"
+// semantics (`_inline_count_nodes`'s sibling helpers, the void-inline
+// path) that must keep their current behavior unchanged.
+static _inline_has_disqualifying_tcall(nd) {
+    auto n: Node, t, arr, cnt, i, fidx;
+    if (nd == 0) { return 0; }
+    n = nd;
+    t = n.ntype;
+    if (t == T_CALL) {
+        if (_inline_is_inst_builtin(n.a)) {
+            arr = n.b; cnt = n.c;
+            for (i = 0; i < cnt; i++) {
+                if (_inline_has_disqualifying_tcall(arr[i])) { return 1; }
+            }
+            return 0;
+        }
+        fidx = find_func_idx(n.a);
+        if (fidx >= 0 && arr_get(fn_inlineable, fidx)) { return 0; }
+        return 1;
+    }
+    switch (t) {
+    T_BINOP    { return _inline_has_disqualifying_tcall(n.b) || _inline_has_disqualifying_tcall(n.c); }
+    T_UNARY    { return _inline_has_disqualifying_tcall(n.b); }
+    T_MEMLD    { return _inline_has_disqualifying_tcall(n.a); }
+    T_ADDR     { return _inline_has_disqualifying_tcall(n.a); }
+    T_TERNARY  { return _inline_has_disqualifying_tcall(n.a) || _inline_has_disqualifying_tcall(n.b) || _inline_has_disqualifying_tcall(n.c); }
+    T_ASSIGN   { return _inline_has_disqualifying_tcall(n.a) || _inline_has_disqualifying_tcall(n.b); }
+    T_MEMST    { return _inline_has_disqualifying_tcall(n.a) || _inline_has_disqualifying_tcall(n.b); }
+    T_RET {
+        if (n.c > 1) {
+            arr = n.b; cnt = n.c;
+            for (i = 0; i < cnt; i++) {
+                if (_inline_has_disqualifying_tcall(arr[i])) { return 1; }
+            }
+            return 0;
+        }
+        return _inline_has_disqualifying_tcall(n.a);
+    }
+    T_DECL     { return 0; }
+    else { return 0; }
+    }
+    return 0;
+}
+
 // Count references to packed name `name_p` inside a subtree. Same
 // statement-node extension as the two siblings above.
 static _inline_param_refs(nd, name_p) {
@@ -5830,8 +5883,24 @@ static _inline_threshold(callee_idx, caller_idx, call_node) {
 // `_inline_reset_callsite_id()`.
 global _inline_callsite_id;
 
+// Inc 6 (nested-inline architecture): per-function, parallel to the
+// callsite-id space above. Index = an OUTER callsite id; value = an
+// arr_new()-style array of nested callsite ids (0 if none), in the same
+// left-to-right depth-first order `_inline_find_nested_calls` always
+// visits T_CALL nodes in. Pre-reg time (`_inline_register_nested`)
+// populates this by walking the callee's SHARED body read-only and
+// registering each nested target's own slots (safe — registration never
+// touches any node). Splice time (`_cg_inline_splice_prelude`) walks its
+// OWN fresh, structurally-identical clone with the same walker and
+// stamps `.e` from this array positionally — the only thing ever
+// mutated is the clone, never the shared original, so two different
+// outer callers of the same nested-call-containing callee (e.g.
+// moog_tick and moog_slope both calling moog_taps) can never collide.
+global _inline_nested_ids;
+
 void _inline_reset_callsite_id() {
     _inline_callsite_id = 0;
+    _inline_nested_ids = arr_new();
 }
 
 // Construct a mangled packed name `_inl<id>_<orig>` by appending
@@ -5940,18 +6009,20 @@ _inline_register_callee_locals(body_arr, body_cnt, id) {
     }
 }
 
-// Register a single inline call site. Assigns the next monotonic
-// id, stamps it on `call_node.e`, then registers `_inl<id>_<orig>`
-// slots for every callee parameter and every callee local in the
-// caller's frame. After this returns, `cg_var_idx(mangled_name)`
-// resolves to a valid slot index for use by the splice procedure.
-void _inline_register_callsite(call_node, fidx) {
-    auto cn: Node;
+// Register the slot block for one callsite: assigns the next monotonic
+// id, then registers `_inl<id>_<orig>` slots for every callee parameter
+// and every callee local in the caller's frame. After this returns,
+// `cg_var_idx(mangled_name)` resolves to a valid slot index for use by
+// the splice procedure. Returns the assigned id. Does NOT touch any
+// T_CALL node — callers decide separately whose `.e` field (if any)
+// gets stamped with the returned id (see `_inline_register_callsite`
+// below for the top-level case, `_inline_register_nested` for the
+// Inc 6 nested case, which deliberately never stamps the SHARED body).
+_inline_register_callsite_slots(fidx) {
     auto fn_rec, body_arr, body_cnt, params, pcnt, i, vi, k, ref_count;
-    auto orig_p, mangled;
+    auto orig_p, mangled, id;
     _inline_callsite_id++;
-    cn = call_node;
-    cn.e = _inline_callsite_id;
+    id = _inline_callsite_id;
     fn_rec = funcs[fidx];
     params = *(fn_rec + FN_PARS);
     pcnt = *(fn_rec + FN_PCNT);
@@ -5960,7 +6031,7 @@ void _inline_register_callsite(call_node, fidx) {
     i = 0;
     while (i < pcnt) {
         orig_p = *(params + i * 8);
-        mangled = _inline_pack_mangled_name(_inline_callsite_id, orig_p);
+        mangled = _inline_pack_mangled_name(id, orig_p);
         vi = cg_var_add(mangled);
         // Inc 4-revised: a FLOAT param's mangled slot must carry the float type,
         // or the binding store `_inl<id>_<param> = <arg>` would write a float
@@ -5984,7 +6055,138 @@ void _inline_register_callsite(call_node, fidx) {
         arr_set(cg_var_refs, vi, ref_count);
         i++;
     }
-    _inline_register_callee_locals(body_arr, body_cnt, _inline_callsite_id);
+    _inline_register_callee_locals(body_arr, body_cnt, id);
+    // Inc 6: this callee's OWN body may itself call other inlinable
+    // functions (e.g. moog_taps calling flt_onepole_tick). Register
+    // THEIR slots too, into this same outer frame, right now — before
+    // this function (and therefore pre-reg) returns. See
+    // _inline_register_nested's own comment for why this must happen
+    // here and not later, at splice/emission time.
+    _inline_register_nested(id, body_arr, body_cnt);
+    return id;
+}
+
+// Register a single inline call site reached directly from the caller's
+// own body (the top-level case — what _inline_pre_reg_walk calls). Stamps
+// the assigned id onto `call_node.e`; this is always safe here because
+// `call_node` is a node living in the CALLER's own body, which belongs to
+// exactly one function and is never shared with any other caller.
+void _inline_register_callsite(call_node, fidx) {
+    auto cn: Node, id;
+    cn = call_node;
+    id = _inline_register_callsite_slots(fidx);
+    cn.e = id;
+}
+
+// Inc 6 (nested-inline architecture) — pure-discovery walk. Appends
+// every T_CALL node (pointer) in `nd` whose target needs the binding
+// splice (multi-statement body, or tier 2 — tier 1's fast-substitute
+// path needs no pre-registered slot and already composes for free with
+// no help from this machinery; tier 3 and void-inlineable nested targets
+// are deliberately not handled yet, out of scope for this increment) to
+// `out_arr`, in deterministic left-to-right depth-first order. Does NOT
+// register anything and does NOT touch `.e` — purely read-only. Called
+// twice per nested-call-containing callee: once on the callee's SHARED,
+// canonical body (pre-reg time, via `_inline_register_nested`, to learn
+// what needs registering) and once on each caller's own FRESH,
+// structurally-identical clone (splice time, via
+// `_cg_inline_splice_prelude`, to learn which clone node gets which
+// already-registered id). Because `ast_clone_subst` preserves tree SHAPE
+// exactly, both walks visit nodes in identical order by construction —
+// this is what lets the two phases agree without any other
+// coordination, and why the shared body itself is never mutated.
+_inline_find_nested_calls(nd, out_arr) {
+    auto n: Node, t, arr, cnt, i, fidx, fn_rec2, callee_bcnt2;
+    if (nd == 0) { return out_arr; }
+    n = nd;
+    t = n.ntype;
+    if (t == T_CALL) {
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) { out_arr = _inline_find_nested_calls(arr[i], out_arr); i++; }
+        fidx = find_func_idx(n.a);
+        if (fidx >= 0 && arr_get(fn_inlineable, fidx)) {
+            fn_rec2 = funcs[fidx];
+            callee_bcnt2 = *(fn_rec2 + FN_BCNT);
+            if (callee_bcnt2 > 1 || arr_get(fn_inlineable, fidx) == 2) {
+                out_arr = arr_push(out_arr, n);
+            }
+        }
+        return out_arr;
+    }
+    switch (t) {
+    T_BINOP   { out_arr = _inline_find_nested_calls(n.b, out_arr); out_arr = _inline_find_nested_calls(n.c, out_arr); }
+    T_UNARY   { out_arr = _inline_find_nested_calls(n.b, out_arr); }
+    T_MEMLD   { out_arr = _inline_find_nested_calls(n.a, out_arr); }
+    T_ADDR    { out_arr = _inline_find_nested_calls(n.a, out_arr); }
+    T_TERNARY {
+        out_arr = _inline_find_nested_calls(n.a, out_arr);
+        out_arr = _inline_find_nested_calls(n.b, out_arr);
+        out_arr = _inline_find_nested_calls(n.c, out_arr);
+    }
+    T_ASSIGN  { out_arr = _inline_find_nested_calls(n.a, out_arr); out_arr = _inline_find_nested_calls(n.b, out_arr); }
+    T_MEMST   { out_arr = _inline_find_nested_calls(n.a, out_arr); out_arr = _inline_find_nested_calls(n.b, out_arr); }
+    T_RET {
+        if (n.c > 1) {
+            arr = n.b; cnt = n.c;
+            i = 0;
+            while (i < cnt) { out_arr = _inline_find_nested_calls(arr[i], out_arr); i++; }
+        } else {
+            out_arr = _inline_find_nested_calls(n.a, out_arr);
+        }
+    }
+    else { }
+    }
+    return out_arr;
+}
+
+// Inc 6 — pre-reg-time half of nested-inline support. `outer_id` is the
+// callsite id just assigned to the callee whose body is `body_arr`/
+// `body_cnt` (the callee's OWN, shared, canonical body — read-only).
+// Finds every nested inlinable call in it and registers each one's own
+// slot block (recursing naturally if that nested callee ALSO has nested
+// calls — bounded by the actual, acyclic call graph, no artificial depth
+// cap needed). Records the resulting ids, in discovery order, in
+// `_inline_nested_ids[outer_id]` for splice time to consume positionally.
+// Registers; never stamps `.e` on anything — see `_inline_find_nested_calls`.
+void _inline_register_nested(outer_id, body_arr, body_cnt) {
+    auto i, found, n: Node, fidx, nested_id, ids, last_stmt: Node, scan_cnt;
+    // Scope to exactly the statements splice-time's own per-statement
+    // loop will clone+walk: when the body ends in T_RET, that trailing
+    // statement is handled separately by each tail (cg_emit_inline_multi/
+    // cg_emit_inline_multi_assign), which do NOT consult _inline_nested_ids
+    // — so a nested call hiding inside the RETURN EXPRESSION itself is
+    // deliberately not discovered here (out of scope for this increment;
+    // moog_taps's own `return a,b,c,d;` has no calls in it, matching this
+    // limit exactly). A void body with no trailing T_RET has no such tail
+    // — splice's loop walks ALL body_cnt statements — so scan all of them.
+    last_stmt = body_arr[body_cnt - 1];
+    if (last_stmt.ntype == T_RET) {
+        scan_cnt = body_cnt - 1;
+    } else {
+        scan_cnt = body_cnt;
+    }
+    found = arr_new();
+    i = 0;
+    while (i < scan_cnt) {
+        found = _inline_find_nested_calls(body_arr[i], found);
+        i++;
+    }
+    if (arr_len(found) == 0) { return 0; }
+    ids = arr_new();
+    i = 0;
+    while (i < arr_len(found)) {
+        n = arr_get(found, i);
+        fidx = find_func_idx(n.a);
+        nested_id = _inline_register_callsite_slots(fidx);
+        ids = arr_push(ids, nested_id);
+        i++;
+    }
+    while (arr_len(_inline_nested_ids) <= outer_id) {
+        _inline_nested_ids = arr_push(_inline_nested_ids, 0);
+    }
+    arr_set(_inline_nested_ids, outer_id, ids);
+    return 0;
 }
 
 // AST walker — for every T_CALL anywhere in the caller's AST,
@@ -6247,6 +6449,7 @@ void classify_inlineable() {
     auto last_stmt: Node, ret_stmt: Node, ret_expr, j, ok, refs;
     auto phase, body_cost, want_void, want_bind, was_guard, has_float_param;
     auto ret_arity;
+    auto fp_changed, fp_iter, fp_sum_before, fp_sum_after, fp_si;
     while (arr_len(fn_inlineable) < func_cnt) {
         fn_inlineable = arr_push(fn_inlineable, 0);
     }
@@ -6256,6 +6459,21 @@ void classify_inlineable() {
     while (arr_len(fn_void_inlineable) < func_cnt) {
         fn_void_inlineable = arr_push(fn_void_inlineable, 0);
     }
+    // Inc 6: a candidate's nested-call gate (just above, in the loop body)
+    // reads OTHER functions' fn_inlineable — which, for a callee declared
+    // AFTER its caller in source order, isn't known yet on a single pass.
+    // Re-run the whole classification to a fixpoint: eligibility only ever
+    // grows (a function's OWN shape never changes between passes, and the
+    // gate only gets MORE permissive as more callees resolve), so comparing
+    // a simple sum across passes is a rigorous "nothing changed" test, not
+    // just a heuristic — if any index's value increased, the sum strictly
+    // increased too, since no index ever decreases. Capped at 8 passes
+    // (generous for any realistic call-depth chain; cheap even if hit
+    // every time — classify_inlineable runs once per compilation).
+    fp_sum_before = -1;
+    fp_iter = 0;
+    fp_changed = 1;
+    while (fp_changed && fp_iter < 8) {
     for (i = 0; i < func_cnt; i++) {
         arr_set(fn_inlineable, i, 0);
         arr_set(fn_void_inlineable, i, 0);
@@ -6339,10 +6557,16 @@ void classify_inlineable() {
         // (control-flow inlining is out of scope per Q1).
         body_cost = _inline_count_nodes_body(body_arr, body_cnt);
         if (body_cost > INLINE_BODY_NODE_CAP) { continue; }
-        // No T_CALL anywhere in body — walk every statement.
+        // Inc 6: a T_CALL to a target that is ALREADY fn_inlineable does
+        // not disqualify this body (it composes — see
+        // _inline_has_disqualifying_tcall's own comment). Everything
+        // else about this gate is unchanged: any call to a target that
+        // isn't (yet, this pass) inlinable still disqualifies. The
+        // surrounding fixpoint (below) is what lets "yet" eventually
+        // become "yes" for a callee declared after its caller.
         ok = 1;
         for (j = 0; j < body_cnt; j++) {
-            if (_inline_has_tcall(body_arr[j])) { ok = 0; break; }
+            if (_inline_has_disqualifying_tcall(body_arr[j])) { ok = 0; break; }
         }
         if (ok == 0) { continue; }
         // Thin-wrapper size gate: a body that inlines a peek/poke builtin is
@@ -6419,6 +6643,14 @@ void classify_inlineable() {
             arr_set(fn_inlineable, i, 1);
         }
     }
+    fp_sum_after = 0;
+    for (fp_si = 0; fp_si < func_cnt; fp_si++) {
+        fp_sum_after += arr_get(fn_inlineable, fp_si) + arr_get(fn_void_inlineable, fp_si);
+    }
+    fp_changed = (fp_sum_after != fp_sum_before);
+    fp_sum_before = fp_sum_after;
+    fp_iter++;
+    }
 }
 
 // Clone an expression subtree, replacing every T_VAR whose packed name
@@ -6460,6 +6692,24 @@ ast_clone_subst(nd, params, pcnt, args) {
         cl.b = ast_clone_subst(orig.b, params, pcnt, args);
         cl.c = ast_clone_subst(orig.c, params, pcnt, args);
     }
+    // Inc 6: reset `.e` (the callsite id) to 0 rather than inheriting the
+    // blanket copy above. `.e` is only ever meaningful WITHIN the specific
+    // function compilation that assigned it — before Inc 6's gate
+    // relaxation, an inlinable body was GUARANTEED to contain zero T_CALL
+    // nodes at all (the old unconditional has-T_CALL reject), so
+    // ast_clone_subst never actually cloned a T_CALL node and this case
+    // was inert. Now that a tier-1/2 candidate's body CAN contain a call
+    // to another inlinable function (e.g. mixer_get_rotary's single
+    // statement IS a call to rotary_get_mode, itself a registered,
+    // multi-statement callee), that inner call's `orig.e` may already
+    // hold an id from whatever context it was LAST pre-reg'd in — stale
+    // and meaningless if this clone is headed somewhere else entirely
+    // (mixer_get_rotary itself becoming an inline candidate elsewhere,
+    // not just a normal call). Re-stamping (`_inline_register_nested` +
+    // the consumption walk in `_cg_inline_splice_prelude`) is the only
+    // thing that should ever set it again — if nothing re-stamps it,
+    // falling through to a real `bl` is correct, if not yet optimal;
+    // carrying over a stale id risks reading slots from the wrong frame.
     T_CALL {
         arr = orig.b; cnt = orig.c;
         new_arr = buf_word(cnt);
@@ -6467,6 +6717,7 @@ ast_clone_subst(nd, params, pcnt, args) {
             new_arr[i] = ast_clone_subst(arr[i], params, pcnt, args);
         }
         cl.b = new_arr;
+        cl.e = 0;
     }
     // S4 P3a — statement-typed nodes. Walked symmetrically to the
     // expression cases so a multi-statement body clones with full

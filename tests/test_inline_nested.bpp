@@ -1,0 +1,93 @@
+// skip-c: native multi-value return banking (a64 x0..x7/d0..d7, x64 register window)
+// test_inline_nested.bpp — Inc 6 (docs/plans/inliner_arc.md): the
+// nested-inline architecture. Mirrors stb/stbfilter.bsm's real shape
+// (moog_taps calling flt_onepole_tick 4x) with a synthetic pair so this
+// lands BEFORE touching the real target: `inner` is a tier-2 leaf (a
+// multi-use param forces bind regardless of arg simplicity, a float
+// param forces tier 2), called 4x by EACH of two different outer leaves
+// (`outer1`/`outer2`), with a mix of T_MEMLD args (struct field loads)
+// and plain T_VAR args — exercising both the bind and substitute paths
+// at the nested level. Calling `inner` from TWO independent outers is
+// the crux: each outer's pre-reg pass resets its own callsite-id
+// sequence from 0, so the SAME shared `inner` body must never let one
+// outer's nested registration collide with the other's.
+//
+// Self-verifying: each mismatch returns a distinct non-zero code so
+// run_all.sh's exit-code check names the failing case. Expected values
+// hand-computed from inner(s,x) = s + x*(s-x), see the plan's derivation.
+
+struct St { base: float }
+
+inner(s: float, x: float) -> float {
+    return s + x * (s - x);
+}
+
+outer1(m, in: float) -> (float, float, float, float) {
+    auto mm: St, a: float, b: float, c: float, d: float;
+    mm = m;
+    a = inner(mm.base, in);
+    b = inner(a, in);
+    c = inner(b, mm.base);
+    d = inner(c, a);
+    return a, b, c, d;
+}
+
+outer2(m, in: float) -> (float, float, float, float) {
+    auto mm: St, a: float, b: float, c: float, d: float;
+    mm = m;
+    a = inner(in, mm.base);
+    b = inner(a, mm.base);
+    c = inner(b, in);
+    d = inner(c, a);
+    return a, b, c, d;
+}
+
+main() {
+    auto m: St, a: float, b: float, c: float, d: float, i;
+    m = malloc(8);
+    m.base = 2.0;
+
+    // Cold site, outer1.
+    a, b, c, d = outer1(m, 3.0);
+    if (a != 0.0 - 1.0)  { return 1; }
+    if (b != 0.0 - 13.0) { return 2; }
+    if (c != 0.0 - 43.0) { return 3; }
+    if (d != 0.0 - 1.0)  { return 4; }
+
+    // Cold site, outer2 — same callee (inner), different outer, same
+    // arguments-by-position but a different argument ORDER per call,
+    // proving the two outers' independent id sequences never collide.
+    a, b, c, d = outer2(m, 3.0);
+    if (a != 5.0)   { return 5; }
+    if (b != 11.0)  { return 6; }
+    if (c != 35.0)  { return 7; }
+    if (d != 185.0) { return 8; }
+
+    // Hot site, outer1, varying input — proves the splice re-evaluates
+    // fresh per iteration and never aliases state across calls.
+    for (i = 0; i < 3; i++) {
+        auto iv: float;
+        iv = i + 1;
+        a, b, c, d = outer1(m, iv);
+        if (i == 0) {
+            if (a != 3.0)  { return 10; }
+            if (b != 5.0)  { return 11; }
+            if (c != 11.0) { return 12; }
+            if (d != 35.0) { return 13; }
+        }
+        if (i == 1) {
+            if (a != 2.0) { return 20; }
+            if (b != 2.0) { return 21; }
+            if (c != 2.0) { return 22; }
+            if (d != 2.0) { return 23; }
+        }
+        if (i == 2) {
+            if (a != 0.0 - 1.0)  { return 30; }
+            if (b != 0.0 - 13.0) { return 31; }
+            if (c != 0.0 - 43.0) { return 32; }
+            if (d != 0.0 - 1.0)  { return 33; }
+        }
+    }
+
+    return 0;
+}

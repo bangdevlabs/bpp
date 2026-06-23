@@ -251,6 +251,72 @@ the first bigger/widely-used target needs it.
   the pre-stamped clone — so a call to an already-inlinable callee (like
   `flt_onepole_tick` inside `moog_taps`) stops disqualifying its caller.
 
+- **Inc 6 — nested-inline architecture. Commit A + B ✅ SHIPPED 2026-06-22;
+  Commit C (flip `moog_taps` for real) not started yet this session.**
+  Staged per the plan at `docs/plans/silly-leaping-sunbeam.md` (the
+  architecture writeup — pre-reg-time discovery, never mutating the
+  shared callee body, `ast_clone_subst` resetting a cloned T_CALL's `.e`
+  to 0 by default — lives there in full; this entry is the ship log).
+  - **Commit A** (`abe3185`): the SAME T_RET-multi blind spot Inc 5 fixed
+    in 4 helpers, missed in a 5th — `_inline_pre_reg_walk`
+    (`bpp_dispatch.bsm:6053`) still read only `n.a`. Fixed identically.
+    Byte-identical binary (this walker wasn't reachable from anything
+    that mattered yet), zero behavior change, ships alone so nothing
+    later is a suspect if something regresses.
+  - **Commit B**: the mechanism itself. `classify_inlineable`'s single
+    pass became a fixpoint (`while(changed && iter<8)`; B++ has no
+    `do-while`, so it's a pre-seeded `while`) — needed because the
+    relaxed gate (`_inline_has_disqualifying_tcall`, a sibling of
+    `_inline_has_tcall` that exempts a call to an ALREADY-`fn_inlineable`
+    target) reads OTHER functions' `fn_inlineable`, which a callee
+    declared after its caller wouldn't have yet on one pass. New
+    `_inline_register_callsite_slots`/`_inline_find_nested_calls`/
+    `_inline_register_nested` register a nested call's own param/local
+    slots into the SAME outer frame, read-only on the callee's shared
+    body (never stamping `.e` there) — splice time
+    (`_cg_inline_splice_prelude`) walks its OWN fresh clone with the
+    same deterministic walker and stamps the pre-registered ids
+    positionally via a cursor that persists across the whole
+    per-statement loop (a first draft that reset the cursor per
+    statement was a real bug, caught before shipping — every statement
+    after the first nested call would have been stamped with the WRONG
+    id). Two real bugs surfaced by REAL pre-existing code, not just the
+    new synthetic test:
+    1. `ast_clone_subst`'s blanket `cl.e = orig.e` copy was dead code
+       before Inc 6 (an inlinable body was previously GUARANTEED
+       call-free, so this line never ran on a T_CALL node) — once the
+       gate relaxed, `stbmixer.bsm`'s `mixer_get_rotary() { return
+       rotary_get_mode(_mx_rotary); }` (a single-statement tier-1 body
+       whose ENTIRE statement IS a call to a multi-statement callee)
+       became newly eligible, and its tier-1 fast path (unrelated,
+       pre-existing code in `a64_codegen.bsm`) cloned that inner call
+       node verbatim — carrying a callsite id meaningful only within
+       `mixer_get_rotary`'s OWN compile into whatever frame
+       `mixer_get_rotary` later got spliced into. `test_mixer_rotary`
+       caught it (`extrn '_inl1_r' has no backing definition`). Fix:
+       `ast_clone_subst`'s T_CALL case now resets `.e` to 0 explicitly;
+       only an explicit re-stamp (this increment's own mechanism) sets
+       it again.
+    2. `test_audio_tone.bpp`'s cb_count window — unrelated to the
+       inliner, surfaced only because it happened to run in the same
+       suite pass; see that file's own header comment for the full
+       investigation (ruled out a recurrence of the 2026-06-21 float-
+       device-boundary bug; actual cause was a zero-margin fixed ceiling
+       plus, after the first fix attempt, a second issue where deriving
+       BOTH bounds from elapsed wall-clock time broke under
+       `run_all_c.sh`'s 6-way parallel contention).
+  - Verified on `tests/test_inline_nested.bpp` (two independent outer
+    leaves calling the same nested callee, each with its own id
+    sequence — the exact multi-caller-collision shape Inc 6 exists to
+    make safe): disasm confirms zero `bl` in either outer. 200/0/12
+    native, 160/0/52 C-emit, audio md5 unchanged, bootstrap byte-stable
+    from gen2 (gen1≠gen2 is the documented 1-cycle oscillation — the
+    compiler's OWN source has a qualifying nested-call shape now too,
+    so gen1, built by a compiler without the mechanism yet, differs from
+    gen2 onward, which is stable).
+  - **Commit C** (flip `moog_taps` itself) is next: expected to need
+    zero further source changes if B is complete — see the plan doc.
+
 **Target:** ~16.6 → ~4.5 ms (the hand-inlined `tl_bench_flat` number, as it
 stood pre-rotary); Inc 3b took the first step (16.9 → 15.3), float-leaf the
 second (15.3 → 13.1 ms, *before* the rotary insert existed). The rotary

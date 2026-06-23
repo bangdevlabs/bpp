@@ -2970,6 +2970,7 @@ _cg_inline_splice_prelude(call_node, fidx) -> (word, word, word, ptr) {
     auto arg_node: Node, arg_t;
     auto bind_needed;
     auto is_void_splice, last_emit;
+    auto nested_ids, nested_found, nk, nested_node: Node;
     cn = call_node;
     callsite_id = cn.e;
     inl_callee = funcs[fidx];
@@ -3095,9 +3096,43 @@ _cg_inline_splice_prelude(call_node, fidx) -> (word, word, word, ptr) {
     } else {
         last_emit = inl_bcnt - 1;
     }
+    // Inc 6 (nested-inline architecture): if pre-reg found nested inlinable
+    // calls in THIS callee's body (_inline_register_nested, keyed by this
+    // exact callsite_id), `nk` tracks how many we've stamped so far —
+    // shared ACROSS every statement in this loop, since multiple
+    // statements can each carry one nested call (moog_taps's 4 separate
+    // `flt_onepole_tick` calls, one per assignment) and they must consume
+    // `nested_ids` in the same single left-to-right sequence pre-reg's
+    // discovery walk produced it in, not restart per statement.
+    nk = 0;
+    if (callsite_id < arr_len(_inline_nested_ids)) {
+        nested_ids = arr_get(_inline_nested_ids, callsite_id);
+    } else {
+        nested_ids = 0;
+    }
     si = 0;
     while (si < last_emit) {
         cloned = ast_clone_subst(inl_body[si], names_buf, total_names, args_buf);
+        // Stamp this statement's share of nested_ids onto its clone —
+        // never the shared original. `_inline_find_nested_calls` visits
+        // T_CALL nodes in the same deterministic order pre-reg's own
+        // discovery walk did (ast_clone_subst preserves tree shape
+        // exactly), so the next `nk` ids it finds are always the right
+        // ones. Once `.e` is set, the nested call needs no further
+        // special-casing — cg_emit_stmt below reaches it through the
+        // ordinary T_CALL dispatch, which recurses into this same splice
+        // machinery on its own.
+        if (nested_ids != 0) {
+            nested_found = arr_new();
+            nested_found = _inline_find_nested_calls(cloned, nested_found);
+            i = 0;
+            while (i < arr_len(nested_found)) {
+                nested_node = arr_get(nested_found, i);
+                nested_node.e = arr_get(nested_ids, nk);
+                nk++;
+                i++;
+            }
+        }
         cg_emit_stmt(cloned);
         si++;
     }
