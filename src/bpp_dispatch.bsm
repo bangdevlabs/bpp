@@ -5393,7 +5393,22 @@ static _inline_count_nodes(nd) {
     T_LIT, T_VAR, T_NOP, T_BREAK, T_CONTINUE { return 1; }
     T_BINOP    { sum += _inline_count_nodes(n.b) + _inline_count_nodes(n.c); }
     T_UNARY    { sum += _inline_count_nodes(n.b); }
-    T_MEMLD    { sum += _inline_count_nodes(n.a); }
+    // Inc 6: a struct-field / fixed-index load's address is the canonical
+    // base+const-offset shape, which folds into ONE load instruction's
+    // addressing mode — see _inline_is_const_offset_addr's own comment.
+    // Skip straight to the base, leaving the '+' and the offset literal
+    // uncounted (they never become separate instructions); count the
+    // ADDRESS expression as today for anything else (e.g. a computed
+    // index, `*ptr`, or a manually-built address).
+    T_MEMLD {
+        auto memld_a: Node;
+        if (_inline_is_const_offset_addr(n.a)) {
+            memld_a = n.a;
+            sum += _inline_count_nodes(memld_a.b);
+        } else {
+            sum += _inline_count_nodes(n.a);
+        }
+    }
     T_ADDR     { sum += _inline_count_nodes(n.a); }
     T_TERNARY  { sum += _inline_count_nodes(n.a) + _inline_count_nodes(n.b) + _inline_count_nodes(n.c); }
     T_CALL {
@@ -5405,7 +5420,19 @@ static _inline_count_nodes(nd) {
     // = addr, .b = value (cg_b3_walk:1114). T_RET.a = return expr.
     // T_DECL stands alone (no child walk in cg_b3_walk:2710).
     T_ASSIGN   { sum += _inline_count_nodes(n.a) + _inline_count_nodes(n.b); }
-    T_MEMST    { sum += _inline_count_nodes(n.a) + _inline_count_nodes(n.b); }
+    // Same const-offset-addressing discount as T_MEMLD above, applied to
+    // a struct-field STORE's address (n.a here IS the address directly,
+    // not wrapped in another T_MEMLD — a store needs the address, not a
+    // loaded value).
+    T_MEMST {
+        auto memst_a: Node;
+        if (_inline_is_const_offset_addr(n.a)) {
+            memst_a = n.a;
+            sum += _inline_count_nodes(memst_a.b) + _inline_count_nodes(n.b);
+        } else {
+            sum += _inline_count_nodes(n.a) + _inline_count_nodes(n.b);
+        }
+    }
     // Inc 5 (multi-value return inlining): a multi-return T_RET stores its
     // expression list in n.b/n.c (n.a aliases n.b[0] — see parse_return,
     // bpp_parser.bsm). Counting only n.a would silently undercount results
@@ -5436,6 +5463,27 @@ static _inline_count_nodes(nd) {
 static _inline_name_eq(name_p, lit, litlen) {
     if (unpack_l(name_p) != litlen) { return 0; }
     return buf_eq(vbuf + unpack_s(name_p), lit, litlen);
+}
+
+// Inc 6 — is `nd` the canonical "base + constant offset" address shape
+// (`parse_struct_field`, bpp_parser.bsm:3191-3196: T_BINOP('+', base,
+// T_LIT(offset))? This is what EVERY struct-field / fixed-array-index
+// access compiles down to — base register plus immediate offset folds
+// into ONE load/store instruction's addressing mode on both chips, never
+// a separate ADD. `_inline_count_nodes` uses this to avoid overstating
+// a struct-heavy body's cost (found investigating moog_taps: counting
+// the '+' and the offset literal as if they were their own instructions
+// made an 11-struct-field-access, single-load-each body look 2x more
+// expensive than it actually compiles to).
+static _inline_is_const_offset_addr(nd) {
+    auto n: Node, c: Node;
+    if (nd == 0) { return 0; }
+    n = nd;
+    if (n.ntype != T_BINOP) { return 0; }
+    if (_inline_name_eq(n.a, "+", 1) == 0) { return 0; }
+    if (n.c == 0) { return 0; }
+    c = n.c;
+    return c.ntype == T_LIT;
 }
 
 // Inline-instruction builtins: the peek/poke family, each lowering to ONE
@@ -6348,8 +6396,9 @@ _inline_collect_locals(body_arr, body_cnt, out_buf) {
 // per-callsite in `_inline_threshold`). This is the absolute
 // ceiling on raw `node_count(body)` — no call site, no caller
 // hotness, no const-arg bonus can push a body past it. LLVM
-// uses 50 for `OptSizeThreshold`; xorshift64 (the S4 anchor)
-// is ~31 nodes, leaving ~19 nodes of headroom.
+// uses 50 for `OptSizeThreshold`; xorshift64 (the original S4
+// anchor) is ~31 nodes.
+//
 const INLINE_BODY_NODE_CAP = 50;
 // Tighter cap for bodies that inline a peek/poke builtin: a thin single-
 // instruction wrapper (read_u16 ≈ 5 nodes) is size-neutral to inline, but a
