@@ -38,10 +38,23 @@ import "bpp_arr.bsm";
 // arms of an if, a loop's continue-or-exit test, one switch arm's
 // pass/fail) uses both; a block ending in T_RET — or an unreachable
 // tail right after T_BREAK/T_CONTINUE/T_RET — uses neither.
+// use_bits/def_bits/live_in/live_out are Stage B's liveness fields —
+// 0 until regalloc_compute_liveness runs. Each is a single-word bitset
+// (bit vi = variable index vi), capping tracked variables per function
+// at 64 — the largest function measured during this whole arc's
+// motivating investigation (games/rts2/rts2_combat.bsm's _combat_step,
+// 14 simultaneously-live integers) is comfortably under that, and nine
+// elsewhere checked the same day topped out lower still; revisit with a
+// real multi-word bitset only if a function is ever found that needs
+// it, not speculatively.
 struct CfgBlock {
-    stmts,    // arr_new()-style growable array of statement-node pointers
-    succ_a,   // -1 if none
-    succ_b    // -1 if none
+    stmts,      // arr_new()-style growable array of statement-node pointers
+    succ_a,     // -1 if none
+    succ_b,     // -1 if none
+    use_bits,   // read in this block before any def in the SAME block
+    def_bits,   // written somewhere in this block
+    live_in,    // live at block entry
+    live_out    // live at block exit
 }
 
 // Per-function CFG-under-construction state. Reset at the top of every
@@ -73,6 +86,10 @@ static _rg_new_block() {
     b.stmts = arr_new();
     b.succ_a = -1;
     b.succ_b = -1;
+    b.use_bits = 0;
+    b.def_bits = 0;
+    b.live_in = 0;
+    b.live_out = 0;
     return idx;
 }
 
@@ -335,4 +352,213 @@ regalloc_name_wants_dump(fn_name) {
     pfx_len = 10;   // length of "__rg_dump_"
     if (unpack_l(fn_name) < pfx_len) { return 0; }
     return buf_eq(vbuf + unpack_s(fn_name), "__rg_dump_", pfx_len);
+}
+
+// ── Stage B — liveness analysis ─────────────────────────────────────
+//
+// Classic backward dataflow over Stage A's CFG: for each block, compute
+// live_in/live_out (which LOCAL variables — globals are never B3/regalloc
+// candidates, so they're not tracked at all) are live, iterating until
+// nothing changes. Per-block working sets are a single 64-bit word
+// (bit vi = variable index vi, from the SAME cg_var_idx every other
+// codegen pass already uses) — see CfgBlock's own field comment for why
+// one word is enough for every function measured so far.
+
+// The bit for variable index `vi`, or 0 if vi is untracked (not a local
+// at all — cg_var_idx returns -1 for globals/unknowns — or past the
+// 64-variable cap this single-word bitset enforces).
+static _rg_var_bit(vi) {
+    if (vi < 0 || vi >= 64) { return 0; }
+    return 1 << vi;
+}
+
+// Every local variable an EXPRESSION reads, as a bitset. Expressions
+// never define a variable on their own (only T_ASSIGN's target, T_MEMST's
+// address/value being assignment-adjacent statements handle that) — this
+// is pure use-side, recursing into every expression-shaped node type the
+// AST has.
+static _rg_expr_uses(nd) {
+    auto n: Node, t, bits, arr, cnt, i;
+    if (nd == 0) { return 0; }
+    n = nd; t = n.ntype;
+    if (t == T_VAR) { return _rg_var_bit(cg_var_idx(n.a)); }
+    if (t == T_BINOP) { return _rg_expr_uses(n.b) | _rg_expr_uses(n.c); }
+    if (t == T_UNARY) { return _rg_expr_uses(n.b); }
+    if (t == T_MEMLD) { return _rg_expr_uses(n.a); }
+    // &x — address-taken. cg_b3_eligible already excludes address-taken
+    // locals from promotion entirely (their value must live at a stable
+    // frame address), so this stage doesn't need to do anything special
+    // with the bit beyond recording the read for completeness.
+    if (t == T_ADDR) { return _rg_expr_uses(n.a); }
+    if (t == T_TERNARY) { return _rg_expr_uses(n.a) | _rg_expr_uses(n.b) | _rg_expr_uses(n.c); }
+    if (t == T_CALL) {
+        arr = n.b; cnt = n.c; bits = 0;
+        i = 0;
+        while (i < cnt) { bits = bits | _rg_expr_uses(arr[i]); i++; }
+        return bits;
+    }
+    return 0;   // T_LIT, T_DECL, T_NOP, T_BREAK, T_CONTINUE: no reads
+}
+
+// One statement's own (use, def) bit pair. The use side reflects every
+// variable READ by this statement regardless of what it also defines —
+// `x = x + 1` both uses and defines x, and the read must count since
+// x's incoming value matters. T_ASSIGN.a is always a plain T_VAR (or,
+// for a multi-target assignment, T_ASSIGN.c is an array of plain T_VAR —
+// confirmed directly in bpp_parser.bsm's parse_assign: any LHS that is
+// itself a T_MEMLD becomes a T_MEMST instead, so T_ASSIGN's own target
+// side is never a complex address).
+static _rg_stmt_use_def(nd) {
+    auto n: Node, t, use_bits, def_bits, vi, arr, cnt, i, tnode: Node;
+    use_bits = 0; def_bits = 0;
+    if (nd == 0) { return use_bits, def_bits; }
+    n = nd; t = n.ntype;
+
+    if (t == T_ASSIGN) {
+        use_bits = _rg_expr_uses(n.b);
+        if (n.d > 1) {
+            arr = n.c; cnt = n.d;
+            i = 0;
+            while (i < cnt) {
+                tnode = arr[i];
+                if (tnode != 0 && tnode.ntype == T_VAR) {
+                    def_bits = def_bits | _rg_var_bit(cg_var_idx(tnode.a));
+                }
+                i++;
+            }
+        } else if (n.a != 0 && n.a.ntype == T_VAR) {
+            def_bits = _rg_var_bit(cg_var_idx(n.a.a));
+        }
+        return use_bits, def_bits;
+    }
+    // A store THROUGH an address — the base var is read (the address is
+    // computed FROM it), never written; only what it points to changes,
+    // which liveness over LOCAL VARIABLES has no bit for.
+    if (t == T_MEMST) {
+        use_bits = _rg_expr_uses(n.a) | _rg_expr_uses(n.b);
+        return use_bits, def_bits;
+    }
+    if (t == T_RET) {
+        if (n.c > 1) {
+            arr = n.b; cnt = n.c;
+            i = 0;
+            while (i < cnt) { use_bits = use_bits | _rg_expr_uses(arr[i]); i++; }
+        } else {
+            use_bits = _rg_expr_uses(n.a);
+        }
+        return use_bits, def_bits;
+    }
+    if (t == T_DECL || t == T_BREAK || t == T_CONTINUE || t == T_NOP) {
+        return use_bits, def_bits;
+    }
+    // A bare expression-statement (e.g. a void-returning T_CALL used in
+    // statement position) or a control-flow condition node this stage
+    // hands directly to _rg_emit (T_IF/T_WHILE/T_SWITCH's own n.a) —
+    // pure use, no def.
+    use_bits = _rg_expr_uses(nd);
+    return use_bits, def_bits;
+}
+
+// Computes block `blk`'s own use_bits/def_bits from its statement list,
+// in order — a read only counts as a block-level "use" if no EARLIER
+// statement in the same block already defined that variable (the
+// classic kill-then-gen sequencing liveness needs to be exact).
+static void _rg_compute_block_use_def(blocks, blk) {
+    auto b: CfgBlock, i, n, su, sd, killed, use_acc, def_acc;
+    b = arr_struct_at(blocks, blk);
+    n = arr_len(b.stmts);
+    killed = 0; use_acc = 0; def_acc = 0;
+    i = 0;
+    while (i < n) {
+        su, sd = _rg_stmt_use_def(arr_get(b.stmts, i));
+        use_acc = use_acc | (su & ~killed);
+        killed = killed | sd;
+        def_acc = def_acc | sd;
+        i++;
+    }
+    b.use_bits = use_acc;
+    b.def_bits = def_acc;
+}
+
+// Computes live_in/live_out for every block in `blocks` (a handle
+// returned by regalloc_build_cfg). Backward dataflow to a fixpoint —
+// no block's live set can shrink once grown (a variable, once proven
+// live, stays live until the iteration that correctly narrows it), so
+// a simple "did anything change this pass" loop converges to the exact
+// answer, same fixpoint-to-convergence shape classify_inlineable's own
+// Inc 6 loop already uses (bpp_dispatch.bsm). Pure analysis — still
+// nothing in codegen reads live_in/live_out yet; Stage C (live
+// intervals) is the first consumer.
+void regalloc_compute_liveness(blocks) {
+    auto n, i, changed, b: CfgBlock, sb: CfgBlock, new_out, new_in;
+    n = arr_struct_count(blocks);
+    i = 0;
+    while (i < n) {
+        _rg_compute_block_use_def(blocks, i);
+        i++;
+    }
+    changed = 1;
+    while (changed) {
+        changed = 0;
+        i = 0;
+        while (i < n) {
+            b = arr_struct_at(blocks, i);
+            new_out = 0;
+            if (b.succ_a >= 0) { sb = arr_struct_at(blocks, b.succ_a); new_out = new_out | sb.live_in; }
+            if (b.succ_b >= 0) { sb = arr_struct_at(blocks, b.succ_b); new_out = new_out | sb.live_in; }
+            new_in = b.use_bits | (new_out & ~b.def_bits);
+            if (new_out != b.live_out || new_in != b.live_in) {
+                b.live_out = new_out;
+                b.live_in = new_in;
+                changed = 1;
+            }
+            i++;
+        }
+    }
+}
+
+// Debug dump for Stage B — prints each block's use/def/live-in/live-out
+// bitsets as decimal integers (a 64-bit word, one bit per tracked
+// variable index — bit vi set means variable index vi).
+// Same verification role regalloc_dump_cfg plays for Stage A: nothing
+// in codegen reads liveness yet, so a human (or a test script grepping
+// this output) is the only consumer. Called instead of
+// regalloc_dump_cfg when the function name carries the
+// "__rg_live_" prefix (see regalloc_name_wants_live_dump) — kept
+// separate from the Stage A dump so a test fixture can opt into
+// whichever stage's output it actually wants to check.
+void regalloc_dump_liveness(blocks, fn_name) {
+    auto n, i, b: CfgBlock;
+    n = arr_struct_count(blocks);
+    diag_str("LIVE ");
+    diag_buf(vbuf + unpack_s(fn_name), unpack_l(fn_name));
+    diag_str(": ");
+    diag_int(n);
+    diag_str(" blocks");
+    diag_newline();
+    i = 0;
+    while (i < n) {
+        b = arr_struct_at(blocks, i);
+        diag_str("  block ");
+        diag_int(i);
+        diag_str(": use=");
+        diag_int(b.use_bits);
+        diag_str(" def=");
+        diag_int(b.def_bits);
+        diag_str(" live_in=");
+        diag_int(b.live_in);
+        diag_str(" live_out=");
+        diag_int(b.live_out);
+        diag_newline();
+        i++;
+    }
+}
+
+// Does `fn_name` start with "__rg_live_"? Mirrors
+// regalloc_name_wants_dump exactly, for Stage B's own dump trigger.
+regalloc_name_wants_live_dump(fn_name) {
+    auto pfx_len;
+    pfx_len = 10;   // length of "__rg_live_"
+    if (unpack_l(fn_name) < pfx_len) { return 0; }
+    return buf_eq(vbuf + unpack_s(fn_name), "__rg_live_", pfx_len);
 }

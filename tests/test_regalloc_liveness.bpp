@@ -1,0 +1,67 @@
+// test_regalloc_liveness.bpp — Stage B verification fixture (RegAlloc v2).
+// Functions named __rg_live_* trigger bpp_regalloc.bsm's liveness debug
+// dump at compile time (regalloc_name_wants_live_dump) — this file's
+// PURPOSE is the compiler's own stdout while compiling it, captured and
+// checked by tests/test_regalloc_liveness.sh, not this program's
+// runtime behavior (though that's verified too — every function is a
+// real, runnable body with real assertions in main()).
+//
+// Variable indices are assigned in declaration order by cg_var_add:
+// params first, then each `auto` in source order — so the expected
+// use/def/live bitsets in the .sh script's comments can be hand-traced
+// against this exact declaration order.
+
+// vi: a=0, b=1 (params), x=2, y=3.
+// x and y are both defined before any read in this block (kill-then-
+// gen), so neither enters `use` despite being read later in the SAME
+// block — only a and b (read with no preceding def) do.
+__rg_live_straightline(a, b) -> word {
+    auto x, y;
+    x = a + 1;
+    y = b + x;
+    return y;
+}
+
+// vi: n=0 (param), i=1, sum=2.
+// i and sum are both carried across every loop iteration (live through
+// the header AND the body) — the exact "stays live across a whole
+// loop" shape live-interval construction (Stage C) needs to get right.
+__rg_live_loop(n) -> word {
+    auto i, sum;
+    i = 0;
+    sum = 0;
+    while (i < n) {
+        sum = sum + i;
+        i = i + 1;
+    }
+    return sum;
+}
+
+// vi: a=0 (param), p=1, q=2.
+// `p` dies at the end of the if-arm (never read again); `q` is born
+// fresh in the else-arm with no relation to `p`. The two never coexist
+// — exactly the non-overlapping-live-range shape this whole arc exists
+// to let a future stage (linear-scan) notice and share a register for,
+// which today's B3 cannot see at all (it only counts total references).
+__rg_live_nonoverlap(a) -> word {
+    auto p, q;
+    if (a > 0) {
+        p = a + 1;
+        return p;
+    }
+    q = a - 1;
+    return q;
+}
+
+main() {
+    auto r;
+    r = __rg_live_straightline(10, 20);
+    if (r != 31) { return 1; }
+    r = __rg_live_loop(5);
+    if (r != 10) { return 2; }
+    r = __rg_live_nonoverlap(5);
+    if (r != 6) { return 3; }
+    r = __rg_live_nonoverlap(0 - 5);
+    if (r != 0 - 6) { return 4; }
+    return 0;
+}
