@@ -438,11 +438,35 @@ above.
    investigation, confirming the disasm-driven prediction that this was
    the dominant remaining lever.
 
-**Final tally, `rotary_tick`'s own disassembly: 35 → 5 `fmov` (86%
-reduction). `tl_bench`: 15.4 → 12.07 ms min-of-5 (~22% across all four
-commits).** What's left, still visible in the same disasm, still
-unstarted: branch-fusion (skip `cset` when a comparison feeds straight
-into a `cbz`, emitting `fcmp; b.cc` instead of `fcmp; cset; cbz`) — the
-remaining `fcmp`/`cset`/`cbz` triplets in `rotary_tick` are the candidate
-sites. No further float-CIP leaf gap is known; this arc's struct-field/
+**`rotary_tick`'s own disassembly: 35 → 5 `fmov` (86% reduction).
+`tl_bench`: 15.4 → 12.07 ms min-of-5 (~22% across the four float-CIP
+commits).** No further float-CIP leaf gap is known; the struct-field/
 comparison/literal trio is, as far as re-disassembly shows, complete.
+
+5. `6cdff89` — float comparison branch fusion. `cg_emit_cmp_to_branch`
+   (the shared T_IF/T_WHILE condition-fusion gate) already fused integer
+   comparisons into `cmp + b.cc` with no boolean materialization; it
+   explicitly bailed out for floats, falling back to `fcmp + cset + cbz`.
+   Extended it by reusing the float-CIP machinery (`cg_try_float_cmp` for
+   eligibility, a new shared `cg_float_cmp_operands_into` helper, a new
+   `emit_cmp_flt_branch` primitive mirroring `emit_cmp_branch_rr`).
+   `rotary_tick`: 6 of the remaining `fcmp`/`cset`/`cbz` triplets fused to
+   `fcmp`/`b.cc` (175 → 169 instructions). **`tl_bench`: 12.07 → 12.11 ms
+   — no measurable movement, reported honestly.** A `cset` feeding an
+   immediately-following `cbz` sits off the critical dependency path on
+   an out-of-order core (the branch predictor speculates past it
+   regardless), so removing one non-blocking instruction per comparison
+   doesn't show up in wall-clock time — the same lesson this manual
+   already documents for integer loop control on the biquad kernel
+   (`docs/manual/bootstrap_manual.md`, "Codegen Quality and the
+   Register-Allocation Frontier"). The struct-field/comparison/literal
+   trio's gains were real because they removed work ON the critical path
+   (extra loads, extra `fmov` copies feeding the next dependent op); this
+   one doesn't. Verified correct regardless (boundary `<=`/`>=` cases
+   tested explicitly, both `if` and `while` call sites) — a real,
+   shipped, disasm-confirmed change, just not a measured speedup on this
+   benchmark.
+
+**This closes the branch-fusion lever named at the end of the float-CIP
+trio.** No further named, unstarted lever from this investigation
+remains — the next one would need a fresh re-disassembly to find.
