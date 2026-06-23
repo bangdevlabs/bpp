@@ -1016,6 +1016,14 @@ global cg_var_promote;
 // register (or -1). cg_b3_loop_depth tracks loop nesting during the B3 walk.
 global cg_const_val, cg_const_wt, cg_const_reg;
 global cg_b3_loop_depth;
+// Set by T_MEMLD/T_MEMST just before emitting an address, when that address
+// is the canonical base+const-offset shape (struct field / fixed-index
+// access) — see cg_try_const_offset. The chip's load/store primitive reads
+// this instead of a hardcoded 0 so the offset folds into the instruction's
+// own addressing mode (one `ldr [base, #off]`) instead of a separate
+// `add` to compute the full address first. Always reset to 0 right after
+// the primitive consumes it, so it never leaks into unrelated code.
+global cg_addr_const_off;
 // Set by the B3 walk: 1 if the function makes NO calls (a leaf). A leaf may
 // promote locals into caller-saved registers too — nothing can clobber them
 // mid-function — widening the budget beyond the callee-saved pool.
@@ -3969,6 +3977,58 @@ cg_emit_cmp_to_branch(cond_node, exit_lbl) {
     return 1;
 }
 
+// Recognizes the canonical base+const-offset address shape
+// (T_BINOP('+', base, T_LIT) — what struct-field access and fixed-index
+// array access always parse to) and, when safe, returns the base node
+// plus the offset value so the caller can emit ONE addressing-mode load/
+// store instead of computing the address via a separate `add`.
+//
+// "Safe" means the offset fits EVERY access width's encoding: ARM64's
+// LDR/STR unsigned-offset immediate is a 12-bit field scaled by the
+// access size (so a uoff that's a multiple of 8 and under 32760 is fine
+// for a double load, but the SAME numeric value divided by 4 might
+// overflow 12 bits for a narrower access) — rather than track which
+// width will be used here, this picks one bound that is safe for every
+// width B++ has (byte through double): offset in 0..4095 and a multiple
+// of 8. Real struct field offsets in this codebase are always far under
+// this (every field is a full 8-byte word slot unless sliced, so
+// offsets are 0, 8, 16, ... by construction) — the bound exists so a
+// pathological future case falls back to the always-correct path
+// (compute the full address via `add`) instead of risking a corrupted
+// encoding, never so it can silently miscompile something large.
+//
+// `fh` is the access's field-hint (T_MEMLD.b / T_MEMST.c) — needed
+// because ARM64's unsigned-offset immediate is scaled by the access
+// width: 16 bytes for the SIMD `:double` q-register path, 8 for every
+// scalar float/word width this primitive loads/stores (all <= 8 bytes,
+// narrower slices use the same 8-aligned base load + a bitfield extract
+// — see `_a64_emit_memld_load`'s SL_BIT..SL_BIT7 case). Dividing an
+// offset by the wrong scale silently truncates it (8 / 16 == 0) instead
+// of erroring, so this picks the alignment the ACTUAL access needs,
+// not a single one-size-fits-all guess.
+//
+// Returns (ok, base_node, offset). When ok == 0, base_node/offset are
+// not meaningful — caller must emit the ORIGINAL address node unchanged.
+cg_try_const_offset(nd, fh) {
+    auto n: Node, c: Node, off, need_align;
+    if (nd == 0) { return 0, 0, 0; }
+    n = nd;
+    if (n.ntype != T_BINOP) { return 0, 0, 0; }
+    if (cg_str_eq(n.a, "+", 1) == 0) { return 0, 0, 0; }
+    if (n.c == 0) { return 0, 0, 0; }
+    c = n.c;
+    if (c.ntype != T_LIT) { return 0, 0, 0; }
+    off = parse_int_lit_value(c.a);
+    if (off < 0 || off > 4095) { return 0, 0, 0; }
+    if (is_float_type(fh) && ty_slice(fh) == SL_DOUBLE) {
+        need_align = 16;
+    } else {
+        need_align = 8;
+    }
+    if (off % need_align != 0) { return 0, 0, 0; }
+    return 1, n.b, off;
+}
+
 // Wave 21 takeover: the spine owns expression emission for every
 // AST case. Eight cases handled inline (T_LIT, T_VAR including
 // stack-struct address-of via emit_addr_stack_struct, T_TERNARY,
@@ -4040,9 +4100,19 @@ cg_emit_node(nd) {
             call(p.emit_iv_load, 0, arr_get(cg_iv_reg, _ivk));
             return 0;
         }
-        ety = call(p.emit_node, n.a);
+        auto _cok, _cbase: Node, _coff, _mret;
+        _cok, _cbase, _coff = cg_try_const_offset(n.a, n.b);
+        if (_cok) {
+            ety = call(p.emit_node, _cbase);
+            cg_addr_const_off = _coff;
+        } else {
+            ety = call(p.emit_node, n.a);
+            cg_addr_const_off = 0;
+        }
         if (ety == 1) { call(p.emit_demote_flt_to_int); }
-        return call(p.emit_memld_load, n.b);
+        _mret = call(p.emit_memld_load, n.b);
+        cg_addr_const_off = 0;
+        return _mret;
     }
 
     // T_ADDR: &x. Locals / globals take straight primitive paths;
