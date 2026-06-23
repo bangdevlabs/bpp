@@ -1,0 +1,106 @@
+// test_b3_wider_pool.bpp — B3's non-leaf integer promotion budget widened
+// from x19..x24 (6 registers) to x19..x28 (10 registers). AAPCS64
+// reserves all ten as plain callee-saved general-purpose registers with
+// no special platform meaning (only x18 carries a reservation, and it
+// is never touched) — x25..x28 were simply never claimed before.
+//
+// Found scoping RegAlloc v2: games/rts2/rts2_combat.bsm's _combat_step
+// auto-acquire loop has 14 simultaneously-live integers in a NON-LEAF
+// function (it calls helpers inside the nested scan), so the old 6-reg
+// budget spilled 8 of them to the frame every iteration of a 13x13 grid
+// scan. This test mirrors that exact shape — a non-leaf function (calls
+// a helper inside the nested loop, so the leaf-only x9..x12 extension
+// never applies) with more locals than the OLD budget but within the
+// NEW one — and checks the computed result against a value hand-traced
+// independently of how many registers any of it lives in.
+
+// Forces non-leaf classification: a real call inside the hot loop.
+helper(x) -> word { return x * 2 + 1; }
+
+// 14 simultaneously-relevant integers through the nested loop, same
+// shape as _combat_step's auto-acquire scan: mgx,mgy,ox,oy,other,ofa,
+// ddx,ddy,d2,best_eid,best_d2,my_player (12) + 2 more to push past the
+// OLD 6-register budget with margin (14 total, matching the real case).
+scan(mgx, mgy, range, my_player) -> word {
+    auto ox, oy, other, ofa, ddx, ddy, d2;
+    auto best_eid, best_d2, hits, sum_d2;
+    best_eid = 0 - 1;
+    best_d2 = 0;
+    hits = 0;
+    sum_d2 = 0;
+    oy = mgy - range;
+    while (oy <= mgy + range) {
+        ox = mgx - range;
+        while (ox <= mgx + range) {
+            other = helper(ox + oy);
+            ofa = other & 0xFF;
+            if (ofa != my_player) {
+                ddx = ox - mgx;
+                ddy = oy - mgy;
+                d2 = ddx * ddx + ddy * ddy;
+                sum_d2 = sum_d2 + d2;
+                hits = hits + 1;
+                if (best_eid < 0 || d2 < best_d2) {
+                    best_eid = other;
+                    best_d2 = d2;
+                }
+            }
+            ox = ox + 1;
+        }
+        oy = oy + 1;
+    }
+    return best_eid * 1000000 + best_d2 * 1000 + hits;
+}
+
+main() {
+    auto r, expect_hits, expect_best_d2, expect_best_eid;
+    auto mgx, mgy, range, my_player;
+    auto ox, oy, ddx, ddy, d2, other, ofa, best_eid, best_d2, hits;
+
+    mgx = 10; mgy = 10; range = 6; my_player = 7;
+
+    // Hand-trace the SAME loop independently (no shared code path with
+    // `scan`'s own register allocation) to derive the expected result.
+    best_eid = 0 - 1; best_d2 = 0; hits = 0;
+    oy = mgy - range;
+    while (oy <= mgy + range) {
+        ox = mgx - range;
+        while (ox <= mgx + range) {
+            other = (ox + oy) * 2 + 1;   // matches helper(x) = x*2+1
+            ofa = other & 0xFF;
+            if (ofa != my_player) {
+                ddx = ox - mgx; ddy = oy - mgy;
+                d2 = ddx * ddx + ddy * ddy;
+                hits = hits + 1;
+                if (best_eid < 0 || d2 < best_d2) {
+                    best_eid = other; best_d2 = d2;
+                }
+            }
+            ox = ox + 1;
+        }
+        oy = oy + 1;
+    }
+    expect_best_eid = best_eid; expect_best_d2 = best_d2; expect_hits = hits;
+
+    r = scan(mgx, mgy, range, my_player);
+    if (r != expect_best_eid * 1000000 + expect_best_d2 * 1000 + expect_hits) {
+        return 1;
+    }
+
+    // Re-run with different inputs (varying my_player, the gate that
+    // changes which iterations count as "hits") to catch any state
+    // leaking across calls — e.g. a promoted register from one call
+    // surviving uninitialised into the next.
+    r = scan(0, 0, 6, 1000);   // my_player never matches any real ofa
+    expect_hits = 13 * 13;     // every iteration is a hit
+    if (r != 0) {
+        // best_eid/best_d2 will differ — only check hits via the low digits
+        auto low3;
+        low3 = r - (r / 1000) * 1000;
+        if (low3 != expect_hits) { return 2; }
+    } else {
+        return 3;   // r should never be exactly 0 for this input
+    }
+
+    return 0;
+}
