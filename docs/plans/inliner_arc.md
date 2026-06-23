@@ -469,4 +469,58 @@ comparison/literal trio is, as far as re-disassembly shows, complete.
 
 **This closes the branch-fusion lever named at the end of the float-CIP
 trio.** No further named, unstarted lever from this investigation
-remains — the next one would need a fresh re-disassembly to find.
+remained at that point — a fresh re-disassembly was needed to find the
+next one, which the user explicitly asked for (after first re-checking
+`examples/bench_codegen.bpp` against the `--c` + `gcc -O2` oracle to
+confirm the float-CIP trio hadn't regressed the canonical kernels — it
+hadn't: lcg 0.99x, xform 1.08x, biquad 1.01x, all within the documented
+parity band).
+
+6. `832e75b` — typed push/pop for call arguments. Re-disassembling
+   `tl_channel_process` (one call deep from `tl_render`, not
+   `rotary_tick` this time) found a different, much bigger-in-scope
+   pattern: every call argument was pushed through the stack as raw
+   integer bits (a float bit-reinterpreted via `fmov` first), popped
+   back positionally, then a separate rearrange pass routed each one
+   into its real AAPCS64/SysV bank — paying 2 extra `fmov`s per float
+   argument plus a `mov` for any int argument whose bank position
+   differed from its push position. The fix already existed, proven, on
+   both chips, for the `call()` builtin (FFI by raw function pointer):
+   record each argument's type into a small `types_buf`, push through
+   the type-matched primitive, pop in reverse order routing directly
+   into the final ABI register via the spine's `cg_count_tags`. Ported
+   that exact pattern to `a64_emit_call`/`x64_emit_call`'s "Regular B++
+   function call" path; `cg_emit_call_arg_rearrange` and its two
+   primitives are now dead and deleted.
+
+   Verification surfaced a real, **pre-existing** bug (confirmed via a
+   direct disasm diff against a pre-change build — same wrong final
+   register state in both, not introduced today): `cg_find_ext_by_argc`
+   matches an FFI extern by name + arg count only, and
+   `_stb_platform_macos.bsm` declares `objc_msgSend` with two different
+   6-arg overloads (`ptr,ptr,double,double,double,double` vs
+   `ptr,ptr,int,ptr,ptr,int`) — the lookup always picks the first one in
+   source order, silently routing a real `NSDate*` argument into a float
+   register for the Cocoa event loop's `nextEventMatchingMask:...` call.
+   This had been surviving by coincidence (whatever garbage was left in
+   the wrongly-unused integer register happened to be harmless); the
+   call-argument rewrite changed nearby register timing enough that it
+   stopped being harmless, crashing every test that opens a real window
+   (`test_gpu_clear`/`shapes`/`circle`/`rect`/`atlas_aseprite`,
+   `test_stbgame_native`) with `-[__NSCFNumber timeIntervalSinceNow]:
+   unrecognized selector`. Fixed by no longer consulting the (possibly
+   ambiguous) declared param type for FFI argument ROUTING at all —
+   route by the argument's own evaluated type instead, since every real
+   call site already passes explicitly-typed literals matching the
+   intended param. `cg_ext_par_is_float` is now unused, removed.
+
+   `tl_channel_process`: the `fmov` bounce around its `rotary_tick` call
+   is gone, confirmed via disasm. **`tl_bench`: 12.07 → 11.39 ms (~5.6%)**
+   — unlike branch-fusion, this removes work that WAS on the critical
+   path (the extra `fmov`s feed directly into the call). 206/0/12 native
+   (every GPU/window test green again), 166/0/52 C-emit, audio md5
+   unchanged, bench_codegen vs gcc -O2 unchanged.
+
+**Running total across the whole "redisassemble instead of guess" arc:
+`tl_bench` 15.4 → 11.39 ms (~26%).** No further named lever remains; the
+next one needs another fresh re-disassembly.
