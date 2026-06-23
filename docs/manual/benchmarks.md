@@ -125,13 +125,34 @@ the per-increment progress signal):
 | `flt_onepole_tick` | 0 | 0 | 0 | matched-float leaf — **now inlined into moog_taps** |
 | `arr_struct_at` | 0 | 0 | 0 | guard-clause → ternary, tier-3 hot-only; inlined at hot sites (3b), standalone for ~80 cold callers |
 
-**Audio correctness baseline:** `tiny_lofi.bpp --render` writes
-`tiny_lofi_test.wav`. The DAW went **stereo** on 2026-06-19
-(`docs/plans/audio_stereo_dogfood.md` S1: `tl_channel_process -> (float, float)`
-+ per-channel constant-power pan), so the baseline is now
-**`3e258737c9f0ef83193793b63eb7eed8`** (real stereo — L≠R; bass centred, lead
-panned right). The prior `7ee452e7…` was the **mono** baseline (superseded by the
-stereo feature, not a regression); the older `8b8742ca…` was stale.
+**Audio correctness baseline (current, 2026-06-23):**
+**`f61fac72be5077a6e9ef9cae21dde2a1`**. `tiny_lofi.bpp --render` writes
+`tiny_lofi_test.wav`; this is the md5 every codegen-only commit must
+reproduce exactly (a change here means the render changed, not just got
+faster/slower).
+
+The chain of supersession, so a future session doesn't re-investigate
+this from scratch (each step changed the bytes for a real, legitimate
+reason — none are regressions):
+
+| md5 | Established at | Why it changed from the previous one |
+|---|---|---|
+| `8b8742ca…` | (early) | stale before `7ee452e7…` was even recorded — predated a `tiny_lofi.bpp` content edit |
+| `7ee452e7…` | pre-2026-06-19 | the **mono** baseline |
+| `3e258737…` | `9f925f8` (2026-06-19, stereo S1) | DAW went stereo (`tl_channel_process -> (float,float)`, per-channel pan) |
+| `3caa9325…` | `1d9208f` (2026-06-22, slice 3 close) | the hardcoded demo project's own CONTENT grew across normal feature commits (WAV import slice 6a, slice 3 editing) between `9f925f8` and here — never written down, found only by bisecting with `git worktree` while investigating the gap below |
+| **`f61fac72…`** | **`2ce22b1`** (2026-06-22) | **int→float migration**: `tl_render` moved from writing s16 (`write_u16`) to writing float32 natively (`pokefloat_h`), matching `stbmixer`'s and the CoreAudio device wire's own float32 format end-to-end; the s16-on-disk WAV conversion moved into a separate `tl_export` pass. Confirmed by direct A/B render at `2ce22b1~1` vs `2ce22b1` (same demo content, only the render/export code path differs) — `3caa9325…` → `f61fac72…`, exactly isolating this one change. |
+
+**Lesson — when re-verifying an audio md5 "regression," bisect with a
+disposable `git worktree`, don't trust the comment.** This doc had
+drifted two supersessions behind (`3e258737…`) while a whole inliner
+session (commits `832e75b`..`c6e19e8`, 2026-06-23) correctly used
+`f61fac72…` as its running baseline without ever cross-checking it
+against this file — the number itself was right throughout, only the
+doc was stale. `git worktree add /tmp/wt <rev>` + rebuild + render at
+each candidate revision is the reliable way to re-derive which commit
+owns which hash; do not assume a md5 mismatch against this doc means a
+real regression without doing that walk first.
 
 **Note — the inliner-arc tl_bench table above is the MONO record** (16.9→13.1
 across the arc). The DAW is now a **stereo** workload (`tl_bench` ~14.6 ms,
@@ -139,6 +160,46 @@ across the arc). The DAW is now a **stereo** workload (`tl_bench` ~14.6 ms,
 multi-return unpack). Don't compare the mono and stereo numbers directly; the
 inliner arc paused at 13.1 ms mono. Stereo also made `tl_channel_process` the
 first real **multi-return product consumer** (the eventual Inc 5 target).
+
+#### 2026-06-23 — full catalog re-run after the "redisassemble instead of
+guess" arc (float-CIP trio, branch fusion, typed call-arg push/pop, two
+inliner fixes — `docs/plans/inliner_arc.md`'s addendum has the per-commit
+detail)
+
+Full catalog run end to end (every benchmark in this doc, not just
+`tl_bench`) on the installed binary at commit `c6e19e8`, cross-checked
+against the historical numbers above rather than reported in isolation:
+
+| Benchmark | Historical | Today | Verdict |
+|---|---|---|---|
+| `bench_compile.sh` bootstrap | 0.25s (2026-06-17) | 0.25s | unchanged |
+| `bench_codegen` lcg vs gcc -O2 | 1.02× (parity) | 0.93× | parity held |
+| `bench_codegen` xform vs gcc -O2 | 1.10× | 1.01× | better |
+| `bench_codegen` biquad vs gcc -O2 | 1.02× (parity) | 0.95× | parity held |
+| `tl_bench` (stereo) | ~14.6 ms / 205× (pre-session baseline) | **10.86 ms / 274×** | **~26% better** — today's cumulative win, not yet a named row above |
+| `tl_bench_flat` (stereo) | n/a (mono record was 4201 µs) | 5298 µs | consistent with stereo roughly doubling the mono flat number |
+| oracle (`gcc -O2` on `tl_bench.bpp`, stereo) | n/a (mono record was 2339 µs) | 3684 µs | consistent, same reasoning |
+| `bench_compose` | 4× (89.9→19.3 ms, 2026-06-17) | 3× (72.5→19.4 ms) | COMPOSE side flat; SERIAL side moved with machine load, not a code regression |
+| `bench_simd_raw` | ~3× | 3× | unchanged |
+| `bench_autovec_gate.sh` | PASS | PASS | — |
+| `bench_mixed_auto.sh` | PASS | PASS | — |
+| `bench_outline` | (no historical row) | 6×, 92% vs hand-written explicit | healthy |
+| `bench_ecs_iter` | ~1.12× (2026-06-17; now informational, gate moved) | 0.95× | within the "informational" band the test itself declares |
+| `bench_ecs_physics_simd` | ~2× | 2×, PASS (positions match bit-for-bit) | unchanged |
+| `bench_ecs_scheduler` | PASS | PASS (45% of sequential) | unchanged |
+| `bench_ecs_sparse_query` | ~22× (unspecified selectivity) | 2.95×–13.82× (10%/2% selectivity buckets) | same direction, different selectivity than whatever the historical row used |
+| `bench_stbflow` (A* vs flow) | ~5× | 4× | within noise |
+| `tablah` / `tablah_opt` | 12.5/1.0/17.5/16.7 ms, 6.7/1.3/18.6/12.1 ms | 14.7/1.2/18.2/17.0 ms, 6.7/1.2/19.2/13.3 ms | within noise, same 24544-item filter result both variants |
+
+**Audio correctness:** confirmed against the corrected baseline above
+(`f61fac72…`) — unchanged across every commit of the day's session.
+
+**Takeaway:** the whole catalog holds at parity or better against its
+own history; `tl_bench` is the one row with a real, durable improvement
+worth a permanent entry (added above). Machine noise (not code) explains
+every other delta in either direction — none of the moved numbers
+correspond to a commit that should have touched that benchmark's code
+path.
 
 ### Autovectorisation + outlining (parallel)
 
