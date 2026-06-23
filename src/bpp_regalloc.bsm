@@ -775,3 +775,208 @@ regalloc_name_wants_ivl_dump(fn_name) {
     if (unpack_l(fn_name) < pfx_len) { return 0; }
     return buf_eq(vbuf + unpack_s(fn_name), "__rg_ivl_", pfx_len);
 }
+
+// ── Stage D — linear-scan allocation (SHADOW MODE — not wired) ──────
+//
+// Poletto & Sarkar's own linear-scan algorithm (1999), the standard
+// real allocators use: sort intervals by start position, scan left to
+// right keeping a pool of free LOGICAL slots, assign a free slot to
+// each new interval, release slots whose interval has expired, and
+// spill (no slot) when the pool runs out — preferring to spill
+// whichever interval (active or incoming) has the FURTHEST end_pos,
+// since that frees a slot for the longest future stretch.
+//
+// Deliberately CHIP-AGNOSTIC: this only ever talks about a slot COUNT
+// (`budget`, a plain integer the caller passes — e.g. 10 for the a64
+// non-leaf integer pool today), never a physical register name. The
+// translation from logical slot to physical register stays where B3
+// already keeps it (_a64_b3_reg_at and its x64 sibling) — this stage
+// only decides WHICH variable gets WHICH slot number, exactly the
+// boundary Tonify's spine/chip split draws everywhere else in this
+// compiler.
+//
+// SHADOW MODE: this stage's output isn't wired into cg_var_promote or
+// anything else codegen reads yet. Before that swap (a future Stage E
+// increment), its decisions need side-by-side validation against B3
+// across the real test suite + real production code
+// (games/rts2/rts2_combat.bsm's _combat_step) — not assumed correct
+// just because the algorithm is textbook-standard.
+struct RegAssign {
+    var_idx,
+    slot   // -1 = spilled (no register); >=0 = logical slot index
+}
+
+struct _RgActive {
+    var_idx,
+    end_pos,
+    slot,
+    dead   // 1 once expired — arr_struct has no remove, so expired
+           // entries are marked dead and skipped rather than compacted
+}
+
+// Returns an arr_new()-style array of indices into `intervals`, in
+// ascending start_pos order. Selection sort — interval counts are
+// single digits to low tens per function, so O(n^2) is irrelevant;
+// ties keep their original (var_idx-ascending) relative order, since
+// the inner swap only fires on a STRICT `<`.
+static _rg_sort_order_by_start(intervals) {
+    auto n, order, i, j, tmp, a: LiveInterval, b: LiveInterval;
+    n = arr_struct_count(intervals);
+    order = arr_new();
+    i = 0;
+    while (i < n) { order = arr_push(order, i); i++; }
+    i = 0;
+    while (i < n) {
+        j = i + 1;
+        while (j < n) {
+            a = arr_struct_at(intervals, arr_get(order, i));
+            b = arr_struct_at(intervals, arr_get(order, j));
+            if (b.start_pos < a.start_pos) {
+                tmp = arr_get(order, i);
+                arr_set(order, i, arr_get(order, j));
+                arr_set(order, j, tmp);
+            }
+            j++;
+        }
+        i++;
+    }
+    return order;
+}
+
+// Finds `var_idx`'s own entry in `assigns` (built earlier in the same
+// scan, one entry per interval already processed) and forces it to -1
+// — used when an already-assigned active interval loses its slot to a
+// later, longer-lived spill decision.
+static void _rg_force_spill(assigns, var_idx) {
+    auto n, i, asn: RegAssign;
+    n = arr_struct_count(assigns);
+    i = 0;
+    while (i < n) {
+        asn = arr_struct_at(assigns, i);
+        if (asn.var_idx == var_idx) { asn.slot = -1; return; }
+        i++;
+    }
+}
+
+// Computes a register assignment for every interval in `intervals`
+// (Stage C's own output), against a logical slot budget of `budget`.
+// Returns an arr_struct of RegAssign, one entry per variable. SHADOW
+// MODE — see this section's own header comment; nothing reads this
+// yet.
+regalloc_linear_scan(intervals, budget) {
+    auto order, n, i, idx, cur: LiveInterval, active, k, act: _RgActive;
+    auto assigns, asn: RegAssign, free_slots, slot;
+    auto worst_k, worst_end, worst_var;
+
+    order = _rg_sort_order_by_start(intervals);
+    n = arr_len(order);
+    active = arr_struct_new(sizeof(_RgActive), 8);
+    assigns = arr_struct_new(sizeof(RegAssign), n);
+    free_slots = arr_new();
+    slot = budget - 1;
+    while (slot >= 0) { free_slots = arr_push(free_slots, slot); slot--; }
+
+    i = 0;
+    while (i < n) {
+        idx = arr_get(order, i);
+        cur = arr_struct_at(intervals, idx);
+
+        // EXPIRE: release any live active entry whose end_pos already
+        // precedes this interval's start -- its slot is free again.
+        k = 0;
+        while (k < arr_struct_count(active)) {
+            act = arr_struct_at(active, k);
+            if (act.dead == 0 && act.end_pos < cur.start_pos) {
+                free_slots = arr_push(free_slots, act.slot);
+                act.dead = 1;
+            }
+            k++;
+        }
+
+        asn = arr_struct_at(assigns, arr_struct_alloc(assigns));
+        asn.var_idx = cur.var_idx;
+
+        if (arr_len(free_slots) > 0) {
+            slot = arr_pop(free_slots);
+            asn.slot = slot;
+            act = arr_struct_at(active, arr_struct_alloc(active));
+            act.var_idx = cur.var_idx;
+            act.end_pos = cur.end_pos;
+            act.slot = slot;
+            act.dead = 0;
+        } else {
+            // No free slot: spill whichever interval (the incoming one,
+            // or one currently active) has the FURTHEST end_pos.
+            worst_k = -1; worst_end = cur.end_pos; worst_var = -1;
+            k = 0;
+            while (k < arr_struct_count(active)) {
+                act = arr_struct_at(active, k);
+                if (act.dead == 0 && act.end_pos > worst_end) {
+                    worst_end = act.end_pos; worst_k = k; worst_var = act.var_idx;
+                }
+                k++;
+            }
+            if (worst_k < 0) {
+                // The incoming interval itself is the worst -- it spills,
+                // every active assignment is untouched.
+                asn.slot = -1;
+            } else {
+                // The active one at worst_k spills; the incoming interval
+                // takes over its slot (and its place in `active`).
+                act = arr_struct_at(active, worst_k);
+                asn.slot = act.slot;
+                _rg_force_spill(assigns, worst_var);
+                act.var_idx = cur.var_idx;
+                act.end_pos = cur.end_pos;
+            }
+        }
+        i++;
+    }
+    return assigns;
+}
+
+// Debug dump for Stage D — prints each variable's slot assignment (or
+// "spill"), in increasing var_idx order for a stable, comparable dump
+// (RegAssign entries are built in start_pos-scan order, not var_idx
+// order). Walks every possible variable index (0..63, the same single-
+// word-bitset cap every earlier stage uses) and looks up its entry by
+// linear search — n is tiny (single digits to low tens per function),
+// so this is simpler and safer than sorting in place, and it never
+// mutates `assigns` (display is read-only; a future stage may still
+// need these exact values afterward). Same verification role as every
+// earlier stage's dump.
+void regalloc_dump_assignments(assigns, fn_name) {
+    auto n, i, vi, asn: RegAssign;
+    n = arr_struct_count(assigns);
+    diag_str("ASN ");
+    diag_buf(vbuf + unpack_s(fn_name), unpack_l(fn_name));
+    diag_str(": ");
+    diag_int(n);
+    diag_str(" vars");
+    diag_newline();
+    vi = 0;
+    while (vi < 64) {
+        i = 0;
+        while (i < n) {
+            asn = arr_struct_at(assigns, i);
+            if (asn.var_idx == vi) {
+                diag_str("  var ");
+                diag_int(asn.var_idx);
+                diag_str(": ");
+                if (asn.slot < 0) { diag_str("spill"); } else { diag_str("slot "); diag_int(asn.slot); }
+                diag_newline();
+            }
+            i++;
+        }
+        vi++;
+    }
+}
+
+// Does `fn_name` start with "__rg_asn_"? Mirrors the other stages'
+// dump-trigger checks exactly.
+regalloc_name_wants_asn_dump(fn_name) {
+    auto pfx_len;
+    pfx_len = 9;   // length of "__rg_asn_"
+    if (unpack_l(fn_name) < pfx_len) { return 0; }
+    return buf_eq(vbuf + unpack_s(fn_name), "__rg_asn_", pfx_len);
+}
