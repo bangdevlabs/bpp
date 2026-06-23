@@ -285,6 +285,28 @@ later stages add work; Stage E (the actual codegen swap) is the point
 where this cost needs to be weighed against a real measured win, not
 before.
 
+**Stage E shipped, same day** — the actual codegen swap (per-function:
+linear-scan replaces B3's integer-local decision when the systematic
+comparison clears AND no variable needed live-range splitting), a64
+only. Closing the loop on the line above:
+
+```
+AFTER (+ Stage E live):  bootstrap min 0.29s, median 0.31s (10 runs)
+```
+
+`bench_codegen`'s `manylive` kernel (the one purpose-built to exercise
+the non-overlapping-slot-sharing shape) moved from ~143-150ms to
+~139ms against the same gcc -O2 oracle (~88ms) — a real, if partial,
+win; checksums match exactly both before and after. Confirmed via
+`bug --disasm` on two real cases: the regalloc test fixture's
+`__rg_asn_straightline` (`a` and `y` correctly share x19, sequentially,
+no corruption) and `manylive_sum` itself (uses the full 14-register
+leaf budget, still spills 3-4 of its 18 locals to stack — expected,
+not a bug, since even perfect sharing can't fit 18 variables in 14
+slots). Audio export md5 unchanged; full native (214/0/12) + C-emit
+(172/0/54) suites green; real games (rts2, fps_wolf3d, bang9) compile
+and run clean.
+
 ### Autovectorisation + outlining (parallel)
 
 | Benchmark | Measures | Run | Good |

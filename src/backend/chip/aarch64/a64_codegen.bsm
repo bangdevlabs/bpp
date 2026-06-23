@@ -222,6 +222,7 @@ void cg_install_arm64_primitives() {
     p.emit_frame_setup       = fn_ptr(_a64_emit_frame_setup);
     p.emit_save_callee_saved = fn_ptr(_a64_emit_save_callee_saved);
     p.b3_select              = fn_ptr(_a64_b3_select_prim);
+    p.regalloc_apply         = fn_ptr(_a64_regalloc_apply);
     p.emit_arg_copy_int      = fn_ptr(_a64_emit_arg_copy_int);
     p.emit_arg_copy_flt      = fn_ptr(_a64_emit_arg_copy_flt);
     p.emit_frame_teardown    = fn_ptr(_a64_emit_frame_teardown);
@@ -571,6 +572,77 @@ void _a64_b3_select() {
         _a64_b3_claim_freelist(reg);
         used++;
     }
+}
+
+// RegAlloc v2 Stage E — replaces _a64_b3_select's own integer-local
+// decision (already run, already populated cg_var_promote and
+// a64_promoted_regs) with the linear-scan one. Refuses (returns 0,
+// leaving B3's decision untouched) when:
+//   - the linear-scan wants to promote a variable B3 itself would
+//     never have considered (cg_b3_eligible == 0 — address-taken,
+//     stack-struct, float, or sub-word-sliced). regalloc_linear_scan's
+//     intervals come from touched-bits, which track every
+//     cg_var_idx-resolvable local regardless of B3 eligibility, so
+//     this check is NOT redundant with anything upstream;
+//   - any assigned slot doesn't map to a real register (a budget
+//     mismatch — should not happen if the caller passed the right
+//     budget, but fail closed, not open).
+// Validates everything FIRST, with zero mutation, so a refused swap
+// always leaves B3's own decision completely intact — only once every
+// check passes does pass 2 touch any shared state.
+//
+// On success: resets cg_var_promote + a64_promoted_regs, rebuilds both
+// from `assigns` via _a64_b3_reg_at (the SAME table _a64_b3_select
+// itself reads — no new register policy, just a different SELECTOR
+// feeding the same physical pool), re-claims the freelist for every
+// newly-promoted register (mirrors _a64_b3_select's own per-pick
+// _a64_b3_claim_freelist call), and re-runs constant promotion
+// (_a64_b3_select_const) since it claims whatever budget the local
+// pass leaves over — that budget just changed.
+_a64_regalloc_apply(assigns) {
+    auto n, i, asn: RegAssign, reg, nv, nc;
+    n = arr_struct_count(assigns);
+
+    // Pass 1 (validate ONLY — no mutation yet).
+    i = 0;
+    while (i < n) {
+        asn = arr_struct_at(assigns, i);
+        if (asn.slot >= 0) {
+            if (cg_b3_eligible(asn.var_idx) == 0) { return 0; }
+            if (_a64_b3_reg_at(asn.slot) < 0) { return 0; }
+        }
+        i++;
+    }
+
+    // Pass 2 (apply). Reset cg_var_promote + a64_promoted_regs (B3's
+    // own decision, already computed) and rebuild both from `assigns`.
+    arr_clear(cg_var_promote);
+    nv = arr_len(cg_vars);
+    i = 0;
+    while (i < nv) { cg_var_promote = arr_push(cg_var_promote, -1); i++; }
+    arr_clear(a64_promoted_regs);
+
+    i = 0;
+    while (i < n) {
+        asn = arr_struct_at(assigns, i);
+        if (asn.slot >= 0) {
+            reg = _a64_b3_reg_at(asn.slot);
+            arr_set(cg_var_promote, asn.var_idx, reg);
+            a64_promoted_regs = arr_push(a64_promoted_regs, reg);
+            _a64_b3_claim_freelist(reg);
+        }
+        i++;
+    }
+
+    // Constant promotion (Stage 2a) claims budget left over AFTER
+    // locals — cg_const_reg already holds B3's own picks from before
+    // this swap; clear them back to "unpromoted" so the re-run
+    // considers the NEW remaining budget fresh, not B3's old one.
+    nc = arr_len(cg_const_reg);
+    i = 0;
+    while (i < nc) { arr_set(cg_const_reg, i, -1); i++; }
+    _a64_b3_select_const();
+    return 1;
 }
 
 // Stage 2a — promote the hottest loop-invariant constants into whatever
