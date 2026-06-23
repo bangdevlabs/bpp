@@ -1,0 +1,99 @@
+// skip-c: native multi-value return banking (chain -> (float, float, float, float))
+// test_inline_float_multiuse_subst.bpp — _cg_inline_splice_prelude's
+// per-param substitution eligibility, extended to float params and
+// T_MEMLD struct-field args (this session's fix). Mirrors
+// stb/stbfilter.bsm's moog_taps -> flt_onepole_tick shape exactly: a
+// multi-use FLOAT param (`s` used twice: `s + g*(in-s)`) previously
+// ALWAYS bound (blanket float exclusion), even when the argument was a
+// plain struct-field read or local variable that's exactly as safe to
+// substitute as the existing T_VAR/T_LIT case already was for non-float
+// params.
+//
+// Also exercises the bug found verifying the fix: when the OUTER
+// function (here `chain`, like moog_taps) is ITSELF nested-inlined into
+// `chain4` (like moog_tick), its own locals get renamed to fresh
+// `_inl<N>_<name>` nodes — and those fresh nodes must carry the
+// renamed local's real type (copied from cg_var_forced_ty), or the
+// per-param eligibility check above always sees a type mismatch for
+// the SECOND level of inlining and falls back to binding regardless.
+// Without the itype-copy fix, this exact shape (4 chained calls, each
+// passing the previous result) silently fell back to binding every
+// step — correct but slow (extra frame-slot spills), confirmed via
+// bug --disasm on the real moog_tick before/after.
+
+struct Pair { lo: float, hi: float }
+
+// `s` used twice: the multi-use float param this whole fix targets.
+step(s: float, in: float, g: float) -> float {
+    return s + g * (in - s);
+}
+
+// Chains 4 steps, each call's `s` argument a struct-field read or a
+// local — exactly moog_taps's shape (mm.s1/mm.s2/mm.s3/mm.s4, then
+// a/b/c as the next stage's `in`).
+chain(p, in: float) -> (float, float, float, float) {
+    auto pp: Pair, g: float, a: float, b: float, c: float, d: float;
+    pp = p;
+    g = 0.5;
+    a = step(pp.lo, in, g);
+    b = step(pp.hi, a, g);
+    c = step(pp.lo, b, g);
+    d = step(pp.hi, c, g);
+    return a, b, c, d;
+}
+
+// `chain` itself gets nested-inlined here (multi-return forces tier 2),
+// exactly mirroring moog_tick delegating to moog_taps.
+chain4(p, in: float) -> float {
+    auto (a, b, c, d): float;
+    a, b, c, d = chain(p, in);
+    return d;
+}
+
+main() {
+    auto p, r: float;
+    p = malloc(16);
+    auto pp: Pair;
+    pp = p;
+    pp.lo = 0.0;
+    pp.hi = 10.0;
+
+    // Hand-computed: g=0.5
+    // a = step(lo=0, in=1, g=0.5) = 0 + 0.5*(1-0)   = 0.5
+    // b = step(hi=10, a=0.5, g)   = 10 + 0.5*(0.5-10) = 10 - 4.75 = 5.25
+    // c = step(lo=0, b=5.25, g)   = 0 + 0.5*(5.25-0)  = 2.625
+    // d = step(hi=10, c=2.625, g) = 10 + 0.5*(2.625-10) = 10 - 3.6875 = 6.3125
+    r = chain4(p, 1.0);
+    if (r != 6.3125) { return 1; }
+
+    // Run it a second time through the same state (stage values
+    // persist via pp.lo/pp.hi being re-read, not re-written here) to
+    // prove no stale binding state leaks across calls.
+    r = chain4(p, 2.0);
+    // a = 0 + 0.5*(2-0) = 1.0
+    // b = 10 + 0.5*(1.0-10) = 10 - 4.5 = 5.5
+    // c = 0 + 0.5*(5.5-0) = 2.75
+    // d = 10 + 0.5*(2.75-10) = 10 - 3.625 = 6.375
+    if (r != 6.375) { return 2; }
+
+    // Vary the struct contents across iterations, proving each call
+    // re-reads pp.lo/pp.hi fresh (the T_MEMLD substitution case) rather
+    // than caching a stale value from a previous inline expansion.
+    auto k;
+    for (k = 0; k < 3; k++) {
+        pp.lo = k + 0.0;
+        pp.hi = k + 10.0;
+        r = chain4(p, 1.0);
+        // a = lo + 0.5*(1-lo); b = hi + 0.5*(a-hi);
+        // c = lo + 0.5*(b-lo); d = hi + 0.5*(c-hi)
+        auto lo: float, hi: float, ea: float, eb: float, ec: float, ed: float;
+        lo = k + 0.0; hi = k + 10.0;
+        ea = lo + 0.5 * (1.0 - lo);
+        eb = hi + 0.5 * (ea - hi);
+        ec = lo + 0.5 * (eb - lo);
+        ed = hi + 0.5 * (ec - hi);
+        if (r != ed) { return 10 + k; }
+    }
+
+    return 0;
+}
