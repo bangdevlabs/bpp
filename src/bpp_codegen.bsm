@@ -249,6 +249,11 @@ struct ChipPrimitives {
                             // the leftover budget). Returns 0 (B3's decision stays
                             // untouched) on any chip that can't yet do this — the
                             // "integer first, a64 first" rollout this stage is.
+    regalloc_apply_float,   // (assigns) -> 1/0     Same shape as regalloc_apply,
+                            // over the disjoint float pool (d8..d15) and
+                            // cg_b3_eligible_float. Independent decision from the
+                            // integer swap — a function can take one, the other,
+                            // both, or neither.
     emit_arg_copy_int,      // (var_idx, abi_seq_idx, frame_off) — int param from x_<seq> / rdi-class to slot
     emit_arg_copy_flt,      // (var_idx, abi_seq_idx, frame_off) — float param from d_<seq> / xmm to slot
     emit_frame_teardown,    // (frame_size, regs_arr, count, base_off) Wave 15
@@ -2578,16 +2583,23 @@ void cg_emit_func(fi) {
     // Stage D: linear-scan, in SHADOW MODE — computed and dumpable for
     // comparison against B3, but not yet wired into cg_var_promote or
     // anything else codegen reads (see regalloc_linear_scan's own
-    // header comment). The budget mirrors _a64_b3_reg_at's own table
-    // (10 non-leaf / 14 leaf) so the systematic comparison below is
-    // apples-to-apples — giving linear-scan a SMALLER budget than B3
-    // actually had for this function would report a false regression.
-    auto _rg_asn, _rg_budget;
+    // header comment). Int and float promotion are DISJOINT physical
+    // pools (x19..x28/x9..x12 vs d8..d15), so each gets its own
+    // intervals (filtered by cg_var_forced_ty), its own budget (the
+    // int budget mirrors _a64_b3_reg_at's own table — 10 non-leaf / 14
+    // leaf — so the systematic comparison below is apples-to-apples;
+    // float is a flat 8, leaf/non-leaf makes no difference there), and
+    // its own independent linear-scan run.
+    auto _rg_ivl_int, _rg_ivl_flt, _rg_asn, _rg_asn_flt, _rg_budget;
     _rg_budget = 10;
     if (cg_fn_leaf) { _rg_budget = 14; }
-    _rg_asn = regalloc_linear_scan(_rg_ivl, _rg_budget);
+    _rg_ivl_int = regalloc_filter_intervals_by_type(_rg_ivl, cg_var_forced_ty, 0);
+    _rg_ivl_flt = regalloc_filter_intervals_by_type(_rg_ivl, cg_var_forced_ty, 1);
+    _rg_asn = regalloc_linear_scan(_rg_ivl_int, _rg_budget);
+    _rg_asn_flt = regalloc_linear_scan(_rg_ivl_flt, 8);
     if (regalloc_name_wants_asn_dump(name_p)) {
         regalloc_dump_assignments(_rg_asn, name_p);
+        regalloc_dump_assignments(_rg_asn_flt, name_p);
     }
 
     // Stage D validation (docs/plans/compiler_boost_roadmap.md F.2's
@@ -2595,27 +2607,49 @@ void cg_emit_func(fi) {
     // spills a variable B3 successfully promoted, across EVERY
     // function this binary ever compiles — the full test suite + every
     // real game sweep this for free since it runs unconditionally.
-    auto _rg_worse, _rg_split;
-    _rg_worse = regalloc_compare_vs_b3(_rg_asn, cg_var_promote, cg_vars, name_p);
+    // Int and float are validated SEPARATELY (want_float distinguishes
+    // them) since they're two independent swap decisions below.
+    auto _rg_worse, _rg_worse_flt, _rg_split, _rg_split_flt;
+    _rg_worse = regalloc_compare_vs_b3(_rg_asn, cg_var_promote, cg_vars, cg_var_forced_ty, 0, name_p);
+    _rg_worse_flt = regalloc_compare_vs_b3(_rg_asn_flt, cg_var_promote, cg_vars, cg_var_forced_ty, 1, name_p);
 
     // Stage E — wire it up, per function, with an automatic fallback.
-    // Only swap B3's own integer-local decision for linear-scan's when
-    // BOTH hold: (1) the systematic comparison just above found zero
-    // regressions for this exact function (linear-scan promotes
-    // everything B3 promotes, here); (2) no variable in this function
-    // needed live-range splitting (regalloc_has_any_split) — a single
-    // physical register per variable can't represent a value that
-    // moves between two different registers at a split boundary, and
-    // codegen has no support for emitting that move yet (separable
-    // future work, the same shape as coalescing). The chip primitive
-    // itself (regalloc_apply) re-validates eligibility (cg_b3_eligible)
-    // before touching anything shared, and refuses entirely (returns 0,
+    // Int and float swap INDEPENDENTLY of each other (a function can
+    // take one, the other, both, or neither) — each only swaps when
+    // ALL hold: (1) the systematic comparison just above found zero
+    // regressions for that class in this exact function (linear-scan
+    // promotes everything B3 promotes, here); (2) no variable of that
+    // class needed live-range splitting (regalloc_has_any_split) — a
+    // single physical register per variable can't represent a value
+    // that moves between two different registers at a split boundary,
+    // and codegen has no support for emitting that move yet
+    // (separable future work, the same shape as coalescing); (3) B3
+    // didn't promote any inliner-mangled slot in THIS function
+    // (regalloc_has_mangled_promoted) — those slots' registers are
+    // completely invisible to the linear-scan that just ran (its CFG
+    // is built from the caller's body before inline splicing), so it
+    // can pick the same physical register for one of its own
+    // variables without knowing the collision is happening at all.
+    // Found via `bug --disasm` on stb/stbfilter.bsm's moog_taps (4
+    // inlined flt_onepole_tick call sites): silently wrong output, no
+    // crash, no diagnostic. The chip primitives themselves
+    // (regalloc_apply / regalloc_apply_float) re-validate eligibility
+    // before touching anything shared, and refuse entirely (returns 0,
     // leaving B3's decision untouched) on any chip that hasn't earned
-    // this yet (x64 today — "integer first" rolls out a64 first).
-    if (_rg_worse == 0) {
-        _rg_split = regalloc_has_any_split(_rg_ivl);
+    // this yet (x64 today — "integer first" rolls out a64 first; x64
+    // has no float B3 pool at all).
+    auto _rg_mangled;
+    _rg_mangled = regalloc_has_mangled_promoted(cg_var_promote, cg_vars);
+    if (_rg_worse == 0 && _rg_mangled == 0) {
+        _rg_split = regalloc_has_any_split(_rg_ivl_int);
         if (_rg_split == 0) {
             call(p.regalloc_apply, _rg_asn);
+        }
+    }
+    if (_rg_worse_flt == 0 && _rg_mangled == 0) {
+        _rg_split_flt = regalloc_has_any_split(_rg_ivl_flt);
+        if (_rg_split_flt == 0) {
+            call(p.regalloc_apply_float, _rg_asn_flt);
         }
     }
 

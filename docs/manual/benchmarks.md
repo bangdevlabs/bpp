@@ -307,6 +307,57 @@ slots). Audio export md5 unchanged; full native (214/0/12) + C-emit
 (172/0/54) suites green; real games (rts2, fps_wolf3d, bang9) compile
 and run clean.
 
+**Stage E extended to float, same day** — the user's own correct push:
+"how do you improve an audio benchmark that's all float32 without
+touching float?" Added the disjoint d8..d15 pool as a second,
+independent linear-scan + swap (regalloc_apply_float), gated the same
+way as int (systematic comparison + no splitting) plus ONE more gate
+int never needed: `regalloc_has_mangled_promoted` refuses the swap
+(either pool) for any function where B3 promoted an inliner-mangled
+slot, because RegAlloc v2's CFG is built from the caller's body BEFORE
+inline splicing — those slots' registers are completely invisible to
+the linear-scan that just ran.
+
+Two real bugs found and fixed via `bug --disasm` before this was safe,
+neither a crash — both silently wrong output, which is why disassembly
+beats trusting a clean exit code:
+
+1. **Slot-sharing double-saved/restored a register.** Pushing a
+   physical register onto the prologue's save list once PER VARIABLE
+   that shares a slot, instead of once per slot, corrupted the frame
+   layout once enough locals shared registers. Found on
+   stb/stbfilter.bsm's `moog_taps` (d8/d10 each appeared twice in the
+   prologue/epilogue). Fixed in both `_a64_regalloc_apply` and
+   `_a64_regalloc_apply_float` — a `slot_seen` set ensures each
+   physical register is pushed exactly once regardless of how many
+   variables took turns owning it.
+2. **Mangled inline slots invisible to linear-scan.** `moog_taps`
+   itself inlines `flt_onepole_tick` four times — each call site gets
+   its own `_inl<N>_s/in/g` slots, pre-registered by the inliner and
+   already promoted by B3, but never seen by RegAlloc v2's analysis
+   (built before splicing). Without a gate, linear-scan could (and
+   did) assign one of ITS OWN variables the same physical register a
+   mangled slot already held — a real collision, output silently
+   wrong (0.0 instead of the correct filtered value), confirmed by
+   comparing against the pre-Stage-E baseline. Fixed by refusing the
+   swap entirely whenever `regalloc_has_mangled_promoted` finds any
+   mangled slot B3 promoted in that function.
+
+Net effect on the real DSP chain (`moog_set`, `flt_onepole_g`,
+`flt_onepole_tick`, `_tl_apply_pan`, `tl_track_set`,
+`tl_track_set_volume`, `moon_set`, `lfo_*`, `vec2_*` — confirmed via a
+temporary instrumented build, then removed): the swap fires on every
+float-bearing leaf-ish function in the chain that doesn't itself
+inline another function; `moog_taps`/`moog_tick`/`moog_slope`/
+`tl_channel_process`/`rotary_tick`/`moon_process` (all of which inline
+something internally) correctly fall back to B3 untouched. Audio
+export md5 still unchanged (`f61fac72be5077a6e9ef9cae21dde2a1`);
+tl_bench unaffected (~10.2-10.4ms, same band as before); full native
+(214/0/12) + C-emit (172/0/54) + all 5 regalloc gates green; real
+games (rts2, fps_wolf3d, bang9) and mini_synth all compile clean.
+Compile-time overhead unchanged from the int-only Stage E entry above
+(0.29/0.31s).
+
 ### Autovectorisation + outlining (parallel)
 
 | Benchmark | Measures | Run | Good |

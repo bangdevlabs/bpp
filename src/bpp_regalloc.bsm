@@ -1163,6 +1163,34 @@ static _rg_is_mangled_inline_slot(var_names, vi) {
     return buf_eq(vbuf + unpack_s(nm), "_inl", 4);
 }
 
+// Stage E's own extra gate, beyond regalloc_compare_vs_b3: does THIS
+// function have any mangled inline slot B3 already promoted to a real
+// register? Excluding mangled slots from the comparison above only
+// keeps them from causing a false "regression" — it does NOT mean
+// linear-scan's own budget accounting knows about them. RegAlloc v2's
+// CFG/intervals are built from the caller's un-spliced body, so a
+// mangled slot's register is completely invisible to the linear-scan
+// that just ran — it can (and, on stb/stbfilter.bsm's moog_taps, did)
+// pick the SAME physical register for one of ITS OWN variables,
+// because nothing told it that slot was already spoken for. Found via
+// `bug --disasm`: corrupted output (0.0 instead of a real filtered
+// value), no crash, no diagnostic — just silently wrong. Refusing the
+// swap entirely whenever B3 promoted ANY mangled slot is the safe
+// answer until inline splicing happens before this analysis instead
+// of after it (a pipeline reordering, not a quick fix).
+regalloc_has_mangled_promoted(b3_promote, var_names) {
+    auto n, vi;
+    n = arr_len(b3_promote);
+    vi = 0;
+    while (vi < n) {
+        if (arr_get(b3_promote, vi) >= 0 && _rg_is_mangled_inline_slot(var_names, vi) != 0) {
+            return 1;
+        }
+        vi++;
+    }
+    return 0;
+}
+
 // Compares Stage D's assignment against B3's actual decision
 // (`b3_promote` is cg_var_promote itself — arr_get(b3_promote, vi) >= 0
 // means B3 promoted vi to a register). Prints one REGRESSION line per
@@ -1175,14 +1203,24 @@ static _rg_is_mangled_inline_slot(var_names, vi) {
 // direction. `var_names` (cg_vars) is consulted to skip the inliner's
 // mangled slots — see _rg_is_mangled_inline_slot's own comment for why
 // those are a known, out-of-scope gap rather than a real regression.
-regalloc_compare_vs_b3(assigns, b3_promote, var_names, fn_name) {
-    auto n, vi, b3_slot, ls_slot, worse;
+// `var_forced_ty` (cg_var_forced_ty) + `want_float` restrict the sweep
+// to variables of ONE register class — int and float promotions live
+// in disjoint physical pools (x19..x28 vs d8..d15) and are computed by
+// two SEPARATE linear-scan runs (different budgets, different
+// intervals), so `assigns` here only ever covers one class at a time.
+// Without this filter, comparing a float-only `assigns` against the
+// full b3_promote (which also holds B3's int picks) would report
+// every B3-promoted int as a false "linear-scan spilled it" — it was
+// never asked to consider that variable at all.
+regalloc_compare_vs_b3(assigns, b3_promote, var_names, var_forced_ty, want_float, fn_name) {
+    auto n, vi, b3_slot, ls_slot, worse, is_flt;
     n = arr_len(b3_promote);
     worse = 0;
     vi = 0;
     while (vi < n) {
         b3_slot = arr_get(b3_promote, vi);
-        if (b3_slot >= 0 && _rg_is_mangled_inline_slot(var_names, vi) == 0) {
+        is_flt = is_float_type(arr_get(var_forced_ty, vi));
+        if (b3_slot >= 0 && is_flt == want_float && _rg_is_mangled_inline_slot(var_names, vi) == 0) {
             ls_slot = _rg_assign_slot_for(assigns, vi);
             if (ls_slot < 0) {
                 diag_str("REGRESSION ");
@@ -1197,6 +1235,30 @@ regalloc_compare_vs_b3(assigns, b3_promote, var_names, fn_name) {
         vi++;
     }
     return worse;
+}
+
+// Returns a NEW arr_struct of LiveInterval containing only the
+// entries whose variable matches `want_float` (1 = float, 0 =
+// everything else) — int and float promotion are two separate
+// physical pools, so Stage D's linear-scan must run once per class
+// with its own intervals and its own budget, never mixed.
+regalloc_filter_intervals_by_type(intervals, var_forced_ty, want_float) {
+    auto n, i, it: LiveInterval, out, out_it: LiveInterval, is_flt;
+    n = arr_struct_count(intervals);
+    out = arr_struct_new(sizeof(LiveInterval), 8);
+    i = 0;
+    while (i < n) {
+        it = arr_struct_at(intervals, i);
+        is_flt = is_float_type(arr_get(var_forced_ty, it.var_idx));
+        if (is_flt == want_float) {
+            out_it = arr_struct_at(out, arr_struct_alloc(out));
+            out_it.var_idx = it.var_idx;
+            out_it.start_pos = it.start_pos;
+            out_it.end_pos = it.end_pos;
+        }
+        i++;
+    }
+    return out;
 }
 
 // ── Stage E support — is this function safe to wire up? ────────────
