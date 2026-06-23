@@ -481,6 +481,77 @@ with scalar codegen work; the steady ~18–20 % `tablah` → `tablah_opt` gap is
 hand inline+unroll of `xorshift64`. It is the standing reference for "what a
 real external workload costs," not a codegen micro-gate.
 
+## 2026-06-23 (final) — evaluation: what the whole day actually bought
+
+Re-ran `tl_bench` (stereo) and `bench_codegen` (all four kernels) one
+more time, min-of-5, on the now-fully-installed binary (inliner arc +
+RegAlloc v2 Stages A-E, int and float, all live) — to answer the
+question this row exists to answer: **after a full day of work, did
+the needle move on the workload that actually matters (real, call-
+heavy, float32 audio), or only on synthetic kernels?**
+
+```sh
+bpp tools/tiny_lofi/tl_bench.bpp -o /tmp/tlb && /tmp/tlb            # ours
+bpp tools/tiny_lofi/tl_bench_flat.bpp -o /tmp/tlbf && /tmp/tlbf      # hand-inlined ceiling
+bpp --c tools/tiny_lofi/tl_bench.bpp > /tmp/t.c && \
+  cc -O2 -w -Wno-error=implicit-function-declaration /tmp/t.c -o /tmp/tlo -lobjc -lm && /tmp/tlo
+bpp examples/bench_codegen.bpp -o /tmp/bcg && /tmp/bcg
+bpp --c examples/bench_codegen.bpp > /tmp/b.c && \
+  cc -O2 -w -Wno-error=implicit-function-declaration /tmp/b.c -o /tmp/bcg_o2 -lobjc -lm && /tmp/bcg_o2
+```
+
+| benchmark | min-of-5 | vs gcc -O2 |
+|---|---|---|
+| `tl_bench` (ours, call-heavy) | 10.14 ms (296×) | **2.72×** |
+| `tl_bench_flat` (hand-inlined ceiling) | 5.20 ms (577×) | 1.39× |
+| `tl_bench` oracle (gcc -O2) | 3.73 ms (804×) | 1× |
+| `bench_codegen` biquad | 49.70 ms | 1.03× |
+| `bench_codegen` lcg | 20.81 ms | 1.01× |
+| `bench_codegen` xform | 6.93 ms | 1.13× |
+| `bench_codegen` manylive | 144.58 ms | 1.72× |
+
+**The real win: `tl_bench` 14.6 ms → 10.86 ms (inliner arc) → 10.14 ms
+(+ RegAlloc v2) = ~30.5% faster than this morning, ~6.7% of that from
+RegAlloc v2 alone.** That's the number that matters — it's measured on
+the assembled, call-heavy, float32 DAW render, not a microbenchmark.
+RegAlloc v2's float extension is what makes this honest: before it,
+"RegAlloc v2 helps the audio chain" was a hope, not a measurement —
+`tl_render`'s own parameters are float and integer Stage E alone
+cannot touch them. The 6.7% is real but partial, for a reason already
+on record: the chain's hottest links (`moog_taps`, `moog_slope`,
+`tl_channel_process`, `moon_process`, `rotary_tick`) all inline
+something internally and correctly fall back to B3 (the mangled-slot
+gate) — RegAlloc v2 today only reaches the chain's *leaves*
+(`flt_onepole_g`, `flt_onepole_tick`, `_tl_apply_pan`, `tl_track_set`,
+`moon_set`, `lfo_*`), not the composed functions the inliner hasn't
+yet collapsed into them. The two arcs are not done competing for the
+same ground — the inliner arc's own remaining frontier (Inc 5 +
+nested-inline, `docs/plans/inliner_arc.md`) would, if it collapses
+`moog_taps`'s own call sites, hand RegAlloc v2 a much bigger leaf to
+work with than it has today.
+
+**`manylive` at 1.72× (vs the 1.58-1.62× recorded earlier today) is
+noise, not a regression** — this doc's own philosophy says to treat
+±15% as noise on a shared machine, and `bench_codegen`'s own biquad
+swung 46-56 ms across runs in today's session alone. Nothing in the
+last two commits (the float Stage E + its two bug fixes) touches
+`manylive_sum` — it's pure integer, leaf, no mangled slots, never a
+candidate for either fix. The honest read: RegAlloc v2's int side is
+holding its earlier ~139ms-ish result within machine variance; the
+gap that's left (still ~1.6-1.7× vs the oracle on a kernel deliberately
+built to need 18 variables in budget=14) is the genuine remaining
+distance between linear-scan's "spill furthest end_pos" heuristic and
+what a smarter spill-cost model (weighted by use count, the way B3
+itself already is) could close — Stage F territory, not measured
+today, not built speculatively.
+
+The other three `bench_codegen` kernels (biquad/lcg/xform) sit exactly
+where they did before any of today's work — 1.01-1.13× — confirming
+RegAlloc v2 didn't cost them anything: those kernels have too few
+simultaneously-live locals for B3 to ever leave anything on the table,
+so the systematic comparison clears, the swap applies, and the result
+is identical to B3's own decision by construction.
+
 ## Adding a benchmark
 
 A new runtime benchmark self-times with the bpp_bench helpers and prints a
