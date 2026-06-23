@@ -427,6 +427,12 @@ struct ChipPrimitives {
     // it needs. A chip that returns 0 from simd_temp_count opts out and
     // keeps the accumulator path (x86_64 today).
     emit_fload_var_into,      // (dreg, off) — ldr d<dreg>, [fp, #off]
+    emit_fload_promoted_into, // (dreg, base_reg, off) — ldr d<dreg>, [x<base_reg>, #off]
+                              //   struct-field CIP leaf: base already promoted,
+                              //   offset folded straight into the load
+    emit_fload_mem_into,      // (dreg, addr_reg) — ldr d<dreg>, [x<addr_reg>]
+                              //   struct-field CIP leaf: base computed into
+                              //   addr_reg by cg_emit_int_into first
     emit_fop_into,            // (op_code, dreg, s1, s2) — d<dreg> = d<s1> OP d<s2>
                               //   op_code: 0=add 1=sub 2=mul 3=div
     emit_fma,                 // (op_code, dst, n, m, a) — fused multiply-add:
@@ -3280,11 +3286,48 @@ cg_float_leaf_kind(nd) {
 
 cg_float_tree_need(nd) {
     auto n: Node, t, c0, op_l, nl, nr, k, rc;
+    auto p: ChipPrimitives, ok, base: Node, off, bvi, ineed;
+    p = cg_prim;
     if (nd == 0) { return 999; }
     n = nd; t = n.ntype;
     if (t == T_VAR) {
         if (cg_float_leaf_kind(nd) < 0) { return 999; }
         return 0;                                    // any leaf: 0 temps
+    }
+    // Struct-field / fixed-index float load. Mirrors cg_int_tree_need's own
+    // T_MEMLD case (bpp_codegen.bsm, the integer CIP arc) — same leaf
+    // shape, but the ADDRESS sub-expression (n.a) is always INTEGER/
+    // pointer-typed even though the LOADED VALUE is float, so its cost is
+    // checked against the INTEGER temp budget, never recursed into via
+    // this (float) function. Found investigating rotary_tick: every
+    // struct-field read bypassed compute-in-place entirely before this,
+    // including pure arithmetic the gate already covers operator-wise.
+    if (t == T_MEMLD) {
+        if (is_float_type(n.b) == 0) { return 999; }
+        if (ty_slice(n.b) != SL_FULL) { return 999; }  // half/quarter/double
+                                                        // SIMD deferred, not
+                                                        // in scope here
+        // Cheapest case: base+const-offset address whose base is already
+        // a promoted register (this session's earlier cg_try_const_offset/
+        // cg_emit_addr work) — the float load reads straight through it,
+        // no address computation, no temp of either pool needed at all.
+        ok, base, off = cg_try_const_offset(n.a, n.b);
+        if (ok) {
+            bvi = -1;
+            if (base.ntype == T_VAR) { bvi = cg_var_idx(base.a); }
+            if (bvi >= 0 && cg_var_is_float(bvi) == 0 && arr_get(cg_var_promote, bvi) >= 0) {
+                return 0;
+            }
+        }
+        // General case: the address tree's cost comes from the INTEGER
+        // pool, checked against the integer budget right here (the
+        // caller only ever checks THIS function's return value against
+        // the FLOAT/SIMD budget, so a cross-pool need must be validated
+        // before returning, not after).
+        ineed = cg_int_tree_need(n.a);
+        if (ineed >= 999) { return 999; }
+        if (ineed > call(p.int_temp_count)) { return 999; }
+        return 0;   // the float load itself needs no SIMD temp
     }
     if (t == T_BINOP) {
         op_l = unpack_l(n.a);
@@ -3332,6 +3375,34 @@ cg_emit_float_into(nd, dreg) {
             call(p.emit_fload_var_into, dreg, off);
         }
         return 0;
+    }
+    // Struct-field / fixed-index float load — mirrors cg_float_tree_need's
+    // own T_MEMLD case (above), which already validated this is safe to
+    // reach here. Cheapest case: base+const-offset address whose base is
+    // already promoted — read straight through it, offset folded into the
+    // load, no temp at all. Otherwise the address (an INTEGER tree) is
+    // computed into a borrowed int temp first, then the float load reads
+    // through that.
+    if (t == T_MEMLD) {
+        auto _mok, _mbase: Node, _moff, _mbvi, _mbreg, _mitmp;
+        _mok, _mbase, _moff = cg_try_const_offset(n.a, n.b);
+        if (_mok) {
+            _mbvi = -1;
+            if (_mbase.ntype == T_VAR) { _mbvi = cg_var_idx(_mbase.a); }
+            _mbreg = -1;
+            if (_mbvi >= 0 && cg_var_is_float(_mbvi) == 0) {
+                _mbreg = arr_get(cg_var_promote, _mbvi);
+            }
+            if (_mbreg >= 0) {
+                call(p.emit_fload_promoted_into, dreg, _mbreg, _moff);
+                return 1;
+            }
+        }
+        _mitmp = call(p.int_temp_alloc);
+        cg_emit_int_into(n.a, _mitmp);
+        call(p.emit_fload_mem_into, dreg, _mitmp);
+        if (_mitmp >= 0) { call(p.int_temp_free, _mitmp); }
+        return 1;
     }
     // T_BINOP: dreg = (left) OP (right). A promoted-leaf operand is read
     // straight from its register — no load, no temp. Otherwise the left
