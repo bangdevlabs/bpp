@@ -416,26 +416,32 @@ _x64_emit_memld_load(fh) {
 // x64 has no freelist for the store-side value reg, so val_reg
 // is always 1 (rcx). Keeping the parameter in the signature
 // for cross-chip uniformity at the spine call site.
+// `cg_addr_const_off` / `cg_addr_const_base`: same convention as
+// `_x64_emit_memld_load` — 0 / -1 normally (address in rax), overridden
+// when the spine's cg_emit_addr folded a base+const-offset address.
 void _x64_emit_memst_store(fh, val_reg) {
-    auto sl, bo, bw, mask, clear_mask;
+    auto sl, bo, bw, mask, clear_mask, coff, cbase;
+    coff = cg_addr_const_off;
+    cbase = cg_addr_const_base;
+    if (cbase < 0) { cbase = 0; }
     sl = ty_slice(fh);
     if (sl >= SL_BIT && sl <= SL_BIT7) {
         bo = (fh / 256) & 7;
         bw = sl - 3;
         mask = (1 << bw) - 1;
         clear_mask = 255 ^ (mask << bo);
-        x64_enc_loadb(2, 0, 0);
+        x64_enc_loadb(2, cbase, coff);
         x64_enc_and_imm(2, clear_mask);
         x64_enc_and_imm(val_reg, mask);
         if (bo > 0) { x64_enc_shl_imm(val_reg, bo); }
         x64_enc_or_reg(2, val_reg);
-        x64_enc_storeb(2, 0, 0);
+        x64_enc_storeb(2, cbase, coff);
         return;
     }
-    if (sl == SL_BYTE)         { x64_enc_storeb(val_reg, 0, 0); }
-    else if (sl == SL_QUARTER) { x64_enc_storeh(val_reg, 0, 0); }
-    else if (sl == SL_HALF)    { x64_enc_store_w(val_reg, 0, 0); }
-    else                       { x64_enc_store(val_reg, 0, 0); }
+    if (sl == SL_BYTE)         { x64_enc_storeb(val_reg, cbase, coff); }
+    else if (sl == SL_QUARTER) { x64_enc_storeh(val_reg, cbase, coff); }
+    else if (sl == SL_HALF)    { x64_enc_store_w(val_reg, cbase, coff); }
+    else                       { x64_enc_store(val_reg, cbase, coff); }
 }
 
 // Address-of a stack-frame local. rbp = reg 5 on x64.
@@ -964,14 +970,18 @@ void _x64_emit_coerce_int_to_float() {
 // low 32 bits hold the real f32 (not the low half of the double's bit pattern),
 // then store those 4 bytes. Mirrors the a64 `fcvt s, d; str s` path.
 void _x64_emit_float_store_scalar(fh_sl, val_reg) {
+    auto coff, cbase;
+    coff = cg_addr_const_off;
+    cbase = cg_addr_const_base;
+    if (cbase < 0) { cbase = 0; }
     if (fh_sl == SL_HALF) {
         x64_enc_cvtsd2ss(val_reg, val_reg);     // double → single (f32 in low 32 bits)
         x64_enc_movq_from_xmm(val_reg, val_reg);
-        x64_enc_store_w(val_reg, 0, 0);         // mov dword [rax], r{val_reg}d
+        x64_enc_store_w(val_reg, cbase, coff);  // mov dword [rax+off], r{val_reg}d
         return;
     }
     x64_enc_movq_from_xmm(val_reg, val_reg);   // bitcast xmm{val_reg} → r{val_reg}
-    x64_enc_store(val_reg, 0, 0);               // mov qword [rax], r{val_reg}
+    x64_enc_store(val_reg, cbase, coff);        // mov qword [rax+off], r{val_reg}
 }
 
 // Push rax onto the stack (Wave 18 dispatch helper).

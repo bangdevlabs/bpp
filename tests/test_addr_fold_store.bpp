@@ -1,0 +1,55 @@
+// test_addr_fold_store.bpp — Inc 6 (const-offset addressing, store side).
+// Exercises the store-side mirror of the load-side fix: a struct-field
+// STORE whose VALUE is itself a struct-field read (the value is always
+// evaluated before the address in every emit_memst_* primitive, so this
+// checks that cg_emit_addr's global state survives that ordering), and a
+// struct-field store whose BASE is a promoted local under a loop (the
+// store-side mirror of the promoted-base-as-load-base optimization).
+
+struct Inner { x: float, y: float }
+struct Outer { val: float, other: float }
+
+main() {
+    auto o: Outer, i: Inner;
+    i = malloc(16);
+    i.x = 1.0;
+    i.y = 2.0;
+
+    o = malloc(16);
+    o.val = 9.0;
+    o.other = 0.0;
+
+    // Store a VALUE that is itself a struct-field read (i.y), into a
+    // plain struct field (o.val). i's evaluation must not corrupt
+    // whatever cg_emit_addr decided for o's own address right after.
+    o.val = i.y;
+    if (o.val != 2.0) { return 1; }
+
+    // Chain it: o.other = o.val (also a struct-field read) + i.x (yet
+    // another one) — two nested field reads feeding one store's value.
+    o.other = o.val + i.x;
+    if (o.other != 3.0) { return 2; }
+
+    // Array of structs — base is a promoted local, offset varies per
+    // iteration (exercises the promoted-base-as-STORE-address path,
+    // mirroring the load-side fix, under a loop so B3 has a real reason
+    // to promote the alias).
+    auto arr, k, p;
+    arr = malloc(3 * 16);
+    for (k = 0; k < 3; k++) {
+        p = arr + k * 16;
+        auto e: Inner;
+        e = p;
+        e.x = k + 1.0;
+        e.y = k + 10.0;
+    }
+    for (k = 0; k < 3; k++) {
+        p = arr + k * 16;
+        auto e2: Inner;
+        e2 = p;
+        if (e2.x != k + 1.0)  { return 10 + k; }
+        if (e2.y != k + 10.0) { return 20 + k; }
+    }
+
+    return 0;
+}

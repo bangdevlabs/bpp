@@ -4042,6 +4042,65 @@ cg_try_const_offset(nd, fh) {
     return 1, n.b, off;
 }
 
+// Shared by T_MEMLD and every T_MEMST store path (each chip's
+// emit_memst_int / emit_memst_float_scalar / emit_memst_float_simd):
+// resolves a load/store's address expression into the cg_addr_const_off
+// / cg_addr_const_base convention those primitives read instead of
+// hardcoding "address is in x0/rax, offset 0".
+//
+// Evaluates `addr` into the accumulator and returns its ety — UNLESS
+// `addr` is the base+const-offset shape AND that base is already a
+// B3-promoted register, in which case NOTHING is evaluated (ety
+// returned as 0): the load/store will read straight through the
+// promoted register as its own base, with the constant folded into its
+// own addressing mode.
+//
+// Always sets the globals fresh (resets to the "use x0, offset 0"
+// defaults, then overwrites if the fast path applies) — callers never
+// need to reset before calling this. Callers DO still need to reset
+// both globals back to their defaults once the load/store primitive
+// that actually consumes them has run (mirrors free()-after-use; see
+// every call site below) — this function only guarantees its OWN
+// output is correct, not that some EARLIER, unrelated consumption left
+// the globals clean walking in.
+cg_emit_addr(addr, fh) {
+    auto p: ChipPrimitives;
+    auto _ok, _base: Node, _off, _bvi, _breg, ety;
+    p = cg_prim;
+    _ok, _base, _off = cg_try_const_offset(addr, fh);
+    _breg = -1;
+    if (_ok) {
+        _bvi = -1;
+        if (_base.ntype == T_VAR) { _bvi = cg_var_idx(_base.a); }
+        if (_bvi >= 0 && cg_var_is_float(_bvi) == 0) {
+            _breg = arr_get(cg_var_promote, _bvi);
+        }
+    }
+    if (_breg >= 0) {
+        ety = 0;
+    } else if (_ok) {
+        ety = call(p.emit_node, _base);
+    } else {
+        ety = call(p.emit_node, addr);
+    }
+    // Set AFTER the (possibly recursive) emit_node call above, never
+    // before — the base can itself be another const-offset T_MEMLD
+    // (`*(a.frames + 0)`, where the address of THIS access is
+    // `a.frames`'s LOADED VALUE, itself a struct-field read), and that
+    // nested call runs this exact same function, resetting both globals
+    // to their defaults right before it returns. Setting this level's
+    // values first and recursing afterward would let the nested call's
+    // own cleanup silently clobber them — a real regression
+    // (test_modulab_character), not a hypothetical one.
+    cg_addr_const_off = 0;
+    cg_addr_const_base = -1;
+    if (_ok) {
+        cg_addr_const_off = _off;
+        if (_breg >= 0) { cg_addr_const_base = _breg; }
+    }
+    return ety;
+}
+
 // Wave 21 takeover: the spine owns expression emission for every
 // AST case. Eight cases handled inline (T_LIT, T_VAR including
 // stack-struct address-of via emit_addr_stack_struct, T_TERNARY,
@@ -4113,46 +4172,9 @@ cg_emit_node(nd) {
             call(p.emit_iv_load, 0, arr_get(cg_iv_reg, _ivk));
             return 0;
         }
-        auto _cok, _cbase: Node, _coff, _mret, _cbvi, _cbreg;
-        _cok, _cbase, _coff = cg_try_const_offset(n.a, n.b);
-        _cbreg = -1;
-        if (_cok) {
-            // If the base is a simple variable ALREADY B3-promoted to a
-            // fixed integer register, the pointer value already lives in
-            // a register — skip emit_node entirely (it would just copy
-            // that register into x0, a real instruction, immediately
-            // before the load needs to read it back out as its base
-            // anyway) and address straight through the promoted register.
-            _cbvi = -1;
-            if (_cbase.ntype == T_VAR) { _cbvi = cg_var_idx(_cbase.a); }
-            if (_cbvi >= 0 && cg_var_is_float(_cbvi) == 0) {
-                _cbreg = arr_get(cg_var_promote, _cbvi);
-            }
-            if (_cbreg >= 0) {
-                ety = 0;
-            } else {
-                ety = call(p.emit_node, _cbase);
-            }
-        } else {
-            ety = call(p.emit_node, n.a);
-        }
-        // Set these AFTER the (possibly recursive) emit_node call above,
-        // never before: the base can itself be another const-offset
-        // T_MEMLD (e.g. `*(a.frames + 0)`, where the address of THIS
-        // load is `a.frames`'s LOADED VALUE, itself a struct-field read)
-        // — that nested call runs this exact same code and resets both
-        // globals to their "use x0, offset 0" defaults right before it
-        // returns. Setting THIS level's values first and recursing
-        // afterward would let the nested call's own cleanup silently
-        // clobber them. (Inc 6 audio session — caught by
-        // test_modulab_character, a real, not synthetic, regression.)
+        auto _mret;
+        ety = cg_emit_addr(n.a, n.b);
         if (ety == 1) { call(p.emit_demote_flt_to_int); }
-        cg_addr_const_off = 0;
-        cg_addr_const_base = -1;
-        if (_cok) {
-            cg_addr_const_off = _coff;
-            if (_cbreg >= 0) { cg_addr_const_base = _cbreg; }
-        }
         _mret = call(p.emit_memld_load, n.b);
         cg_addr_const_off = 0;
         cg_addr_const_base = -1;
