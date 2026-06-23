@@ -1024,6 +1024,17 @@ global cg_b3_loop_depth;
 // `add` to compute the full address first. Always reset to 0 right after
 // the primitive consumes it, so it never leaks into unrelated code.
 global cg_addr_const_off;
+// Companion to cg_addr_const_off: the BASE register to address through,
+// or -1 (the sentinel) meaning "the base was evaluated into the
+// accumulator as usual, use x0/rax." Set when T_MEMLD's base expression
+// is a simple T_VAR that's ALREADY B3-promoted to a fixed integer
+// register — in that case there is nothing to evaluate at all: the
+// pointer value already lives in a register, so emit_node on it would
+// just copy it into x0 for no reason (an ADD #0 / MOV, real CPU cost,
+// not free) right before the load needed to read it right back out via
+// THAT SAME register as its base. Skipping straight to "use the
+// promoted register as the load's own base" removes that copy entirely.
+global cg_addr_const_base;
 // Set by the B3 walk: 1 if the function makes NO calls (a leaf). A leaf may
 // promote locals into caller-saved registers too — nothing can clobber them
 // mid-function — widening the budget beyond the callee-saved pool.
@@ -1778,6 +1789,7 @@ cg_builtin_dispatch(n) {
         arr = n.b;
         ety = call(p.emit_node, *(arr + 0));
         if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        cg_addr_const_off = 0; cg_addr_const_base = -1;
         return call(p.emit_memld_load, TY_FLOAT) + 1;    // +1: ety (0=int,1=float) → dispatch ret (1=int,2=float)
     }
 
@@ -1789,6 +1801,7 @@ cg_builtin_dispatch(n) {
         arr = n.b;
         ety = call(p.emit_node, *(arr + 0));
         if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        cg_addr_const_off = 0; cg_addr_const_base = -1;
         return call(p.emit_memld_load, TY_FLOAT_H) + 1;  // +1: same ety→dispatch convention
     }
 
@@ -4100,18 +4113,49 @@ cg_emit_node(nd) {
             call(p.emit_iv_load, 0, arr_get(cg_iv_reg, _ivk));
             return 0;
         }
-        auto _cok, _cbase: Node, _coff, _mret;
+        auto _cok, _cbase: Node, _coff, _mret, _cbvi, _cbreg;
         _cok, _cbase, _coff = cg_try_const_offset(n.a, n.b);
+        _cbreg = -1;
         if (_cok) {
-            ety = call(p.emit_node, _cbase);
-            cg_addr_const_off = _coff;
+            // If the base is a simple variable ALREADY B3-promoted to a
+            // fixed integer register, the pointer value already lives in
+            // a register — skip emit_node entirely (it would just copy
+            // that register into x0, a real instruction, immediately
+            // before the load needs to read it back out as its base
+            // anyway) and address straight through the promoted register.
+            _cbvi = -1;
+            if (_cbase.ntype == T_VAR) { _cbvi = cg_var_idx(_cbase.a); }
+            if (_cbvi >= 0 && cg_var_is_float(_cbvi) == 0) {
+                _cbreg = arr_get(cg_var_promote, _cbvi);
+            }
+            if (_cbreg >= 0) {
+                ety = 0;
+            } else {
+                ety = call(p.emit_node, _cbase);
+            }
         } else {
             ety = call(p.emit_node, n.a);
-            cg_addr_const_off = 0;
         }
+        // Set these AFTER the (possibly recursive) emit_node call above,
+        // never before: the base can itself be another const-offset
+        // T_MEMLD (e.g. `*(a.frames + 0)`, where the address of THIS
+        // load is `a.frames`'s LOADED VALUE, itself a struct-field read)
+        // — that nested call runs this exact same code and resets both
+        // globals to their "use x0, offset 0" defaults right before it
+        // returns. Setting THIS level's values first and recursing
+        // afterward would let the nested call's own cleanup silently
+        // clobber them. (Inc 6 audio session — caught by
+        // test_modulab_character, a real, not synthetic, regression.)
         if (ety == 1) { call(p.emit_demote_flt_to_int); }
+        cg_addr_const_off = 0;
+        cg_addr_const_base = -1;
+        if (_cok) {
+            cg_addr_const_off = _coff;
+            if (_cbreg >= 0) { cg_addr_const_base = _cbreg; }
+        }
         _mret = call(p.emit_memld_load, n.b);
         cg_addr_const_off = 0;
+        cg_addr_const_base = -1;
         return _mret;
     }
 
