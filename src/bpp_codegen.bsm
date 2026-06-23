@@ -3016,13 +3016,38 @@ _cg_inline_splice_prelude(call_node, fidx) -> (word, word, word, ptr) {
     while (i < inl_pcnt) {
         arg_node = *(args_arr + i * 8);
         arg_t = arg_node.ntype;
-        // Inc 4-revised: a FLOAT param always BINDS (never substitutes). The
-        // substitute path drops the arg expression straight into the body with no
-        // int/float conversion; binding routes it through a float-typed slot
-        // (_inline_register_callsite) whose assignment converts, so the inline
-        // matches what a real call would emit regardless of the arg's type.
-        if (is_float_type(get_fn_par_type(fidx, i)) == 0 &&
-            (arg_t == T_VAR || arg_t == T_LIT) &&
+        // Per-param substitution eligibility. T_VAR / T_LIT are always
+        // idempotent (re-reading a variable or re-emitting a literal twice
+        // costs nothing extra and has no side effect). T_MEMLD is ALSO
+        // idempotent — but only when its address is the canonical
+        // `var + const-offset` struct-field shape (cg_try_const_offset,
+        // this session's earlier addressing work): that shape is
+        // structurally incapable of containing a T_CALL, so re-evaluating
+        // it twice is exactly as safe as T_VAR. A T_MEMLD with a more
+        // complex address (e.g. `*(f())`) does NOT qualify — base must be
+        // a plain T_VAR, not just any const-offset base.
+        auto _sub_ok, _memld_ok, _memld_base: Node, _memld_off;
+        _sub_ok = (arg_t == T_VAR || arg_t == T_LIT);
+        if (_sub_ok == 0 && arg_t == T_MEMLD) {
+            _memld_ok, _memld_base, _memld_off = cg_try_const_offset(arg_node.a, arg_node.b);
+            if (_memld_ok && _memld_base.ntype == T_VAR) { _sub_ok = 1; }
+        }
+        // A FLOAT param only substitutes when the arg's OWN inferred type
+        // EXACTLY matches the param's declared type (same base AND same
+        // slice width) — substitution drops the arg expression in with no
+        // conversion, so this is the one case binding (which converts via
+        // the typed slot's assignment) is NOT just overhead but a real
+        // semantic requirement. Found re-disassembling moog_taps: every
+        // flt_onepole_tick call passes already-`: float`-typed args
+        // (struct fields, locals), so this fires for the common DSP-chain
+        // shape — previously a blanket exclusion bound EVERY float param
+        // unconditionally, materializing a fresh frame slot even when
+        // substitution would have been exactly as correct and far cheaper.
+        if (_sub_ok && is_float_type(get_fn_par_type(fidx, i)) &&
+            arg_node.itype != get_fn_par_type(fidx, i)) {
+            _sub_ok = 0;
+        }
+        if (_sub_ok &&
             _inline_param_is_written(inl_body, inl_bcnt, *(inl_params + i * 8)) == 0) {
             *(bind_needed + i * 8) = 0;
         } else {
@@ -3047,8 +3072,21 @@ _cg_inline_splice_prelude(call_node, fidx) -> (word, word, word, ptr) {
     while (i < inl_pcnt) {
         *(names_buf + i * 8) = *(inl_params + i * 8);
         if (*(bind_needed + i * 8)) {
+            auto _mp_vi;
             mp_node = make_node(T_VAR);
             mp_node.a = *(mangled_params_buf + i * 8);
+            // The mangled slot is already registered (pre-reg phase,
+            // _inline_register_callsite_slots) with its declared type in
+            // cg_var_forced_ty — copy it onto this fresh node so a FURTHER
+            // nested splice (this body itself calling another inlinable
+            // function, Inc 6) sees a real itype here instead of TY_UNK.
+            // Without this, the per-param substitution-eligibility check
+            // above always finds a type mismatch for a renamed param used
+            // as a nested call's argument and falls back to binding even
+            // when substitution would have been safe — found
+            // re-disassembling moog_taps -> flt_onepole_tick.
+            _mp_vi = cg_var_idx(mp_node.a);
+            if (_mp_vi >= 0) { mp_node.itype = arr_get(cg_var_forced_ty, _mp_vi); }
             *(args_buf + i * 8) = mp_node;
         } else {
             *(args_buf + i * 8) = *(args_arr + i * 8);
@@ -3057,9 +3095,15 @@ _cg_inline_splice_prelude(call_node, fidx) -> (word, word, word, ptr) {
     }
     i = 0;
     while (i < locals_cnt) {
+        auto _ml_vi;
         *(names_buf + (inl_pcnt + i) * 8) = *(locals_buf + i * 8);
         mp_node = make_node(T_VAR);
         mp_node.a = *(mangled_locals_buf + i * 8);
+        // Same fix as the param case above, for a renamed LOCAL (e.g.
+        // moog_taps's own `g`/`fb`/`a`/`b`/`c`/`d`) used as a nested
+        // inlined call's argument.
+        _ml_vi = cg_var_idx(mp_node.a);
+        if (_ml_vi >= 0) { mp_node.itype = arr_get(cg_var_forced_ty, _ml_vi); }
         *(args_buf + (inl_pcnt + i) * 8) = mp_node;
         i++;
     }
