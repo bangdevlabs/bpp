@@ -504,6 +504,20 @@ struct ChipPrimitives {
 // orders the inits to match the requested target triple.
 extrn cg_prim;
 
+// This file has otherwise relied on transitive availability (every
+// real caller chain — a64_codegen.bsm / x64_codegen.bsm, imported from
+// bpp.bpp — already pulls in bpp_array/bpp_arr/bpp_dispatch by the time
+// this file's functions run). RegAlloc v2 Stage A introduced the first
+// GENUINE new dependency this file calls directly
+// (regalloc_build_cfg / regalloc_name_wants_dump / regalloc_dump_cfg,
+// in cg_emit_func below) that isn't already guaranteed transitively —
+// some lower-level compiler-internal tests assemble their own minimal
+// import chain (e.g. tests/test_macho_only.bpp: bpp_dispatch.bsm then
+// straight to a64_codegen.bsm, never through bpp.bpp's own list), so
+// this needs its own explicit import rather than counting on bpp.bpp's
+// chain again.
+import "bpp_regalloc.bsm";
+
 // Allocate cg_prim if it hasn't been yet. Idempotent — both
 // init_codegen_<chip>() functions guard their own population
 // behind this so the malloc happens exactly once per process.
@@ -2510,6 +2524,21 @@ void cg_emit_func(fi) {
         if (stmt_i != 0) { cg_b3_walk(stmt_i); }
     }
     call(p.b3_select);
+
+    // RegAlloc v2, Stage A (docs/plans/compiler_boost_roadmap.md F.2):
+    // build this function's CFG. Pure analysis — its output isn't
+    // consumed by anything below yet (later stages add liveness,
+    // intervals, and linear-scan before any of this touches a real
+    // register decision) — so this runs unconditionally, same as
+    // cg_b3_walk's own ref-count pass above, with zero effect on the
+    // bytes this function compiles to. The dump-on-demand hook
+    // (regalloc_name_wants_dump) is this stage's own verification tool,
+    // since nothing else observes the CFG yet.
+    auto _rg_cfg;
+    _rg_cfg = regalloc_build_cfg(body_arr, body_cnt);
+    if (regalloc_name_wants_dump(name_p)) {
+        regalloc_dump_cfg(_rg_cfg, name_p);
+    }
 
     // 7b. Persist per-variable location info for the bug debugger.
     // After b3_select, cg_var_promote is settled: >= 0 for register-

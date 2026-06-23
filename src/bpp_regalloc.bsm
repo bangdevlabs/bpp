@@ -1,0 +1,338 @@
+// bpp_regalloc.bsm — RegAlloc v2: real liveness-based register allocation.
+//
+// Today's B3 (bpp_codegen.bsm's cg_b3_walk + each chip's _<chip>_b3_select)
+// ranks local variables by total reference count and promotes the top N
+// into callee-saved registers. It has no notion of WHEN a variable is
+// alive — two variables that never coexist (one dies before the other is
+// born) compete for the same promotion budget as if they were rivals,
+// when they could safely share one physical register. Closing that gap
+// needs a real liveness-based allocator: explicit control-flow graph,
+// liveness dataflow, live intervals, linear-scan assignment, coalescing.
+// See docs/plans/compiler_boost_roadmap.md (section F.2) for the full
+// staged design and the measured evidence that motivates it (tl_bench's
+// flat/oracle gap persisting after every call and accumulator shuttle is
+// gone; games/rts2/rts2_combat.bsm's _combat_step needing more
+// simultaneously-live registers than even the widened B3 pool provides).
+//
+// Stage A (this file, today): AST-to-CFG construction only. Builds an
+// explicit basic-block graph per function. Pure read-only analysis —
+// nothing in codegen consumes its output yet; later stages (liveness,
+// intervals, linear-scan, the eventual swap into cg_var_promote) are
+// future increments, each verified before touching anything live.
+//
+// A T_SWITCH is modelled as a CHAIN of 2-way branches (one per arm, in
+// declaration order, falling through to "else" last) rather than a
+// single N-way block — mirrors exactly how bpp_dispatch.bsm's
+// _inline_normalize_switch_ret already treats this same node shape as a
+// sequence of binary comparisons. Keeps every CfgBlock at a uniform "at
+// most 2 successors" shape, so no later stage (liveness, intervals)
+// needs to special-case an N-way construct.
+
+import "bpp_defs.bsm";
+import "bpp_array.bsm";
+import "bpp_arr.bsm";
+
+// One basic block: a maximal straight-line statement sequence with a
+// single entry and at most two successors. An unconditional fallthrough
+// or jump uses succ_a only (succ_b stays -1); a real branch (the two
+// arms of an if, a loop's continue-or-exit test, one switch arm's
+// pass/fail) uses both; a block ending in T_RET — or an unreachable
+// tail right after T_BREAK/T_CONTINUE/T_RET — uses neither.
+struct CfgBlock {
+    stmts,    // arr_new()-style growable array of statement-node pointers
+    succ_a,   // -1 if none
+    succ_b    // -1 if none
+}
+
+// Per-function CFG-under-construction state. Reset at the top of every
+// regalloc_build_cfg call (mirrors cg_vars / cg_var_promote's own
+// per-function reset convention in bpp_codegen.bsm) — nothing here
+// persists across functions.
+global rg_blocks;          // arr_struct of CfgBlock for the function currently being built
+global rg_cur_block;       // index of the block statements are currently appended to
+global rg_break_stack;     // arr_new() of block indices (break targets)
+global rg_continue_stack;  // arr_new() of block indices (continue targets)
+
+// Initialize the regalloc module. Call once at startup, mirroring
+// init_dispatch()'s own convention — the real per-function state is set
+// fresh by regalloc_build_cfg every time, so this just establishes safe
+// defaults before the first function is ever compiled.
+void init_regalloc() {
+    rg_blocks = 0;
+    rg_cur_block = -1;
+    rg_break_stack = arr_new();
+    rg_continue_stack = arr_new();
+}
+
+// Allocate a fresh, empty block in the function currently under
+// construction. Returns its index.
+static _rg_new_block() {
+    auto idx, b: CfgBlock;
+    idx = arr_struct_alloc(rg_blocks);
+    b = arr_struct_at(rg_blocks, idx);
+    b.stmts = arr_new();
+    b.succ_a = -1;
+    b.succ_b = -1;
+    return idx;
+}
+
+// Append a statement-node pointer to the currently-open block.
+static void _rg_emit(nd) {
+    auto b: CfgBlock;
+    b = arr_struct_at(rg_blocks, rg_cur_block);
+    b.stmts = arr_push(b.stmts, nd);
+}
+
+// Unconditionally set a block's successors — used at the exact points a
+// branch/jump/return is known explicitly (a condition's two arms, a
+// break, a continue, a return, a loop's back-edge). Never used for
+// "falls through to whatever comes next" — that path is
+// _rg_link_fallthrough below, which respects a block that already
+// terminated itself via a nested return/break/continue.
+static void _rg_set_succ(blk, a, b_) {
+    auto b: CfgBlock;
+    b = arr_struct_at(rg_blocks, blk);
+    b.succ_a = a;
+    b.succ_b = b_;
+}
+
+// Link a block to `target` ONLY if it has no explicit successor yet. A
+// nested T_RET/T_BREAK/T_CONTINUE inside an if/while/switch arm already
+// set succ_a via _rg_set_succ — that decision must never be overwritten
+// by the generic "falls through to the join block" edge the caller adds
+// once the whole construct's shape is known.
+static void _rg_link_fallthrough(blk, target) {
+    auto b: CfgBlock;
+    b = arr_struct_at(rg_blocks, blk);
+    if (b.succ_a < 0 && b.succ_b < 0) { b.succ_a = target; }
+}
+
+// Build the CFG for one statement, updating rg_cur_block to whatever
+// block is open once it returns. Mirrors cg_emit_stmt's own per-node
+// dispatch shape (bpp_codegen.bsm) — only the CONTROL-FLOW shape
+// matters here; any statement that doesn't split blocks is just
+// appended to whatever block is currently open.
+static _rg_build_stmt(nd) {
+    auto n: Node, t;
+    if (nd == 0) { return 0; }
+    n = nd; t = n.ntype;
+
+    if (t == T_IF) {
+        auto cond_blk, if_entry, else_entry, if_exit, else_exit, join_blk, has_else;
+        cond_blk = rg_cur_block;
+        _rg_emit(n.a);
+        has_else = (n.e > 0);
+        if_entry = _rg_new_block();
+        if (has_else) {
+            else_entry = _rg_new_block();
+            _rg_set_succ(cond_blk, if_entry, else_entry);
+        } else {
+            else_entry = -1;
+        }
+        rg_cur_block = if_entry;
+        _rg_build_body(n.b, n.c);
+        if_exit = rg_cur_block;
+        if (has_else) {
+            rg_cur_block = else_entry;
+            _rg_build_body(n.d, n.e);
+            else_exit = rg_cur_block;
+        } else {
+            else_exit = -1;
+        }
+        join_blk = _rg_new_block();
+        if (has_else == 0) { _rg_set_succ(cond_blk, if_entry, join_blk); }
+        _rg_link_fallthrough(if_exit, join_blk);
+        if (has_else) { _rg_link_fallthrough(else_exit, join_blk); }
+        rg_cur_block = join_blk;
+        return 0;
+    }
+
+    if (t == T_WHILE) {
+        auto prev_blk, header_blk, body_entry, exit_blk, continue_blk, body_exit, step_node;
+        step_node = n.e;
+        prev_blk = rg_cur_block;
+        header_blk = _rg_new_block();
+        _rg_link_fallthrough(prev_blk, header_blk);
+        rg_cur_block = header_blk;
+        _rg_emit(n.a);
+
+        body_entry = _rg_new_block();
+        exit_blk = _rg_new_block();
+        continue_blk = _rg_new_block();
+        _rg_set_succ(header_blk, body_entry, exit_blk);
+
+        rg_break_stack = arr_push(rg_break_stack, exit_blk);
+        rg_continue_stack = arr_push(rg_continue_stack, continue_blk);
+
+        rg_cur_block = body_entry;
+        _rg_build_body(n.b, n.c);
+        body_exit = rg_cur_block;
+        _rg_link_fallthrough(body_exit, continue_blk);
+
+        arr_pop(rg_break_stack);
+        arr_pop(rg_continue_stack);
+
+        rg_cur_block = continue_blk;
+        if (step_node != 0) { _rg_emit(step_node); }
+        _rg_set_succ(continue_blk, header_blk, -1);
+
+        rg_cur_block = exit_blk;
+        return 0;
+    }
+
+    if (t == T_BREAK) {
+        _rg_emit(nd);
+        if (arr_len(rg_break_stack) > 0) {
+            _rg_set_succ(rg_cur_block, arr_last(rg_break_stack), -1);
+        }
+        rg_cur_block = _rg_new_block();   // unreachable tail, kept so a
+                                          // statement after `break;` in
+                                          // the same arm still has
+                                          // somewhere safe to land
+        return 0;
+    }
+
+    if (t == T_CONTINUE) {
+        _rg_emit(nd);
+        if (arr_len(rg_continue_stack) > 0) {
+            _rg_set_succ(rg_cur_block, arr_last(rg_continue_stack), -1);
+        }
+        rg_cur_block = _rg_new_block();
+        return 0;
+    }
+
+    if (t == T_RET) {
+        _rg_emit(nd);
+        _rg_set_succ(rg_cur_block, -1, -1);
+        rg_cur_block = _rg_new_block();
+        return 0;
+    }
+
+    if (t == T_SWITCH) {
+        // Layout (bpp_parser.bsm's parse_switch): n.a=condition,
+        // n.b=arm_values (interleaved [vals_arr, vcnt] per arm),
+        // n.c=arm_count, n.d/n.e=else body/count,
+        // n.src_tok=arm_bodies (interleaved [body_arr, bcnt] per arm).
+        auto arm_values, arm_bodies, arm_count, k, join_blk, test_blk, body_blk, next_test;
+        auto exits, ei, ab, bc;
+        arm_values = n.b; arm_bodies = n.src_tok; arm_count = n.c;
+        exits = arr_new();
+        test_blk = rg_cur_block;
+        _rg_emit(n.a);
+
+        k = 0;
+        while (k < arm_count) {
+            body_blk = _rg_new_block();
+            next_test = _rg_new_block();
+            _rg_set_succ(test_blk, body_blk, next_test);
+            rg_cur_block = body_blk;
+            ab = arm_bodies[k * 2]; bc = arm_bodies[k * 2 + 1];
+            _rg_build_body(ab, bc);
+            exits = arr_push(exits, rg_cur_block);
+            test_blk = next_test;
+            k++;
+        }
+        if (n.e > 0) {
+            rg_cur_block = test_blk;
+            _rg_build_body(n.d, n.e);
+            exits = arr_push(exits, rg_cur_block);
+        } else {
+            exits = arr_push(exits, test_blk);   // no else: falls straight to join
+        }
+        join_blk = _rg_new_block();
+        ei = 0;
+        while (ei < arr_len(exits)) {
+            _rg_link_fallthrough(arr_get(exits, ei), join_blk);
+            ei++;
+        }
+        rg_cur_block = join_blk;
+        return 0;
+    }
+
+    if (t == T_BLOCK) {
+        _rg_build_body(n.b, n.c);
+        return 0;
+    }
+
+    // Plain statement (T_ASSIGN, T_MEMST, T_DECL, expression-statement,
+    // etc.) — none of these split blocks, just append.
+    _rg_emit(nd);
+    return 0;
+}
+
+static _rg_build_body(arr, cnt) {
+    auto i;
+    i = 0;
+    while (i < cnt) {
+        _rg_build_stmt(arr[i]);
+        i++;
+    }
+    return 0;
+}
+
+// Build the CFG for one whole function body. Resets per-function state,
+// allocates the entry block, walks the body, and returns the `rg_blocks`
+// handle (an arr_struct of CfgBlock) for the caller to keep, dump, or
+// (future stages) analyse further. Falling off the end of the body with
+// no explicit T_RET (a void function, or one whose last statement is
+// plain code) leaves the final block's successors at (-1,-1) by
+// construction — exactly the same "no successor" shape an explicit
+// T_RET produces, since function exit either way has nothing after it.
+regalloc_build_cfg(body_arr, body_cnt) -> ptr {
+    rg_blocks = arr_struct_new(sizeof(CfgBlock), 16);
+    rg_break_stack = arr_new();
+    rg_continue_stack = arr_new();
+    rg_cur_block = _rg_new_block();
+    _rg_build_body(body_arr, body_cnt);
+    return rg_blocks;
+}
+
+// Debug dump: prints block count + per-block statement count and
+// successor edges. The verification tool for this stage — nothing in
+// codegen consumes the CFG yet, so this is how its correctness gets
+// checked (by a human reading the dump, or a test script grepping it).
+// Mirrors --show-deps's own diag_str/diag_int/diag_newline self-printing
+// convention (bpp.bpp). `fn_name` is the function's packed name
+// (offset+length into vbuf, same representation FN_NAME always carries)
+// — printed via diag_buf exactly like --show-deps prints module names.
+void regalloc_dump_cfg(blocks, fn_name) {
+    auto n, i, b: CfgBlock;
+    n = arr_struct_count(blocks);
+    diag_str("CFG ");
+    diag_buf(vbuf + unpack_s(fn_name), unpack_l(fn_name));
+    diag_str(": ");
+    diag_int(n);
+    diag_str(" blocks");
+    diag_newline();
+    i = 0;
+    while (i < n) {
+        b = arr_struct_at(blocks, i);
+        diag_str("  block ");
+        diag_int(i);
+        diag_str(": ");
+        diag_int(arr_len(b.stmts));
+        diag_str(" stmts, succ=(");
+        diag_int(b.succ_a);
+        diag_str(",");
+        diag_int(b.succ_b);
+        diag_str(")");
+        diag_newline();
+        i++;
+    }
+}
+
+// Does `fn_name` start with the debug-dump trigger prefix
+// "__rg_dump_"? A function named this way gets its CFG printed (via
+// regalloc_dump_cfg) the moment it's built — the test-facing hook for
+// this stage, since nothing else observes the CFG yet. Avoids adding a
+// new CLI flag + a persistent cross-function CFG table purely for
+// verification purposes; a future stage that wires the CFG into real
+// codegen decisions will need that persistence anyway, at which point
+// this hook stays exactly as useful without having pre-built unneeded
+// plumbing today.
+regalloc_name_wants_dump(fn_name) {
+    auto pfx_len;
+    pfx_len = 10;   // length of "__rg_dump_"
+    if (unpack_l(fn_name) < pfx_len) { return 0; }
+    return buf_eq(vbuf + unpack_s(fn_name), "__rg_dump_", pfx_len);
+}
