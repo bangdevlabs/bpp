@@ -35,6 +35,10 @@ import "bpp_arr.bsm";
 // inliner's own id/slot scheme this module's "see through an inlined
 // call site" mechanism reuses verbatim (never reinvents).
 import "bpp_dispatch.bsm";
+// make_node — synthesizing the small per-parameter bind nodes the
+// inline-expansion below needs (NOT cloning the callee's body; see
+// the header comment on _rg_expand_inline_straightline).
+import "bpp_internal.bsm";
 
 // One basic block: a maximal straight-line statement sequence with a
 // single entry and at most two successors. An unconditional fallthrough
@@ -172,6 +176,228 @@ static void _rg_link_fallthrough(blk, target) {
     auto b: CfgBlock;
     b = arr_struct_at(rg_blocks, blk);
     if (b.dead == 0 && b.succ_a < 0 && b.succ_b < 0) { b.succ_a = target; }
+}
+
+// ── Seeing through an inlined call site ─────────────────────────────
+//
+// The inliner's real splice (cg_emit_inline_multi, bpp_codegen.bsm)
+// only clones the callee's body at EMISSION time — well after this
+// module's whole analysis has already run on the caller's un-spliced
+// body. Any inlined call site's mangled slots (_inl<id>_<param>,
+// pre-registered by _inline_register_callsite_slots /
+// _inline_register_nested in bpp_dispatch.bsm) are therefore invisible
+// to Stage A's walker by default, which is exactly why
+// regalloc_has_mangled_promoted (bpp_codegen.bsm) exists: refuse the
+// swap entirely rather than let linear-scan collide with a register
+// B3 already gave a slot it cannot see.
+//
+// This section closes that gap WITHOUT cloning the callee's full body
+// tree: when the walker meets an inlined T_CALL whose callee body is
+// a simple "straight line of statements ending in one return" shape,
+// it binds each (param, arg) pair as a small SYNTHESIZED T_ASSIGN
+// (make_node — the exact mechanism _inline_normalize_switch_ret
+// already uses to synthesize a ternary, never a new pattern), then
+// clones+translates the callee's trailing return expression
+// (_rg_clone_translate) into a final assignment.
+//
+// Why clone the return expression but not the whole body: the
+// callee's own AST nodes are SHARED (used standalone, and by every
+// other inliner of the same function) and carry the callee's NATIVE
+// param/local names. A node that ends up stored in a block's stmts
+// array is only ever resolved later, during Stage B/C/D — by which
+// point Stage A has long finished and rg_inline_stack is back to
+// empty. So every node that gets stored MUST already carry its FINAL
+// name baked in at the moment it is built, not a name to be
+// translated later (there is no "later" for rg_inline_stack — see
+// _rg_translate_name's own comment for the bug this fixes, found by
+// hand-tracing a real interval dump). _rg_clone_translate does exactly
+// that: walk the shared expression once, translating each T_VAR
+// through the CURRENTLY active frame as it goes, producing a fresh
+// expression tree of nodes that need no further translation, ever.
+//
+// Scoped narrowly for now (see docs/plans's "RegAlloc v2 sees through
+// inlined call sites" arc): only a STRAIGHT-LINE callee body (no
+// T_IF/T_WHILE/T_SWITCH, no T_CALL anywhere — nesting is a later
+// increment of the same arc) ending in a single-value T_RET, assigned
+// into a plain T_VAR target (`a = callee(...)`) — exactly the
+// flt_onepole_tick shape. Anything outside this shape falls through
+// to today's behavior (the call site is NOT expanded, B3's
+// mangled-promotion gate still protects it).
+
+// Clone an expression, translating every T_VAR through
+// _rg_translate_name as it goes. Only the node shapes that can appear
+// inside a straight-line callee's return expression need handling
+// here (mirrors _rg_expr_uses' own case list one level up, expression
+// nodes only — no statement shapes, since this stage's eligibility
+// check already rejects anything with control flow or nested calls).
+static _rg_clone_translate(nd) {
+    auto orig: Node, cl: Node, t;
+    if (nd == 0) { return 0; }
+    orig = nd;
+    t = orig.ntype;
+    if (t == T_VAR) {
+        cl = make_node(T_VAR);
+        cl.a = _rg_translate_name(orig.a);
+        return cl;
+    }
+    if (t == T_LIT) { return orig; }   // immutable, content-only — safe to share
+    if (t == T_BINOP) {
+        cl = make_node(T_BINOP);
+        cl.a = orig.a;
+        cl.b = _rg_clone_translate(orig.b);
+        cl.c = _rg_clone_translate(orig.c);
+        return cl;
+    }
+    if (t == T_UNARY) {
+        cl = make_node(T_UNARY);
+        cl.a = orig.a;
+        cl.b = _rg_clone_translate(orig.b);
+        return cl;
+    }
+    if (t == T_MEMLD) {
+        cl = make_node(T_MEMLD);
+        cl.a = _rg_clone_translate(orig.a);
+        cl.b = orig.b;
+        return cl;
+    }
+    if (t == T_ADDR) {
+        cl = make_node(T_ADDR);
+        cl.a = _rg_clone_translate(orig.a);
+        return cl;
+    }
+    if (t == T_TERNARY) {
+        cl = make_node(T_TERNARY);
+        cl.a = _rg_clone_translate(orig.a);
+        cl.b = _rg_clone_translate(orig.b);
+        cl.c = _rg_clone_translate(orig.c);
+        return cl;
+    }
+    return orig;   // unreachable given the straightline + no-T_CALL gate
+}
+
+// Does `body_arr` describe a callee this stage can expand in place?
+// Every check must pass BEFORE any node is emitted — once one
+// statement is appended to the current block, there is no clean way
+// to "undo" a partial expansion if a later statement disqualifies it.
+// Scoped to a SINGLE statement (body_cnt == 1: the trailing T_RET,
+// nothing before it) — a callee with locals needs each local's own
+// T_DECL/T_ASSIGN walked and translated too, which
+// _rg_expand_inline_straightline does not do yet (it only ever
+// touches the trailing return); widening this is a later increment of
+// the same arc, not folded in here speculatively. Also rejects ANY
+// T_CALL inside the body (not just control flow) — a nested inlined
+// call needs its OWN frame pushed at the right moment, which this
+// increment doesn't yet do either.
+static _rg_inline_body_is_straightline(body_arr, body_cnt) {
+    auto n: Node;
+    if (body_cnt != 1) { return 0; }
+    n = body_arr[0];
+    if (n == 0) { return 0; }
+    if (n.ntype != T_RET) { return 0; }
+    if (n.c > 1) { return 0; }       // multi-value return — a later increment
+    if (n.a == 0) { return 0; }      // void return has no value to bind
+    if (_rg_expr_has_call(n.a)) { return 0; }
+    return 1;
+}
+
+// Does this expression contain a T_CALL anywhere? Mirrors
+// _rg_expr_uses' own case list (expression nodes only — this is only
+// ever called on a callee's single return expression, never a
+// statement). Used to reject nested inlined calls for this increment
+// (see _rg_inline_body_is_straightline's own comment for why).
+static _rg_expr_has_call(nd) {
+    auto n: Node, t;
+    if (nd == 0) { return 0; }
+    n = nd; t = n.ntype;
+    if (t == T_CALL) { return 1; }
+    if (t == T_BINOP) { return _rg_expr_has_call(n.b) || _rg_expr_has_call(n.c); }
+    if (t == T_UNARY) { return _rg_expr_has_call(n.b); }
+    if (t == T_MEMLD) { return _rg_expr_has_call(n.a); }
+    if (t == T_ADDR) { return _rg_expr_has_call(n.a); }
+    if (t == T_TERNARY) { return _rg_expr_has_call(n.a) || _rg_expr_has_call(n.b) || _rg_expr_has_call(n.c); }
+    return 0;
+}
+
+// Expand ONE inlined call site in place: bind every (param, arg) pair,
+// then synthesize the final assignment into `dest_var_node` (the
+// T_VAR the original call's result was being assigned to) from the
+// callee's cloned+translated return expression. Caller (_rg_build_stmt)
+// has already confirmed eligibility via _rg_inline_body_is_straightline
+// (which guarantees body_cnt == 1, the trailing T_RET — a straight-
+// line body with no statement before it, since any earlier statement
+// would itself have to be a T_DECL/T_ASSIGN the callee never has
+// without locals; locals are a later increment alongside nesting).
+static void _rg_expand_inline_straightline(call_node, dest_var_node) {
+    auto id, fidx, fn_rec, params, pcnt, body_arr, body_cnt;
+    auto args, argc, i, param_name, mangled, slot_var: Node, arg_expr, translated_arg;
+    auto bind_n: Node, last: Node, final_n: Node;
+    id = call_node.e;
+    fidx = find_func_idx(call_node.a);
+    fn_rec = funcs[fidx];
+    params = *(fn_rec + FN_PARS);
+    pcnt = *(fn_rec + FN_PCNT);
+    body_arr = *(fn_rec + FN_BODY);
+    body_cnt = *(fn_rec + FN_BCNT);
+    args = call_node.b;
+    argc = call_node.c;
+
+    // Bind each parameter: `_inl<id>_<param> = <arg expr>`. The
+    // argument is translated through whatever frame is ALREADY active
+    // (rg_inline_stack's state from before this call) — exactly how a
+    // real call's arguments evaluate in the CALLER's own scope, before
+    // control ever reaches the callee's body. The new frame for THIS
+    // callee is not pushed until after every bind is emitted.
+    i = 0;
+    while (i < pcnt) {
+        param_name = params[i];
+        mangled = _inline_pack_mangled_name(id, param_name);
+        slot_var = make_node(T_VAR);
+        slot_var.a = mangled;
+        arg_expr = (i < argc) ? args[i] : 0;
+        translated_arg = _rg_clone_translate(arg_expr);
+        bind_n = make_node(T_ASSIGN);
+        bind_n.a = slot_var;
+        bind_n.b = translated_arg;
+        bind_n.d = 0;
+        _rg_emit(bind_n);
+        i++;
+    }
+
+    // _rg_inline_body_is_straightline already guarantees body_cnt == 1
+    // (no locals/earlier statements yet — that's the nesting increment).
+    // Clone+translate the trailing return's expression WITH the new
+    // frame active, so the callee's own param names resolve to their
+    // mangled slots, then synthesize the assignment into dest_var_node.
+    last = body_arr[body_cnt - 1];
+    if (dest_var_node != 0) {
+        rg_inline_stack = arr_push(rg_inline_stack, id);
+        final_n = make_node(T_ASSIGN);
+        final_n.a = dest_var_node;
+        final_n.b = _rg_clone_translate(last.a);
+        final_n.d = 0;
+        arr_pop(rg_inline_stack);
+        _rg_emit(final_n);
+    }
+}
+
+// Is `nd` a T_ASSIGN whose RHS is directly an inlined call site this
+// stage knows how to expand (single target, single-statement RHS —
+// the shape every real flt_onepole_tick-style call site takes)?
+static _rg_is_expandable_inline_assign(nd) {
+    auto n: Node, rhs: Node, fidx, fn_rec, body_arr, body_cnt;
+    n = nd;
+    if (n.ntype != T_ASSIGN) { return 0; }
+    if (n.d > 1) { return 0; }                  // multi-target — later increment
+    if (n.a == 0 || n.a.ntype != T_VAR) { return 0; }
+    rhs = n.b;
+    if (rhs == 0 || rhs.ntype != T_CALL) { return 0; }
+    if (rhs.e == 0) { return 0; }                // not an inlined call site at all
+    fidx = find_func_idx(rhs.a);
+    if (fidx < 0) { return 0; }
+    fn_rec = funcs[fidx];
+    body_arr = *(fn_rec + FN_BODY);
+    body_cnt = *(fn_rec + FN_BCNT);
+    return _rg_inline_body_is_straightline(body_arr, body_cnt);
 }
 
 // Build the CFG for one statement, updating rg_cur_block to whatever
@@ -321,6 +547,17 @@ static _rg_build_stmt(nd) {
         return 0;
     }
 
+    // `a = <inlined call>` where the callee is a straight-line, single-
+    // return body — expand it in place (see "Seeing through an
+    // inlined call site" above) instead of treating the call as an
+    // opaque statement. Every other shape (multi-target, multi-return,
+    // control flow in the callee, or simply not an inlined call at
+    // all) falls through unchanged to the plain-statement case below.
+    if (t == T_ASSIGN && _rg_is_expandable_inline_assign(nd)) {
+        _rg_expand_inline_straightline(n.b, n.a);
+        return 0;
+    }
+
     // Plain statement (T_ASSIGN, T_MEMST, T_DECL, expression-statement,
     // etc.) — none of these split blocks, just append.
     _rg_emit(nd);
@@ -423,31 +660,36 @@ static _rg_var_bit(vi) {
     return 1 << vi;
 }
 
-// Resolve a T_VAR's packed name to a variable index, redirecting
-// through the inline-translation stack when the walker is currently
-// "inside" an inlined call site's body. While walking flt_onepole_tick's
-// own statements (spliced in place of a real call, see the T_CALL case
-// in _rg_build_stmt/_rg_expr_uses below), a reference to its parameter
-// `s` must resolve to THAT callsite's mangled slot
-// (`_inl<id>_s`'s var_idx, already registered by the inliner's own
-// _inline_register_callsite_slots before this analysis ever runs) —
-// not to whatever `s` would mean natively (there usually isn't one).
+// Resolve a packed name to whatever it should ACTUALLY refer to right
+// now, given the inline-translation stack's current top frame —
+// returns a (possibly different) packed name, not an index. This is
+// the one and only thing rg_inline_stack is for: it is consulted
+// exclusively DURING Stage A's construction, inside
+// _rg_clone_translate below, while cloning an inlined callee's body
+// statement by statement. By the time Stage B/C/D ever run, Stage A
+// has already finished — every node sitting in a block's stmts array
+// was either copied verbatim from the caller's own source (needs no
+// translation) or produced by _rg_clone_translate with its FINAL name
+// already burned in. There is deliberately no translation step
+// anywhere in Stage B/C's own walkers (_rg_expr_uses /
+// _rg_stmt_use_def) — they call plain cg_var_idx, exactly like every
+// other codegen pass, because by the time they run there is nothing
+// left to translate.
 //
-// Only the top frame is consulted (see rg_inline_stack's own field
-// comment for why one level is always enough). A name that does NOT
-// belong to the current callee's own params/locals — most commonly a
-// global, or (one day) an outer frame's variable referenced from a
-// nested callee that doesn't shadow it — falls through to the plain
-// cg_var_idx every other codegen pass already uses.
-static _rg_resolve_var(name_p) {
-    auto top_id, mangled, vi;
+// (First version of this mechanism tried to defer translation to
+// Stage B/C by consulting the stack from inside _rg_expr_uses itself —
+// wrong: the stack had already been popped back to empty by the time
+// those walkers ran, since they only run AFTER the whole CFG is built.
+// Found by hand-tracing a real interval dump that showed a mangled
+// slot's interval missing its actual use entirely.)
+static _rg_translate_name(name_p) {
+    auto top_id, mangled;
     if (arr_len(rg_inline_stack) > 0) {
         top_id = arr_last(rg_inline_stack);
         mangled = _inline_pack_mangled_name(top_id, name_p);
-        vi = cg_var_idx(mangled);
-        if (vi >= 0) { return vi; }
+        if (cg_var_idx(mangled) >= 0) { return mangled; }
     }
-    return cg_var_idx(name_p);
+    return name_p;
 }
 
 // Every local variable an EXPRESSION reads, as a bitset. Expressions
@@ -459,7 +701,7 @@ static _rg_expr_uses(nd) {
     auto n: Node, t, bits, arr, cnt, i;
     if (nd == 0) { return 0; }
     n = nd; t = n.ntype;
-    if (t == T_VAR) { return _rg_var_bit(_rg_resolve_var(n.a)); }
+    if (t == T_VAR) { return _rg_var_bit(cg_var_idx(n.a)); }
     if (t == T_BINOP) { return _rg_expr_uses(n.b) | _rg_expr_uses(n.c); }
     if (t == T_UNARY) { return _rg_expr_uses(n.b); }
     if (t == T_MEMLD) { return _rg_expr_uses(n.a); }
@@ -500,12 +742,12 @@ static _rg_stmt_use_def(nd) {
             while (i < cnt) {
                 tnode = arr[i];
                 if (tnode != 0 && tnode.ntype == T_VAR) {
-                    def_bits = def_bits | _rg_var_bit(_rg_resolve_var(tnode.a));
+                    def_bits = def_bits | _rg_var_bit(cg_var_idx(tnode.a));
                 }
                 i++;
             }
         } else if (n.a != 0 && n.a.ntype == T_VAR) {
-            def_bits = _rg_var_bit(_rg_resolve_var(n.a.a));
+            def_bits = _rg_var_bit(cg_var_idx(n.a.a));
         }
         return use_bits, def_bits;
     }
