@@ -279,19 +279,26 @@ static _rg_clone_translate(nd) {
 // Every check must pass BEFORE any node is emitted — once one
 // statement is appended to the current block, there is no clean way
 // to "undo" a partial expansion if a later statement disqualifies it.
-// Scoped to a SINGLE statement (body_cnt == 1: the trailing T_RET,
-// nothing before it) — a callee with locals needs each local's own
-// T_DECL/T_ASSIGN walked and translated too, which
-// _rg_expand_inline_straightline does not do yet (it only ever
-// touches the trailing return); widening this is a later increment of
-// the same arc, not folded in here speculatively. Also rejects ANY
-// T_CALL inside the body (not just control flow) — a nested inlined
-// call needs its OWN frame pushed at the right moment, which this
-// increment doesn't yet do either.
+// Every statement BEFORE the trailing T_RET must be a plain
+// single-target T_DECL or T_ASSIGN (the callee's own locals) — no
+// control flow, no T_CALL anywhere (still rejected: a nested inlined
+// call needs its own frame pushed mid-walk, which is Phase 3b, not
+// this increment).
 static _rg_inline_body_is_straightline(body_arr, body_cnt) {
-    auto n: Node;
-    if (body_cnt != 1) { return 0; }
-    n = body_arr[0];
+    auto i, n: Node;
+    if (body_cnt < 1) { return 0; }
+    i = 0;
+    while (i < body_cnt - 1) {
+        n = body_arr[i];
+        if (n == 0) { return 0; }
+        if (n.ntype == T_DECL) { i++; continue; }
+        if (n.ntype != T_ASSIGN) { return 0; }
+        if (n.d > 1) { return 0; }                  // multi-target local — later increment
+        if (n.a == 0 || n.a.ntype != T_VAR) { return 0; }
+        if (_rg_expr_has_call(n.b)) { return 0; }
+        i++;
+    }
+    n = body_arr[body_cnt - 1];
     if (n == 0) { return 0; }
     if (n.ntype != T_RET) { return 0; }
     if (n.c > 1) { return 0; }       // multi-value return — a later increment
@@ -319,18 +326,17 @@ static _rg_expr_has_call(nd) {
 }
 
 // Expand ONE inlined call site in place: bind every (param, arg) pair,
-// then synthesize the final assignment into `dest_var_node` (the
-// T_VAR the original call's result was being assigned to) from the
-// callee's cloned+translated return expression. Caller (_rg_build_stmt)
-// has already confirmed eligibility via _rg_inline_body_is_straightline
-// (which guarantees body_cnt == 1, the trailing T_RET — a straight-
-// line body with no statement before it, since any earlier statement
-// would itself have to be a T_DECL/T_ASSIGN the callee never has
-// without locals; locals are a later increment alongside nesting).
+// walk the callee's own locals (each T_ASSIGN cloned+translated, each
+// T_DECL skipped — its mangled slot already exists from pre-reg, a
+// fresh declaration would add nothing), then synthesize the final
+// assignment into `dest_var_node` (the T_VAR the original call's
+// result was being assigned to) from the callee's cloned+translated
+// return expression. Caller (_rg_build_stmt) has already confirmed
+// eligibility via _rg_inline_body_is_straightline.
 static void _rg_expand_inline_straightline(call_node, dest_var_node) {
     auto id, fidx, fn_rec, params, pcnt, body_arr, body_cnt;
     auto args, argc, i, param_name, mangled, slot_var: Node, arg_expr, translated_arg;
-    auto bind_n: Node, last: Node, final_n: Node;
+    auto bind_n: Node, n: Node, last: Node, final_n: Node, local_n: Node;
     id = call_node.e;
     fidx = find_func_idx(call_node.a);
     fn_rec = funcs[fidx];
@@ -363,21 +369,36 @@ static void _rg_expand_inline_straightline(call_node, dest_var_node) {
         i++;
     }
 
-    // _rg_inline_body_is_straightline already guarantees body_cnt == 1
-    // (no locals/earlier statements yet — that's the nesting increment).
-    // Clone+translate the trailing return's expression WITH the new
-    // frame active, so the callee's own param names resolve to their
-    // mangled slots, then synthesize the assignment into dest_var_node.
+    // Walk the callee's own locals (everything before the trailing
+    // return) WITH the new frame active, so both sides of each
+    // T_ASSIGN resolve through the callee's mangled slots. T_DECL
+    // carries no value to translate — its slot is already registered.
+    rg_inline_stack = arr_push(rg_inline_stack, id);
+    i = 0;
+    while (i < body_cnt - 1) {
+        n = body_arr[i];
+        if (n.ntype == T_ASSIGN) {
+            local_n = make_node(T_ASSIGN);
+            local_n.a = _rg_clone_translate(n.a);
+            local_n.b = _rg_clone_translate(n.b);
+            local_n.d = 0;
+            _rg_emit(local_n);
+        }
+        i++;
+    }
+
+    // Clone+translate the trailing return's expression (still with
+    // the same frame active), then synthesize the assignment into
+    // dest_var_node.
     last = body_arr[body_cnt - 1];
     if (dest_var_node != 0) {
-        rg_inline_stack = arr_push(rg_inline_stack, id);
         final_n = make_node(T_ASSIGN);
         final_n.a = dest_var_node;
         final_n.b = _rg_clone_translate(last.a);
         final_n.d = 0;
-        arr_pop(rg_inline_stack);
         _rg_emit(final_n);
     }
+    arr_pop(rg_inline_stack);
 }
 
 // Is `nd` a T_ASSIGN whose RHS is directly an inlined call site this
