@@ -403,7 +403,6 @@ struct ChipPrimitives {
     fn_compute_offsets,       // () → total_vars_bytes (fills cg_var_off)
     fn_scratch_base,          // () → hidden-scratch size (fp/lr + d0/d1 save etc)
     save_main_runtime_globals,// () — save argc/argv/envp from arg regs to _bpp_* globals
-    emit_zero_reg,            // (reg) — reg ← 0
     emit_narrow_float_params, // (par_cnt) — a64 half/quarter fcvt pass, no-op on x64
     emit_implicit_ret_zero,   // () — mov return_reg, 0 for fallthrough return
     emit_body,                // (body_arr, body_cnt) — chip's body walker delegation
@@ -2444,7 +2443,6 @@ void cg_emit_func(fi) {
     auto frame, i, total;
     auto hints, ph, fn_rec, pvi;
     auto stmt_i: Node;
-    auto vi, n_vars, preg;
 
     p = cg_prim;
 
@@ -2704,13 +2702,30 @@ void cg_emit_func(fi) {
         i++;
     }
 
-    // 12. Zero any promoted local that is not also a parameter.
-    n_vars = arr_len(cg_vars);
-    for (vi = par_cnt; vi < n_vars; vi++) {
-        preg = arr_get(cg_var_promote, vi);
-        if (preg >= 0) { call(p.emit_zero_reg, preg); }
-    }
-
+    // 12. (Removed — see RegAlloc v2 Stage E note below.) This used to
+    // zero every promoted non-parameter local's register here in the
+    // prologue, unconditionally. That assumed an invariant B3 always
+    // held (one physical register, one owning variable, for the whole
+    // function) which RegAlloc v2's linear-scan deliberately breaks
+    // via slot-sharing: two variables with non-overlapping live ranges
+    // can share a register. With that sharing in play, this loop would
+    // zero a register a DIFFERENT variable already holds a real value
+    // in (e.g. a parameter copied in step 11, just above, sharing a
+    // slot with a later local) — found via `bug --disasm` on
+    // __rg_asn_straightline once Stage E started swapping decisions
+    // in: `a`'s value (copied from x0 into its promoted register one
+    // instruction earlier) was overwritten by this exact loop zeroing
+    // `y`'s register, which Stage E's linear-scan had assigned the
+    // SAME physical register once `a` expired.
+    //
+    // Removed rather than patched with a sharing-aware exception:
+    // stack-resident locals were NEVER zero-initialised by this
+    // compiler (only promoted ones were), so removing this loop makes
+    // "promoted" and "stack" locals behave consistently — both
+    // uninitialised-until-written, which is what well-formed B++
+    // source already assumes (no test in this repo reads a local
+    // before writing it; confirmed by running the full suite after
+    // removing this loop — see the commit this change ships in).
     // 12b. Stage 2a — materialise each promoted hot constant into its
     // callee-saved register, once, here in the prologue. cg_const_reg is
     // only ever set on backends whose b3_select_const ran (a64), so this
