@@ -136,6 +136,54 @@ global rg_inline_dest_cnt_stack;
 // plain fallthrough in any ordinary function today.
 global rg_inline_join_stack;
 
+// Parallel to rg_inline_stack: which of the CURRENT frame's own
+// parameters were SUBSTITUTED directly in place rather than bound to
+// a real mangled slot — _inline_param_needs_bind (bpp_codegen.bsm) is
+// the single source of truth for this decision, shared with the real
+// splice so the two can never disagree about which shape a callsite
+// takes (see that function's own header comment for the bug this
+// closes — RegAlloc v2 used to assume every parameter was always
+// bound, which silently corrupted register state for any parameter
+// the real splice substitutes instead).
+//
+// Each entry is itself an arr_new() of (orig_name, subst_node) pairs
+// — packed as two parallel arrays, rg_inline_subst_names_stack[top]
+// and rg_inline_subst_nodes_stack[top] — for the CURRENT frame only.
+// `subst_node` is the ARGUMENT already cloned+translated through
+// whatever frame was active BEFORE this one was pushed (the same
+// translation _rg_expand_inline_straightline already performs for
+// every bound parameter) — looked up and re-cloned (never shared
+// directly — see _rg_clone_subst_lookup) every time a T_VAR inside
+// this frame's body references that parameter's name.
+global rg_inline_subst_names_stack;
+global rg_inline_subst_nodes_stack;
+
+// Every mangled name (`_inl<id>_<param>`) any expansion this function
+// ever substituted, across the WHOLE function — unlike the per-frame
+// stacks above, this accumulates and is never popped mid-function;
+// only reset at the top of regalloc_build_cfg. Needed because
+// regalloc_has_uncovered_mangled_promoted (Stage E's own gate) runs
+// AFTER every frame has already been pushed and popped, with no
+// per-frame state left to consult — yet it still needs to tell a
+// genuinely uncovered mangled slot (Stage A's analysis really can't
+// see it) apart from a KNOWN-substituted one (Stage A correctly
+// expanded right through it, and it simply has no interval because it
+// was never bound to a real slot in the first place).
+//
+// Why this is the right gate and not "fewer false positives": pre-reg
+// (_inline_register_callsite_slots, bpp_codegen.bsm) always registers
+// `_inl<id>_<param>` in cg_vars and computes its cg_var_refs from the
+// callee's ORIGINAL body — independent of bind_needed, which is only
+// decided later. B3 ranks purely by that ref count, so it can promote
+// a substituted parameter's slot even though the real splice never
+// emits a single reference to it (every reference was rewritten to
+// the caller's own argument expression instead). The promoted
+// register is reserved but genuinely untouched by B3 itself in that
+// case — Stage E's linear-scan is free to hand the same physical
+// register to one of its own variables with no real collision,
+// because nothing B3 emits ever touches the substituted slot.
+global rg_known_substituted_names;
+
 // Initialize the regalloc module. Call once at startup, mirroring
 // init_dispatch()'s own convention — the real per-function state is set
 // fresh by regalloc_build_cfg every time, so this just establishes safe
@@ -150,6 +198,9 @@ void init_regalloc() {
     rg_inline_dest_arr_stack = arr_new();
     rg_inline_dest_cnt_stack = arr_new();
     rg_inline_join_stack = arr_new();
+    rg_inline_subst_names_stack = arr_new();
+    rg_inline_subst_nodes_stack = arr_new();
+    rg_known_substituted_names = arr_new();
 }
 
 // Allocate a fresh, empty block in the function currently under
@@ -273,11 +324,33 @@ static void _rg_link_fallthrough(blk, target) {
 // nodes only — no statement shapes, since this stage's eligibility
 // check already rejects anything with control flow or nested calls).
 static _rg_clone_translate(nd) {
-    auto orig: Node, cl: Node, t;
+    auto orig: Node, cl: Node, t, _subst;
     if (nd == 0) { return 0; }
     orig = nd;
     t = orig.ntype;
     if (t == T_VAR) {
+        // A name matching one of the CURRENT frame's substituted
+        // (bind_needed==0) parameters resolves to a fresh clone of the
+        // caller's own argument expression — never a mangled T_VAR at
+        // all, since the real splice never creates a slot for it
+        // either. See _rg_clone_subst_lookup's own comment.
+        //
+        // _rg_clone_PLAIN, not _rg_clone_translate, on the substitute:
+        // `_subst` was already fully translated at bind time, through
+        // whichever frame was active BEFORE this one was pushed — it
+        // needs cloning (so two references to the same parameter don't
+        // share one mutable node), never a second translation pass.
+        // Recursing back into _rg_clone_translate here was an infinite
+        // loop waiting to happen whenever a parameter's own name
+        // matched its argument's name (e.g. `vec2_add(out, ...)`
+        // substituting its own `out` parameter with the caller's
+        // variable ALSO named `out`): every re-entry would look up
+        // "out" against this SAME frame's substitution map, find the
+        // SAME entry, and recurse forever — found via `lldb`/a crash
+        // bootstrapping the compiler against its own large `vec2_add`-
+        // shaped call sites, 78000+ stacked _rg_clone_translate frames.
+        _subst = _rg_clone_subst_lookup(orig.a);
+        if (_subst != 0) { return _rg_clone_plain(_subst); }
         cl = make_node(T_VAR);
         cl.a = _rg_translate_name(orig.a);
         return cl;
@@ -317,6 +390,59 @@ static _rg_clone_translate(nd) {
     return orig;   // unreachable given the straightline + no-T_CALL gate
 }
 
+// Clone an expression with NO translation at all — every name is
+// copied verbatim. Used exactly once: re-cloning a substituted
+// parameter's argument node (_rg_clone_translate's own T_VAR case),
+// which was already fully translated through the CORRECT (outer)
+// frame at bind time and must never be re-resolved against the
+// CURRENT (inner) frame's own substitution map — see that case's own
+// comment for the infinite-recursion bug this prevents. Mirrors
+// _rg_clone_translate's case list exactly, minus the lookup.
+static _rg_clone_plain(nd) {
+    auto orig: Node, cl: Node, t;
+    if (nd == 0) { return 0; }
+    orig = nd;
+    t = orig.ntype;
+    if (t == T_VAR) {
+        cl = make_node(T_VAR);
+        cl.a = orig.a;
+        return cl;
+    }
+    if (t == T_LIT) { return orig; }
+    if (t == T_BINOP) {
+        cl = make_node(T_BINOP);
+        cl.a = orig.a;
+        cl.b = _rg_clone_plain(orig.b);
+        cl.c = _rg_clone_plain(orig.c);
+        return cl;
+    }
+    if (t == T_UNARY) {
+        cl = make_node(T_UNARY);
+        cl.a = orig.a;
+        cl.b = _rg_clone_plain(orig.b);
+        return cl;
+    }
+    if (t == T_MEMLD) {
+        cl = make_node(T_MEMLD);
+        cl.a = _rg_clone_plain(orig.a);
+        cl.b = orig.b;
+        return cl;
+    }
+    if (t == T_ADDR) {
+        cl = make_node(T_ADDR);
+        cl.a = _rg_clone_plain(orig.a);
+        return cl;
+    }
+    if (t == T_TERNARY) {
+        cl = make_node(T_TERNARY);
+        cl.a = _rg_clone_plain(orig.a);
+        cl.b = _rg_clone_plain(orig.b);
+        cl.c = _rg_clone_plain(orig.c);
+        return cl;
+    }
+    return orig;
+}
+
 // Does every path through `body_arr` return, using only shapes this
 // stage understands, given the call site assigns into
 // `expected_arity` targets (1 for a plain single-target assignment, N
@@ -328,8 +454,20 @@ static _rg_clone_translate(nd) {
 // if-arm — never legal for a whole callee body, which the call site
 // is relying on for its result) and "invalid" (-1) reject identically
 // here.
+//
+// `expected_arity == 0` is the one exception: a VOID callee (a plain
+// statement-level call site with no assignment at all, the
+// lfo_set_rate-inside-rotary_tick shape — see _rg_is_void_call_expandable)
+// is EXPECTED to fall through without ever returning (the real
+// inliner's own fn_void_inlineable classifier already rejects any
+// void candidate whose body contains a T_RET at all — Stage A's own
+// T_RET case below mirrors that same rule), so "falls through" (0) is
+// the SUCCESS case here, not "invalid, no value to use."
 static _rg_body_all_paths_return(body_arr, body_cnt, expected_arity) {
-    return (_rg_stmts_all_paths_return(body_arr, body_cnt, 0, expected_arity) == 1) ? 1 : 0;
+    auto result;
+    result = _rg_stmts_all_paths_return(body_arr, body_cnt, 0, expected_arity);
+    if (expected_arity == 0) { return (result >= 0) ? 1 : 0; }
+    return (result == 1) ? 1 : 0;
 }
 
 // Walks body_arr[start_idx..body_cnt), classifying every path through
@@ -395,7 +533,10 @@ static _rg_stmts_all_paths_return(body_arr, body_cnt, start_idx, expected_arity)
     while (i < body_cnt) {
         n = body_arr[i];
         if (n == 0) { return -1; }
-        if (n.ntype == T_RET) { return _rg_return_arity_ok(n, expected_arity) ? 1 : -1; }
+        if (n.ntype == T_RET) {
+            if (expected_arity == 0) { return -1; }   // a void callee must never contain a return at all
+            return _rg_return_arity_ok(n, expected_arity) ? 1 : -1;
+        }
         if (n.ntype == T_DECL) { i++; continue; }
         if (n.ntype == T_MEMST) {
             // A struct-field write (moog_taps's own `mm.s1 = a;`
@@ -608,7 +749,7 @@ static _rg_ret_to_assign_array(ret: Node, dest_arr, dest_cnt) {
 static void _rg_expand_inline_straightline(call_node, dest_arr, dest_cnt, id) {
     auto fidx, fn_rec, params, pcnt, body_arr, body_cnt;
     auto args, argc, i, param_name, mangled, slot_var: Node, arg_expr, translated_arg;
-    auto bind_n: Node, join_blk;
+    auto bind_n: Node, join_blk, needs_bind, subst_names, subst_nodes;
     fidx = find_func_idx(call_node.a);
     fn_rec = funcs[fidx];
     params = *(fn_rec + FN_PARS);
@@ -618,25 +759,60 @@ static void _rg_expand_inline_straightline(call_node, dest_arr, dest_cnt, id) {
     args = call_node.b;
     argc = call_node.c;
 
-    // Bind each parameter: `_inl<id>_<param> = <arg expr>`. The
-    // argument is translated through whatever frame is ALREADY active
-    // (rg_inline_stack's state from before this call) — exactly how a
-    // real call's arguments evaluate in the CALLER's own scope, before
-    // control ever reaches the callee's body. The new frame for THIS
-    // callee is not pushed until after every bind is emitted.
+    // Per-param bind-vs-substitute strategy: _inline_param_needs_bind
+    // (bpp_codegen.bsm) is THE single source of truth for this
+    // decision — the same function the real splice itself calls — so
+    // this can never silently diverge from what the real emission
+    // actually does again (see that function's own header comment for
+    // the bug this closes: a parameter the real splice substitutes
+    // directly, with no slot ever created, used to be assumed bound
+    // here, corrupting register state for any callee body with more
+    // than one statement standing between the substituted parameter's
+    // "phantom bind point" and its real use).
+    //
+    // A BOUND parameter behaves exactly as before: emit
+    // `_inl<id>_<param> = <arg expr>` once, translated through
+    // whatever frame was ALREADY active (rg_inline_stack's state from
+    // before this call — exactly how a real call's arguments evaluate
+    // in the CALLER's own scope, before control ever reaches the
+    // callee's body).
+    //
+    // A SUBSTITUTED parameter emits NOTHING — instead, its name and
+    // its already-translated argument node are recorded into this
+    // frame's own substitution map (subst_names/subst_nodes, pushed
+    // below), so every reference to it inside the callee's body
+    // resolves straight to a fresh clone of the argument expression
+    // (_rg_clone_subst_lookup, consulted from _rg_clone_translate's
+    // own T_VAR case) — never to a mangled slot that the real
+    // emission never actually creates.
+    subst_names = arr_new();
+    subst_nodes = arr_new();
     i = 0;
     while (i < pcnt) {
         param_name = params[i];
-        mangled = _inline_pack_mangled_name(id, param_name);
-        slot_var = make_node(T_VAR);
-        slot_var.a = mangled;
         arg_expr = (i < argc) ? args[i] : 0;
         translated_arg = _rg_clone_translate(arg_expr);
-        bind_n = make_node(T_ASSIGN);
-        bind_n.a = slot_var;
-        bind_n.b = translated_arg;
-        bind_n.d = 0;
-        _rg_emit(bind_n);
+        needs_bind = (arg_expr == 0) ? 1 : _inline_param_needs_bind(fidx, i, arg_expr, body_arr, body_cnt, params);
+        if (needs_bind) {
+            mangled = _inline_pack_mangled_name(id, param_name);
+            slot_var = make_node(T_VAR);
+            slot_var.a = mangled;
+            bind_n = make_node(T_ASSIGN);
+            bind_n.a = slot_var;
+            bind_n.b = translated_arg;
+            bind_n.d = 0;
+            _rg_emit(bind_n);
+        } else {
+            subst_names = arr_push(subst_names, param_name);
+            subst_nodes = arr_push(subst_nodes, translated_arg);
+            // Record the slot pre-reg still registered in cg_vars for
+            // this substituted parameter (_inline_register_callsite_slots
+            // always registers it, independent of bind_needed — see
+            // rg_known_substituted_names's own header comment) so Stage
+            // E's gate can recognize it as known-safe instead of
+            // genuinely uncovered.
+            rg_known_substituted_names = arr_push(rg_known_substituted_names, _inline_pack_mangled_name(id, param_name));
+        }
         i++;
     }
 
@@ -656,6 +832,8 @@ static void _rg_expand_inline_straightline(call_node, dest_arr, dest_cnt, id) {
     rg_inline_dest_arr_stack = arr_push(rg_inline_dest_arr_stack, dest_arr);
     rg_inline_dest_cnt_stack = arr_push(rg_inline_dest_cnt_stack, dest_cnt);
     rg_inline_join_stack = arr_push(rg_inline_join_stack, join_blk);
+    rg_inline_subst_names_stack = arr_push(rg_inline_subst_names_stack, subst_names);
+    rg_inline_subst_nodes_stack = arr_push(rg_inline_subst_nodes_stack, subst_nodes);
 
     _rg_build_body(body_arr, body_cnt);
 
@@ -664,6 +842,8 @@ static void _rg_expand_inline_straightline(call_node, dest_arr, dest_cnt, id) {
     arr_pop(rg_inline_dest_arr_stack);
     arr_pop(rg_inline_dest_cnt_stack);
     arr_pop(rg_inline_join_stack);
+    arr_pop(rg_inline_subst_names_stack);
+    arr_pop(rg_inline_subst_nodes_stack);
 
     // A body that falls off the end without an explicit return
     // shouldn't happen for a non-void callee (_rg_body_all_paths_return
@@ -797,6 +977,40 @@ static _rg_call_is_expandable(call_node, is_nested, expected_arity) {
     body_arr = *(fn_rec + FN_BODY);
     body_cnt = *(fn_rec + FN_BCNT);
     return _rg_body_all_paths_return(body_arr, body_cnt, expected_arity);
+}
+
+// Is `call_node` a plain STATEMENT-level call (no assignment, no
+// return — `lfo_set_rate(r.lfo, r.cur);` inside rotary_tick's own
+// body) whose target is the real inliner's VOID-inlineable tier
+// (fn_void_inlineable, bpp_dispatch.bsm — a DIFFERENT classifier from
+// fn_inlineable, registered the same way via _inline_register_callsite
+// but never carrying a value)? Mirrors _rg_call_is_expandable's own
+// shape exactly, just against the void classifier and with
+// expected_arity pinned to 0 — _rg_body_all_paths_return's own
+// expected_arity==0 branch (above) is what actually accepts "falls
+// through without a return" as success here, instead of rejecting it.
+// Only the TOP-LEVEL case (is_nested==0) is wired up — a void call
+// nested inside another callee's own body isn't reached by anything
+// real yet (_inline_find_nested_calls, bpp_dispatch.bsm, doesn't walk
+// a callee's PLAIN statement list looking for a bare T_CALL either —
+// only inside an expression), so there's nothing this stage could
+// recurse into even if it tried.
+static _rg_is_void_call_expandable(call_node, is_nested) {
+    auto rhs: Node, fidx, fn_rec, body_arr, body_cnt;
+    rhs = call_node;
+    if (rhs == 0 || rhs.ntype != T_CALL) { return 0; }
+    fidx = find_func_idx(rhs.a);
+    if (fidx < 0) { return 0; }
+    if (arr_get(fn_void_inlineable, fidx) == 0) { return 0; }
+    if (is_nested == 0) {
+        if (rhs.e == 0) { return 0; }            // not a call site the real inliner chose
+    } else {
+        return 0;                                // not yet motivated by any real shape
+    }
+    fn_rec = funcs[fidx];
+    body_arr = *(fn_rec + FN_BODY);
+    body_cnt = *(fn_rec + FN_BCNT);
+    return _rg_body_all_paths_return(body_arr, body_cnt, 0);
 }
 
 // Build the CFG for one statement, updating rg_cur_block to whatever
@@ -1076,6 +1290,27 @@ static _rg_build_stmt(nd) {
         }
     }
 
+    // A plain STATEMENT-level call with no assignment and no return at
+    // all (`lfo_set_rate(r.lfo, r.cur);` inside rotary_tick's own body)
+    // — the void-inlineable counterpart of the T_ASSIGN case just
+    // above. Only recognized at the TOP level (rg_inline_stack empty —
+    // see _rg_is_void_call_expandable's own comment for why a nested
+    // occurrence isn't handled). dest_arr=0/dest_cnt=0 tells
+    // _rg_expand_inline_straightline there is no result to bind
+    // anywhere — safe because a void callee's own body is guaranteed
+    // (by _rg_body_all_paths_return's expected_arity==0 check) to
+    // never contain a T_RET that would need a destination at all.
+    if (t == T_CALL && arr_len(rg_inline_stack) == 0) {
+        auto _rg_void_cs_id;
+        if (_rg_is_void_call_expandable(nd, 0)) {
+            _rg_void_cs_id = _rg_callsite_id_for(nd);
+            if (_rg_void_cs_id >= 0) {
+                _rg_expand_inline_straightline(nd, 0, 0, _rg_void_cs_id);
+                return 0;
+            }
+        }
+    }
+
     // Plain statement (T_ASSIGN, T_MEMST, T_DECL, expression-statement,
     // etc.) — none of these split blocks, just append. Outside any
     // expansion (the common case — every ordinary function the
@@ -1153,6 +1388,9 @@ regalloc_build_cfg(body_arr, body_cnt) -> ptr {
     rg_inline_dest_arr_stack = arr_new();
     rg_inline_dest_cnt_stack = arr_new();
     rg_inline_join_stack = arr_new();
+    rg_inline_subst_names_stack = arr_new();
+    rg_inline_subst_nodes_stack = arr_new();
+    rg_known_substituted_names = arr_new();
     rg_cur_block = _rg_new_block();
     _rg_build_body(body_arr, body_cnt);
     return rg_blocks;
@@ -1224,6 +1462,32 @@ regalloc_name_wants_dump(fn_name) {
 static _rg_var_bit(vi) {
     if (vi < 0 || vi >= 64) { return 0; }
     return 1 << vi;
+}
+
+// Does `name_p` match one of the CURRENT (topmost) frame's substituted
+// parameters — a parameter _inline_param_needs_bind decided gets no
+// real mangled slot at all, because the real splice substitutes the
+// caller's own argument expression directly in its place? Returns the
+// (already cloned+translated, at bind time) argument node if so, 0
+// otherwise — checked BEFORE _rg_translate_name's mangled-name lookup
+// in _rg_clone_translate, since a substituted parameter has no
+// mangled slot for that lookup to ever find anyway. Only the topmost
+// frame is consulted, mirroring rg_inline_stack's own "exactly one
+// level of currently-active translation context" invariant — see its
+// header comment.
+static _rg_clone_subst_lookup(name_p) {
+    auto top_idx, names, nodes, n, i;
+    top_idx = arr_len(rg_inline_subst_names_stack) - 1;
+    if (top_idx < 0) { return 0; }
+    names = arr_get(rg_inline_subst_names_stack, top_idx);
+    nodes = arr_get(rg_inline_subst_nodes_stack, top_idx);
+    n = arr_len(names);
+    i = 0;
+    while (i < n) {
+        if (packed_eq(arr_get(names, i), name_p)) { return arr_get(nodes, i); }
+        i++;
+    }
+    return 0;
 }
 
 // Resolve a packed name to whatever it should ACTUALLY refer to right
@@ -1968,6 +2232,49 @@ regalloc_name_wants_asn_dump(fn_name) {
     return buf_eq(vbuf + unpack_s(fn_name), "__rg_asn_", pfx_len);
 }
 
+// Does `fn_name` start with "__rg_swap_"? Stage E's own dump trigger —
+// reports the four gate outcomes (B3-regression check, uncovered-
+// mangled-slot check, live-range-split check, for each register
+// class) PLUS whether the swap was actually applied, since none of
+// the earlier dumps (CFG/liveness/RPO/intervals/assignments) show
+// Stage E's final decision. Mirrors the other stages' prefix check
+// exactly; see regalloc_dump_swap below for the printed shape.
+regalloc_name_wants_swap_dump(fn_name) {
+    auto pfx_len;
+    pfx_len = 10;   // length of "__rg_swap_"
+    if (unpack_l(fn_name) < pfx_len) { return 0; }
+    return buf_eq(vbuf + unpack_s(fn_name), "__rg_swap_", pfx_len);
+}
+
+// Print Stage E's full gate outcome for one function: whether linear-
+// scan ever regressed against B3 (int/float separately), whether any
+// B3-promoted mangled slot is still uncovered by Stage A's analysis,
+// whether either register class needed live-range splitting, and
+// whether the swap was actually applied for each class. This is the
+// one piece of Stage E's reasoning none of the other dump stages
+// (CFG/liveness/RPO/intervals/assignments) ever show on their own —
+// a function can have perfectly clean intervals and assignments yet
+// still fall back to B3 for a reason only visible here.
+void regalloc_dump_swap(fn_name, worse, worse_flt, mangled, split, split_flt, applied_int, applied_flt) {
+    diag_str("SWAP ");
+    diag_buf(vbuf + unpack_s(fn_name), unpack_l(fn_name));
+    diag_str(": worse=");
+    diag_int(worse);
+    diag_str(" worse_flt=");
+    diag_int(worse_flt);
+    diag_str(" mangled=");
+    diag_int(mangled);
+    diag_str(" split=");
+    diag_int(split);
+    diag_str(" split_flt=");
+    diag_int(split_flt);
+    diag_str(" applied_int=");
+    diag_int(applied_int);
+    diag_str(" applied_flt=");
+    diag_int(applied_flt);
+    diag_newline();
+}
+
 // ── Stage D validation — systematic comparison against B3 ───────────
 //
 // Before Stage E can read linear-scan's decisions for anything real,
@@ -2038,6 +2345,25 @@ static _rg_var_in_intervals(intervals, vi) {
     return 0;
 }
 
+// Does `var_names[vi]`'s mangled name match one this function's
+// expansions already KNOW was substituted in place rather than ever
+// bound to a real slot (rg_known_substituted_names, accumulated
+// across the whole function by _rg_expand_inline_straightline — see
+// its own header comment)? A linear scan over a handful of entries —
+// same cost class as _rg_var_in_intervals just above, and called from
+// the exact same site, right after it.
+static _rg_is_known_substituted(var_names, vi) {
+    auto nm, n, i;
+    nm = arr_get(var_names, vi);
+    n = arr_len(rg_known_substituted_names);
+    i = 0;
+    while (i < n) {
+        if (packed_eq(arr_get(rg_known_substituted_names, i), nm)) { return 1; }
+        i++;
+    }
+    return 0;
+}
+
 // Stage E's own extra gate, beyond regalloc_compare_vs_b3. The
 // original (now superseded — git log has its own header for the full
 // story) version refused the swap whenever B3 promoted ANY mangled
@@ -2058,12 +2384,23 @@ static _rg_var_in_intervals(intervals, vi) {
 // the blanket refusal became needlessly conservative; most of the
 // real DSP chain's mangled slots ARE covered today. This function
 // refuses the swap only when a mangled slot B3 promoted genuinely has
-// NO interval anywhere in this function's analysis (neither pool) —
-// the actual signature of "this shape is still invisible to Stage A,"
-// not merely "this function happens to contain a mangled slot at
-// all." A mangled slot that DOES have a real interval was reached by
-// one of the expansion shapes this arc supports, and its liveness is
-// exactly as trustworthy as any native local's.
+// NO interval anywhere in this function's analysis (neither pool) AND
+// is not a KNOWN-substituted slot (_rg_is_known_substituted) — the
+// actual signature of "this shape is still invisible to Stage A," not
+// merely "this function happens to contain a mangled slot at all." A
+// mangled slot that DOES have a real interval was reached by one of
+// the expansion shapes this arc supports, and its liveness is exactly
+// as trustworthy as any native local's. A mangled slot Stage A KNOWS
+// was substituted (bind_needed==0 — _inline_param_needs_bind,
+// bpp_codegen.bsm) has no interval for an entirely different, equally
+// safe reason: pre-reg always registers it in cg_vars (and computes
+// its cg_var_refs from the callee's ORIGINAL body, before bind_needed
+// is even decided), so B3 can rank and promote it purely on that stale
+// ref count — but the real splice never emits a single reference to
+// it, every one was rewritten to the caller's own argument instead.
+// The "promoted" register is reserved yet genuinely untouched by B3,
+// so linear-scan handing that same physical register to one of its
+// own variables collides with nothing real.
 regalloc_has_uncovered_mangled_promoted(b3_promote, var_names, ivl_int, ivl_flt) {
     auto n, vi;
     n = arr_len(b3_promote);
@@ -2071,7 +2408,7 @@ regalloc_has_uncovered_mangled_promoted(b3_promote, var_names, ivl_int, ivl_flt)
     while (vi < n) {
         if (arr_get(b3_promote, vi) >= 0 && _rg_is_mangled_inline_slot(var_names, vi) != 0) {
             if (_rg_var_in_intervals(ivl_int, vi) == 0 && _rg_var_in_intervals(ivl_flt, vi) == 0) {
-                return 1;
+                if (_rg_is_known_substituted(var_names, vi) == 0) { return 1; }
             }
         }
         vi++;

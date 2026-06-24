@@ -2642,20 +2642,24 @@ void cg_emit_func(fi) {
     // leaving B3's decision untouched) on any chip that hasn't earned
     // this yet (x64 today — "integer first" rolls out a64 first; x64
     // has no float B3 pool at all).
-    auto _rg_mangled;
+    auto _rg_mangled, _rg_applied_int, _rg_applied_flt;
     _rg_mangled = regalloc_has_uncovered_mangled_promoted(cg_var_promote, cg_vars, _rg_ivl_int, _rg_ivl_flt);
+    _rg_applied_int = 0; _rg_applied_flt = 0;
 
     if (_rg_worse == 0 && _rg_mangled == 0) {
         _rg_split = regalloc_has_any_split(_rg_ivl_int);
         if (_rg_split == 0) {
-            call(p.regalloc_apply, _rg_asn);
+            _rg_applied_int = call(p.regalloc_apply, _rg_asn);
         }
     }
     if (_rg_worse_flt == 0 && _rg_mangled == 0) {
         _rg_split_flt = regalloc_has_any_split(_rg_ivl_flt);
         if (_rg_split_flt == 0) {
-            call(p.regalloc_apply_float, _rg_asn_flt);
+            _rg_applied_flt = call(p.regalloc_apply_float, _rg_asn_flt);
         }
+    }
+    if (regalloc_name_wants_swap_dump(name_p)) {
+        regalloc_dump_swap(name_p, _rg_worse, _rg_worse_flt, _rg_mangled, _rg_split, _rg_split_flt, _rg_applied_int, _rg_applied_flt);
     }
 
     // 7b. Persist per-variable location info for the bug debugger.
@@ -3006,7 +3010,7 @@ _bug_line_record(pc, tok) {
 //
 // The traversal mirrors ast_clone_subst (bpp_dispatch.bsm) field for
 // field so the two stay in agreement about the shape of every node.
-static _inline_writes_param(nd, pname) {
+_inline_writes_param(nd, pname) {
     auto n: Node, t, arr, cnt, i, lhs: Node;
     if (nd == 0) { return 0; }
     n = nd;
@@ -3085,12 +3089,48 @@ static _inline_writes_param(nd, pname) {
 }
 
 // Scan a whole callee body for any write to the parameter `pname`.
-static _inline_param_is_written(body_arr, bcnt, pname) {
+_inline_param_is_written(body_arr, bcnt, pname) {
     auto i;
     for (i = 0; i < bcnt; i++) {
         if (_inline_writes_param(body_arr[i], pname)) { return 1; }
     }
     return 0;
+}
+
+// Does parameter `i` of callee `fidx` need a real bound mangled slot
+// (1), or can its argument `arg_node` be substituted directly in place
+// of every reference (0)? THE single source of truth for this
+// decision — used both by the real splice below (which then either
+// binds or substitutes) and by bpp_regalloc.bsm's "see through inlined
+// call sites" arc (which must know, for each parameter, whether a
+// reference inside the callee's body resolves to a real mangled slot
+// or to the caller's own argument expression, with no slot at all).
+// The two were found to silently disagree once — RegAlloc v2's
+// analysis always assumed every parameter was bound, when in fact a
+// T_VAR/T_LIT (or const-offset T_MEMLD) argument to a never-written
+// parameter is substituted with no slot ever created. The single-
+// statement leaf bodies the arc shipped against first (flt_onepole_tick)
+// never exposed the gap (no second statement existed for another
+// variable to steal the "freed" register from); a void statement-level
+// call site with more than one body statement did. Extracting this
+// decision into its own function — called from both places — makes
+// that kind of divergence structurally impossible going forward.
+_inline_param_needs_bind(fidx, i, arg_node: Node, inl_body, inl_bcnt, inl_params) {
+    auto arg_t, _sub_ok, _memld_ok, _memld_base: Node, _memld_off;
+    arg_t = arg_node.ntype;
+    _sub_ok = (arg_t == T_VAR || arg_t == T_LIT);
+    if (_sub_ok == 0 && arg_t == T_MEMLD) {
+        _memld_ok, _memld_base, _memld_off = cg_try_const_offset(arg_node.a, arg_node.b);
+        if (_memld_ok && _memld_base.ntype == T_VAR) { _sub_ok = 1; }
+    }
+    if (_sub_ok && is_float_type(get_fn_par_type(fidx, i)) &&
+        arg_node.itype != get_fn_par_type(fidx, i)) {
+        _sub_ok = 0;
+    }
+    if (_sub_ok && _inline_param_is_written(inl_body, inl_bcnt, *(inl_params + i * 8)) == 0) {
+        return 0;
+    }
+    return 1;
 }
 
 // Multi-statement / void inline splice, shared by both chips (was
@@ -3175,44 +3215,15 @@ _cg_inline_splice_prelude(call_node, fidx) -> (word, word, word, ptr, word, word
     //    synth T_ASSIGN — the node dispatcher is expression-only
     //    and silently drops statement-typed nodes. Same pitfall as
     //    the body-prelude loop further down; see commit `6a7dcd5`.
+    // Per-param bind-vs-substitute strategy — see _inline_param_needs_bind's
+    // own header comment for the full rationale and for why this decision
+    // now lives in ONE function shared with bpp_regalloc.bsm, instead of
+    // inline here as it used to be.
     bind_needed = buf_word(inl_pcnt + 1);
     i = 0;
     while (i < inl_pcnt) {
         arg_node = *(args_arr + i * 8);
-        arg_t = arg_node.ntype;
-        // Per-param substitution eligibility. T_VAR / T_LIT are always
-        // idempotent (re-reading a variable or re-emitting a literal twice
-        // costs nothing extra and has no side effect). T_MEMLD is ALSO
-        // idempotent — but only when its address is the canonical
-        // `var + const-offset` struct-field shape (cg_try_const_offset,
-        // this session's earlier addressing work): that shape is
-        // structurally incapable of containing a T_CALL, so re-evaluating
-        // it twice is exactly as safe as T_VAR. A T_MEMLD with a more
-        // complex address (e.g. `*(f())`) does NOT qualify — base must be
-        // a plain T_VAR, not just any const-offset base.
-        auto _sub_ok, _memld_ok, _memld_base: Node, _memld_off;
-        _sub_ok = (arg_t == T_VAR || arg_t == T_LIT);
-        if (_sub_ok == 0 && arg_t == T_MEMLD) {
-            _memld_ok, _memld_base, _memld_off = cg_try_const_offset(arg_node.a, arg_node.b);
-            if (_memld_ok && _memld_base.ntype == T_VAR) { _sub_ok = 1; }
-        }
-        // A FLOAT param only substitutes when the arg's OWN inferred type
-        // EXACTLY matches the param's declared type (same base AND same
-        // slice width) — substitution drops the arg expression in with no
-        // conversion, so this is the one case binding (which converts via
-        // the typed slot's assignment) is NOT just overhead but a real
-        // semantic requirement. Found re-disassembling moog_taps: every
-        // flt_onepole_tick call passes already-`: float`-typed args
-        // (struct fields, locals), so this fires for the common DSP-chain
-        // shape — previously a blanket exclusion bound EVERY float param
-        // unconditionally, materializing a fresh frame slot even when
-        // substitution would have been exactly as correct and far cheaper.
-        if (_sub_ok && is_float_type(get_fn_par_type(fidx, i)) &&
-            arg_node.itype != get_fn_par_type(fidx, i)) {
-            _sub_ok = 0;
-        }
-        if (_sub_ok &&
-            _inline_param_is_written(inl_body, inl_bcnt, *(inl_params + i * 8)) == 0) {
+        if (_inline_param_needs_bind(fidx, i, arg_node, inl_body, inl_bcnt, inl_params) == 0) {
             *(bind_needed + i * 8) = 0;
         } else {
             *(bind_needed + i * 8) = 1;
