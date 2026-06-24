@@ -331,43 +331,82 @@ static _rg_inline_body_is_straightline(body_arr, body_cnt, expected_arity) {
             continue;
         }
         if (n.ntype != T_ASSIGN) { return 0; }
-        if (n.d > 1) { return 0; }                  // multi-target local — later increment
-        if (n.a == 0 || n.a.ntype != T_VAR) { return 0; }
         if (n.b != 0 && n.b.ntype == T_CALL) {
             // Recursing FROM here means this statement belongs to
             // some OTHER callee's body — always a nested context, by
             // definition. See _rg_is_expandable_inline_assign's own
             // comment for why this matters (.e is meaningless here).
-            // A nested local assignment is always single-target, so
-            // the recursive validation always expects arity 1 here —
-            // a nested call returning multiple values into a single
-            // local isn't a real shape (the parser would have already
-            // rejected the source).
-            if (_rg_is_expandable_inline_assign(n, 1, 1) == 0) { return 0; }
-        } else if (_rg_expr_has_call(n.b)) {
-            return 0;
+            // The nested local's OWN target arity matches the nested
+            // call's own return arity — moog_slope's own
+            // `a,b,c,d = moog_taps(m,in);` is exactly this shape
+            // (n.d == 4, the nested callee's own multi-value return).
+            // _rg_is_expandable_inline_assign validates the target
+            // shape (every n.c[i] is a plain T_VAR) itself.
+            if (_rg_is_expandable_inline_assign(n, 1, (n.d > 1) ? n.d : 1) == 0) { return 0; }
+        } else {
+            if (n.d > 1) { return 0; }    // multi-target without a matching nested call — no real shape
+            if (n.a == 0 || n.a.ntype != T_VAR) { return 0; }
+            if (_rg_expr_has_call(n.b)) { return 0; }
         }
         i++;
     }
     n = body_arr[body_cnt - 1];
     if (n == 0) { return 0; }
-    if (n.ntype != T_RET) { return 0; }
-    // n.c is the MULTI-value count only — the parser leaves it at 0
-    // for a plain single-value `return x;` (the value lives in n.a,
-    // not n.b/n.c at all), so arity 1 must accept n.c <= 1, never
-    // require it to literally equal 1.
+    if (n.ntype == T_RET) { return _rg_return_arity_ok(n, expected_arity); }
+    if (n.ntype == T_SWITCH) { return _rg_switch_of_returns_ok(n, expected_arity); }
+    return 0;
+}
+
+// Does `ret` (a T_RET node) have a usable, call-free value matching
+// `expected_arity`? n.c is the MULTI-value count only — the parser
+// leaves it at 0 for a plain single-value `return x;` (the value
+// lives in n.a, not n.b/n.c at all), so arity 1 must accept n.c <= 1,
+// never require it to literally equal 1.
+static _rg_return_arity_ok(ret: Node, expected_arity) {
+    auto n: Node, i;
+    n = ret;
     if (expected_arity == 1) {
         if (n.c > 1) { return 0; }
         if (n.a == 0) { return 0; }      // void return has no value to bind
         if (_rg_expr_has_call(n.a)) { return 0; }
-    } else {
-        if (n.c != expected_arity) { return 0; }
-        if (n.b == 0) { return 0; }
-        i = 0;
-        while (i < expected_arity) {
-            if (_rg_expr_has_call(n.b[i])) { return 0; }
-            i++;
-        }
+        return 1;
+    }
+    if (n.c != expected_arity) { return 0; }
+    if (n.b == 0) { return 0; }
+    i = 0;
+    while (i < expected_arity) {
+        if (_rg_expr_has_call(n.b[i])) { return 0; }
+        i++;
+    }
+    return 1;
+}
+
+// Does `sw` (a T_SWITCH that is the LAST statement of a callee body)
+// describe the moog_slope shape: a value-dispatch switch, mandatory
+// else, where EVERY arm — including else — is a single statement that
+// is itself a valid, call-free return of the right arity? This is a
+// narrow, deliberately specific shape (not "any control flow that
+// returns eventually") — it's exactly what real callees like
+// moog_slope need, and validating "every path returns" in general
+// would be a much bigger, separately-scoped analysis. The switch's
+// own condition must also be call-free (it's evaluated once, outside
+// any arm, same as any other expression this stage clones+translates).
+static _rg_switch_of_returns_ok(sw: Node, expected_arity) {
+    auto arm_bodies, arm_count, k, ab, bc, stmt: Node;
+    if (_rg_expr_has_call(sw.a)) { return 0; }
+    if (sw.d == 0 || sw.e != 1) { return 0; }   // mandatory, single-stmt else
+    if (_rg_return_arity_ok(sw.d[0], expected_arity) == 0) { return 0; }
+    arm_bodies = sw.src_tok;
+    arm_count = sw.c;
+    k = 0;
+    while (k < arm_count) {
+        bc = arm_bodies[k * 2 + 1];
+        if (bc != 1) { return 0; }
+        ab = arm_bodies[k * 2];
+        stmt = ab[0];
+        if (stmt == 0 || stmt.ntype != T_RET) { return 0; }
+        if (_rg_return_arity_ok(stmt, expected_arity) == 0) { return 0; }
+        k++;
     }
     return 1;
 }
@@ -390,6 +429,79 @@ static _rg_expr_has_call(nd) {
     return 0;
 }
 
+// Build the array of synthesized `dest[i] = <translated value>`
+// assignments a T_RET turns into when it's the tail of an inlined
+// expansion — the same shape whether it lands directly in the current
+// block (a plain trailing T_RET) or inside one arm of a synthetic
+// switch (see _rg_emit_switch_of_returns below). Caller has already
+// confirmed (_rg_return_arity_ok) that `ret`'s arity matches dest_cnt.
+static _rg_ret_to_assign_array(ret: Node, dest_arr, dest_cnt) {
+    auto out, final_n: Node, i;
+    out = buf_word(dest_cnt);
+    if (dest_cnt == 1) {
+        final_n = make_node(T_ASSIGN);
+        final_n.a = dest_arr[0];
+        final_n.b = _rg_clone_translate(ret.a);
+        final_n.d = 0;
+        out[0] = final_n;
+    } else {
+        i = 0;
+        while (i < dest_cnt) {
+            final_n = make_node(T_ASSIGN);
+            final_n.a = dest_arr[i];
+            final_n.b = _rg_clone_translate(ret.b[i]);
+            final_n.d = 0;
+            out[i] = final_n;
+            i++;
+        }
+    }
+    return out;
+}
+
+// Emit a plain trailing T_RET's translated value(s) directly into the
+// current block — the original (Phase 2/3a-c) shape.
+static void _rg_emit_ret_as_assigns(ret: Node, dest_arr, dest_cnt) {
+    auto assigns, i;
+    assigns = _rg_ret_to_assign_array(ret, dest_arr, dest_cnt);
+    i = 0;
+    while (i < dest_cnt) { _rg_emit(assigns[i]); i++; }
+}
+
+// Emit the moog_slope shape: a callee whose trailing statement is a
+// T_SWITCH where every arm (and the mandatory else,
+// _rg_switch_of_returns_ok already confirmed both) is a single T_RET.
+// Builds a SYNTHETIC T_SWITCH — same condition (translated), same arm
+// VALUES (literals, shared as-is — no T_VAR to translate), but every
+// arm/else body replaced by its own assign-array — then hands it to
+// _rg_build_stmt. This reuses the CFG machinery a real switch in user
+// code already gets (new blocks per arm, join block, fallthrough
+// edges) instead of reimplementing it: _rg_build_stmt's own T_RET case
+// only fires for a REAL return, and there is none left in this
+// synthetic tree — every arm now ends in a plain assignment, which
+// falls through to the join block exactly like any other arm would.
+static void _rg_emit_switch_of_returns(sw: Node, dest_arr, dest_cnt) {
+    auto arm_bodies, arm_count, k, ab, stmt: Node, new_arm_bodies, new_sw: Node;
+    arm_bodies = sw.src_tok;
+    arm_count = sw.c;
+    new_arm_bodies = buf_word(arm_count * 2);
+    k = 0;
+    while (k < arm_count) {
+        ab = arm_bodies[k * 2];
+        stmt = ab[0];
+        new_arm_bodies[k * 2] = _rg_ret_to_assign_array(stmt, dest_arr, dest_cnt);
+        new_arm_bodies[k * 2 + 1] = dest_cnt;
+        k++;
+    }
+    new_sw = make_node(T_SWITCH);
+    new_sw.a = _rg_clone_translate(sw.a);
+    new_sw.b = sw.b;            // arm-comparison VALUES are literals — shared verbatim
+    new_sw.c = arm_count;
+    new_sw.d = _rg_ret_to_assign_array(sw.d[0], dest_arr, dest_cnt);
+    new_sw.e = dest_cnt;
+    new_sw.src_tok = new_arm_bodies;
+    _rg_build_stmt(new_sw);
+}
+
 // Expand ONE inlined call site in place: bind every (param, arg) pair,
 // walk the callee's own locals (each T_ASSIGN cloned+translated, each
 // T_DECL skipped — its mangled slot already exists from pre-reg, a
@@ -398,17 +510,19 @@ static _rg_expr_has_call(nd) {
 // call's result(s) were being assigned to — a 1-element array for a
 // plain `a = callee(...)`, an N-element array for moog_taps's own
 // `a,b,c,d = callee(...)` shape) from the matching slice of the
-// callee's cloned+translated return expression(s). Caller
-// (_rg_build_stmt or this same function, recursing for a nested call)
-// has already confirmed eligibility via _rg_inline_body_is_straightline
-// and resolved `id` — the caller's job, never this function's, since
-// a TOP-LEVEL call site's id lives in call_node.e while a NESTED one
-// never does (see _rg_callsite_id_for's own comment for why) — this
-// function does not care which source it came from.
+// callee's cloned+translated return expression(s) — or, for the
+// moog_slope shape, from whichever arm of a synthesized switch fires
+// (see _rg_emit_switch_of_returns). Caller (_rg_build_stmt or this
+// same function, recursing for a nested call) has already confirmed
+// eligibility via _rg_inline_body_is_straightline and resolved `id` —
+// the caller's job, never this function's, since a TOP-LEVEL call
+// site's id lives in call_node.e while a NESTED one never does (see
+// _rg_callsite_id_for's own comment for why) — this function does not
+// care which source it came from.
 static void _rg_expand_inline_straightline(call_node, dest_arr, dest_cnt, id) {
     auto fidx, fn_rec, params, pcnt, body_arr, body_cnt;
     auto args, argc, i, param_name, mangled, slot_var: Node, arg_expr, translated_arg;
-    auto bind_n: Node, n: Node, last: Node, final_n: Node, local_n: Node, nested_id;
+    auto bind_n: Node, n: Node, last: Node, local_n: Node, nested_id;
     fidx = find_func_idx(call_node.a);
     fn_rec = funcs[fidx];
     params = *(fn_rec + FN_PARS);
@@ -454,19 +568,29 @@ static void _rg_expand_inline_straightline(call_node, dest_arr, dest_cnt, id) {
             if (n.b != 0 && n.b.ntype == T_CALL) { nested_id = _rg_callsite_id_for(n.b); }
             if (nested_id >= 0) {
                 // A nested inlined call (moog_taps's own shape: 4
-                // calls to flt_onepole_tick) — recurse with the SAME
-                // outer frame still on top, so the nested call's own
-                // arguments translate through THIS callee's mangled
-                // slots, exactly as a real evaluation order would.
-                // The recursive call pushes/pops its OWN frame for
-                // the nested callee around its own body. A nested
-                // local assignment is always single-target (see
-                // _rg_inline_body_is_straightline's own comment), so
-                // a fresh 1-element array is enough here.
-                auto _rg_nested_dest;
-                _rg_nested_dest = buf_word(1);
-                _rg_nested_dest[0] = _rg_clone_translate(n.a);
-                _rg_expand_inline_straightline(n.b, _rg_nested_dest, 1, nested_id);
+                // calls to flt_onepole_tick, or moog_slope's own
+                // `a,b,c,d = moog_taps(m,in);`) — recurse with the
+                // SAME outer frame still on top, so the nested call's
+                // own arguments translate through THIS callee's
+                // mangled slots, exactly as a real evaluation order
+                // would. The recursive call pushes/pops its OWN frame
+                // for the nested callee around its own body. Target
+                // arity mirrors the nested call's own return arity —
+                // _rg_inline_body_is_straightline already confirmed
+                // they match.
+                auto _rg_nested_dest, _rg_nested_arity, _rg_k;
+                _rg_nested_arity = (n.d > 1) ? n.d : 1;
+                _rg_nested_dest = buf_word(_rg_nested_arity);
+                if (_rg_nested_arity == 1) {
+                    _rg_nested_dest[0] = _rg_clone_translate(n.a);
+                } else {
+                    _rg_k = 0;
+                    while (_rg_k < _rg_nested_arity) {
+                        _rg_nested_dest[_rg_k] = _rg_clone_translate(n.c[_rg_k]);
+                        _rg_k++;
+                    }
+                }
+                _rg_expand_inline_straightline(n.b, _rg_nested_dest, _rg_nested_arity, nested_id);
             } else {
                 local_n = make_node(T_ASSIGN);
                 local_n.a = _rg_clone_translate(n.a);
@@ -483,27 +607,17 @@ static void _rg_expand_inline_straightline(call_node, dest_arr, dest_cnt, id) {
         i++;
     }
 
-    // Clone+translate the trailing return's expression(s) (still with
-    // the same frame active), then synthesize one assignment per
-    // dest_arr entry. _rg_inline_body_is_straightline already
-    // confirmed the return's own arity matches dest_cnt exactly.
+    // The trailing statement is either a plain T_RET
+    // (_rg_inline_body_is_straightline's original shape) or a
+    // moog_slope-shaped T_SWITCH whose every arm (and mandatory else)
+    // is itself a single, validated T_RET. Either way, the frame is
+    // still active here, so every translation below sees the right
+    // mangled slots.
     last = body_arr[body_cnt - 1];
-    if (dest_cnt == 1) {
-        final_n = make_node(T_ASSIGN);
-        final_n.a = dest_arr[0];
-        final_n.b = _rg_clone_translate(last.a);
-        final_n.d = 0;
-        _rg_emit(final_n);
+    if (last.ntype == T_RET) {
+        _rg_emit_ret_as_assigns(last, dest_arr, dest_cnt);
     } else {
-        i = 0;
-        while (i < dest_cnt) {
-            final_n = make_node(T_ASSIGN);
-            final_n.a = dest_arr[i];
-            final_n.b = _rg_clone_translate(last.b[i]);
-            final_n.d = 0;
-            _rg_emit(final_n);
-            i++;
-        }
+        _rg_emit_switch_of_returns(last, dest_arr, dest_cnt);
     }
     arr_pop(rg_inline_stack);
     arr_pop(rg_inline_nk_stack);
