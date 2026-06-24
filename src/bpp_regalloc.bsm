@@ -289,7 +289,9 @@ static _rg_clone_translate(nd) {
     return orig;   // unreachable given the straightline + no-T_CALL gate
 }
 
-// Does `body_arr` describe a callee this stage can expand in place?
+// Does `body_arr` describe a callee this stage can expand in place,
+// given the call site assigns into `expected_arity` targets (1 for a
+// plain single-target assignment, N for `a,b,c,d = callee(...)`)?
 // Every check must pass BEFORE any node is emitted — once one
 // statement is appended to the current block, there is no clean way
 // to "undo" a partial expansion if a later statement disqualifies it.
@@ -304,8 +306,13 @@ static _rg_clone_translate(nd) {
 // recursive functions outright). A call buried deeper inside a larger
 // expression (`x + flt_onepole_tick(...)`) is still rejected — that
 // shape needs splicing a sub-expression's result mid-expression, a
-// separate increment from "the whole RHS IS the call".
-static _rg_inline_body_is_straightline(body_arr, body_cnt) {
+// separate increment from "the whole RHS IS the call". The trailing
+// return's own arity must match `expected_arity` exactly — the actual
+// call site this stage is for moog_taps's own shape (multi-value
+// T_RET, n.c == expected_arity == 4), not a nested local assignment
+// (single-target locals inside a callee's body are still validated at
+// expected_arity 1, regardless of the OUTER call's own arity).
+static _rg_inline_body_is_straightline(body_arr, body_cnt, expected_arity) {
     auto i, n: Node;
     if (body_cnt < 1) { return 0; }
     i = 0;
@@ -313,6 +320,16 @@ static _rg_inline_body_is_straightline(body_arr, body_cnt) {
         n = body_arr[i];
         if (n == 0) { return 0; }
         if (n.ntype == T_DECL) { i++; continue; }
+        if (n.ntype == T_MEMST) {
+            // A struct-field write (moog_taps's own `mm.s1 = a;`
+            // shape) — both the address expression and the value are
+            // call-free and translate like any other expression; no
+            // mangled slot of its own to register (it writes THROUGH
+            // an existing pointer, never declares a new local).
+            if (_rg_expr_has_call(n.a) || _rg_expr_has_call(n.b)) { return 0; }
+            i++;
+            continue;
+        }
         if (n.ntype != T_ASSIGN) { return 0; }
         if (n.d > 1) { return 0; }                  // multi-target local — later increment
         if (n.a == 0 || n.a.ntype != T_VAR) { return 0; }
@@ -321,7 +338,12 @@ static _rg_inline_body_is_straightline(body_arr, body_cnt) {
             // some OTHER callee's body — always a nested context, by
             // definition. See _rg_is_expandable_inline_assign's own
             // comment for why this matters (.e is meaningless here).
-            if (_rg_is_expandable_inline_assign(n, 1) == 0) { return 0; }
+            // A nested local assignment is always single-target, so
+            // the recursive validation always expects arity 1 here —
+            // a nested call returning multiple values into a single
+            // local isn't a real shape (the parser would have already
+            // rejected the source).
+            if (_rg_is_expandable_inline_assign(n, 1, 1) == 0) { return 0; }
         } else if (_rg_expr_has_call(n.b)) {
             return 0;
         }
@@ -330,9 +352,23 @@ static _rg_inline_body_is_straightline(body_arr, body_cnt) {
     n = body_arr[body_cnt - 1];
     if (n == 0) { return 0; }
     if (n.ntype != T_RET) { return 0; }
-    if (n.c > 1) { return 0; }       // multi-value return — a later increment
-    if (n.a == 0) { return 0; }      // void return has no value to bind
-    if (_rg_expr_has_call(n.a)) { return 0; }
+    // n.c is the MULTI-value count only — the parser leaves it at 0
+    // for a plain single-value `return x;` (the value lives in n.a,
+    // not n.b/n.c at all), so arity 1 must accept n.c <= 1, never
+    // require it to literally equal 1.
+    if (expected_arity == 1) {
+        if (n.c > 1) { return 0; }
+        if (n.a == 0) { return 0; }      // void return has no value to bind
+        if (_rg_expr_has_call(n.a)) { return 0; }
+    } else {
+        if (n.c != expected_arity) { return 0; }
+        if (n.b == 0) { return 0; }
+        i = 0;
+        while (i < expected_arity) {
+            if (_rg_expr_has_call(n.b[i])) { return 0; }
+            i++;
+        }
+    }
     return 1;
 }
 
@@ -357,17 +393,19 @@ static _rg_expr_has_call(nd) {
 // Expand ONE inlined call site in place: bind every (param, arg) pair,
 // walk the callee's own locals (each T_ASSIGN cloned+translated, each
 // T_DECL skipped — its mangled slot already exists from pre-reg, a
-// fresh declaration would add nothing), then synthesize the final
-// assignment into `dest_var_node` (the T_VAR the original call's
-// result was being assigned to) from the callee's cloned+translated
-// return expression. Caller (_rg_build_stmt or this same function,
-// recursing for a nested call) has already confirmed eligibility via
-// _rg_inline_body_is_straightline and resolved `id` — the caller's
-// job, never this function's, since a TOP-LEVEL call site's id lives
-// in call_node.e while a NESTED one never does (see
-// _rg_callsite_id_for's own comment for why) — this function does not
-// care which source it came from.
-static void _rg_expand_inline_straightline(call_node, dest_var_node, id) {
+// fresh declaration would add nothing), then synthesize one final
+// assignment per entry of `dest_arr` (the T_VAR(s) the original
+// call's result(s) were being assigned to — a 1-element array for a
+// plain `a = callee(...)`, an N-element array for moog_taps's own
+// `a,b,c,d = callee(...)` shape) from the matching slice of the
+// callee's cloned+translated return expression(s). Caller
+// (_rg_build_stmt or this same function, recursing for a nested call)
+// has already confirmed eligibility via _rg_inline_body_is_straightline
+// and resolved `id` — the caller's job, never this function's, since
+// a TOP-LEVEL call site's id lives in call_node.e while a NESTED one
+// never does (see _rg_callsite_id_for's own comment for why) — this
+// function does not care which source it came from.
+static void _rg_expand_inline_straightline(call_node, dest_arr, dest_cnt, id) {
     auto fidx, fn_rec, params, pcnt, body_arr, body_cnt;
     auto args, argc, i, param_name, mangled, slot_var: Node, arg_expr, translated_arg;
     auto bind_n: Node, n: Node, last: Node, final_n: Node, local_n: Node, nested_id;
@@ -421,8 +459,14 @@ static void _rg_expand_inline_straightline(call_node, dest_var_node, id) {
                 // arguments translate through THIS callee's mangled
                 // slots, exactly as a real evaluation order would.
                 // The recursive call pushes/pops its OWN frame for
-                // the nested callee around its own body.
-                _rg_expand_inline_straightline(n.b, _rg_clone_translate(n.a), nested_id);
+                // the nested callee around its own body. A nested
+                // local assignment is always single-target (see
+                // _rg_inline_body_is_straightline's own comment), so
+                // a fresh 1-element array is enough here.
+                auto _rg_nested_dest;
+                _rg_nested_dest = buf_word(1);
+                _rg_nested_dest[0] = _rg_clone_translate(n.a);
+                _rg_expand_inline_straightline(n.b, _rg_nested_dest, 1, nested_id);
             } else {
                 local_n = make_node(T_ASSIGN);
                 local_n.a = _rg_clone_translate(n.a);
@@ -430,20 +474,36 @@ static void _rg_expand_inline_straightline(call_node, dest_var_node, id) {
                 local_n.d = 0;
                 _rg_emit(local_n);
             }
+        } else if (n.ntype == T_MEMST) {
+            local_n = make_node(T_MEMST);
+            local_n.a = _rg_clone_translate(n.a);
+            local_n.b = _rg_clone_translate(n.b);
+            _rg_emit(local_n);
         }
         i++;
     }
 
-    // Clone+translate the trailing return's expression (still with
-    // the same frame active), then synthesize the assignment into
-    // dest_var_node.
+    // Clone+translate the trailing return's expression(s) (still with
+    // the same frame active), then synthesize one assignment per
+    // dest_arr entry. _rg_inline_body_is_straightline already
+    // confirmed the return's own arity matches dest_cnt exactly.
     last = body_arr[body_cnt - 1];
-    if (dest_var_node != 0) {
+    if (dest_cnt == 1) {
         final_n = make_node(T_ASSIGN);
-        final_n.a = dest_var_node;
+        final_n.a = dest_arr[0];
         final_n.b = _rg_clone_translate(last.a);
         final_n.d = 0;
         _rg_emit(final_n);
+    } else {
+        i = 0;
+        while (i < dest_cnt) {
+            final_n = make_node(T_ASSIGN);
+            final_n.a = dest_arr[i];
+            final_n.b = _rg_clone_translate(last.b[i]);
+            final_n.d = 0;
+            _rg_emit(final_n);
+            i++;
+        }
     }
     arr_pop(rg_inline_stack);
     arr_pop(rg_inline_nk_stack);
@@ -504,9 +564,10 @@ static _rg_next_nested_id() {
     return result;
 }
 
-// Is `nd` a T_ASSIGN whose RHS is directly an inlined call site this
-// stage knows how to expand (single target, single-statement RHS —
-// the shape every real flt_onepole_tick-style call site takes)?
+// Is `nd` a T_ASSIGN (target arity == `expected_arity`) whose RHS is
+// directly an inlined call site this stage knows how to expand — the
+// shape every real flt_onepole_tick-style (arity 1) or moog_taps-style
+// (arity 4, multi-return) call site takes?
 //
 // `is_nested` distinguishes the two contexts this is called from
 // (mirrors _rg_callsite_id_for's own split, but at VALIDATION time,
@@ -527,12 +588,23 @@ static _rg_next_nested_id() {
 //       this exact call as a nested one (and therefore whether
 //       _rg_next_nested_id will find a real id for it later, at
 //       expansion time).
-static _rg_is_expandable_inline_assign(nd, is_nested) {
+static _rg_is_expandable_inline_assign(nd, is_nested, expected_arity) {
     auto n: Node, rhs: Node, fidx, fn_rec, body_arr, body_cnt, callee_bcnt;
+    auto i, tnode: Node;
     n = nd;
     if (n.ntype != T_ASSIGN) { return 0; }
-    if (n.d > 1) { return 0; }                  // multi-target — later increment
-    if (n.a == 0 || n.a.ntype != T_VAR) { return 0; }
+    if (expected_arity == 1) {
+        if (n.d > 1) { return 0; }
+        if (n.a == 0 || n.a.ntype != T_VAR) { return 0; }
+    } else {
+        if (n.d != expected_arity) { return 0; }
+        i = 0;
+        while (i < expected_arity) {
+            tnode = n.c[i];
+            if (tnode == 0 || tnode.ntype != T_VAR) { return 0; }
+            i++;
+        }
+    }
     rhs = n.b;
     if (rhs == 0 || rhs.ntype != T_CALL) { return 0; }
     fidx = find_func_idx(rhs.a);
@@ -548,7 +620,7 @@ static _rg_is_expandable_inline_assign(nd, is_nested) {
     fn_rec = funcs[fidx];
     body_arr = *(fn_rec + FN_BODY);
     body_cnt = *(fn_rec + FN_BCNT);
-    return _rg_inline_body_is_straightline(body_arr, body_cnt);
+    return _rg_inline_body_is_straightline(body_arr, body_cnt, expected_arity);
 }
 
 // Build the CFG for one statement, updating rg_cur_block to whatever
@@ -698,15 +770,26 @@ static _rg_build_stmt(nd) {
         return 0;
     }
 
-    // `a = <inlined call>` where the callee is a straight-line, single-
-    // return body — expand it in place (see "Seeing through an
-    // inlined call site" above) instead of treating the call as an
-    // opaque statement. Every other shape (multi-target, multi-return,
-    // control flow in the callee, or simply not an inlined call at
-    // all) falls through unchanged to the plain-statement case below.
-    if (t == T_ASSIGN && _rg_is_expandable_inline_assign(nd, 0)) {
-        _rg_expand_inline_straightline(n.b, n.a, n.b.e);
-        return 0;
+    // `a = <inlined call>` or `a,b,c,d = <inlined call>` where the
+    // callee is a straight-line body (matching return arity) — expand
+    // it in place (see "Seeing through an inlined call site" above)
+    // instead of treating the call as an opaque statement. Every
+    // other shape (control flow in the callee, a call buried deeper
+    // inside an expression, or simply not an inlined call at all)
+    // falls through unchanged to the plain-statement case below.
+    if (t == T_ASSIGN && n.b != 0 && n.b.ntype == T_CALL) {
+        auto _rg_arity, _rg_dest_arr;
+        _rg_arity = (n.d > 1) ? n.d : 1;
+        if (_rg_is_expandable_inline_assign(nd, 0, _rg_arity)) {
+            if (n.d > 1) {
+                _rg_dest_arr = n.c;
+            } else {
+                _rg_dest_arr = buf_word(1);
+                _rg_dest_arr[0] = n.a;
+            }
+            _rg_expand_inline_straightline(n.b, _rg_dest_arr, _rg_arity, n.b.e);
+            return 0;
+        }
     }
 
     // Plain statement (T_ASSIGN, T_MEMST, T_DECL, expression-statement,
