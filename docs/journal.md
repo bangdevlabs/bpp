@@ -14141,3 +14141,553 @@ corruption survived two whole commits before a crash finally said
 something. Verified clean: `total_pushed=44100` (exact), `cb_count=44`
 (≈43Hz, confirming the buffer-size fix), `consumed≈42000`. Full suite
 197/0/12, `bench_compile.sh` unchanged.
+
+## 2026-06-18 — tiny_lofi is born, the inliner arc opens, and gets reverted twice before it sticks
+
+The DAW's first slice: `tools/tiny_lofi` split into `tl_channel` (8 mixer
+channels, volume + filter insert + slope), `tl_timeline` (clips over time +
+the frame-outer mix/render), `tl_io` (WAV export), `tl_tools` (non-destructive
+edits — scissors today), and `tl_lib` (the aggregator). `stbfilter.bsm`
+graduated the Moog ladder low-pass to a reusable cartridge, dogfooding
+multi-value return for real: `moog_taps` returns all four pole taps
+(-6/-12/-18/-24 dB/oct) in one call, banking straight into d0..d3 — no struct,
+no out-params. The slope-4 render came out byte-identical to the
+pre-refactor baseline, proving the modular split changed nothing it
+shouldn't. Almost immediately the filter math itself got pulled one layer
+deeper: `stbfilter.bsm` became the CARTRIDGE (the one-pole primitive both the
+Moog ladder and a future EQ shelf compose from) while `tools/moon_filter`
+became the PLUGIN — a named effect with its own `moon_new/set/process/reset/
+free` lifecycle wrapping the cartridge. `tiny_lofi` now hangs `moon_filter` on
+every channel instead of calling the Moog directly, setting up the
+mini-Cubase direction: a channel hosts plugins, the engine underneath is
+`stbmixer`.
+
+Slice 2 opened an actual window: transport bar, a one-mark-per-second time
+ruler, eight track lanes with colored clip blocks, an 8-fader mixer strip, and
+a playhead that tracks playback in real time. `./tl --render` kept the
+headless WAV path byte-identical, so the engine itself stayed untouched by
+the GUI work.
+
+Then the project asked "can we measure the audio-codegen claim, or only
+assert it?" — and the honest answer reopened a frontier the earlier
+register-allocation work hadn't found: `tl_bench` (render the 3s project in a
+tight loop) measured 16.9ms against clang -O2's 2.3ms on the SAME source —
+7.3x, not the 1.02x "gcc -O2 parity" the biquad kernel had already proven.
+Disasm showed why: our `tl_render` makes 6 `bl` calls per sample (`arr_struct_at`,
+two `read_u16`/`write_u16`, the whole filter chain), clang's makes one, total.
+A hand-inlined sibling (`tl_bench_flat`, zero calls in the hot loop) decomposed
+the 7.3x cleanly: ~x3.7 is the inliner gap (call overhead), ~x2.0 is flat-loop
+codegen quality on a branchy triple-nested loop — two separate frontiers,
+named in priority order in `benchmarks.md`.
+
+The inliner arc that opened to close the first frontier needed two false
+starts before the first real increment landed, and both reversions are worth
+keeping in the record because each one corrected a real measurement mistake,
+not just a bug:
+
+- **Increment 1, take 1** (relaxing the inliner's "any T_CALL = reject" gate
+  for inline-instruction builtins like `peek_q`/`poke_q`, so thin wrappers
+  like `read_u16` could inline) measured a 3% DAW win — and a **+13% compiler
+  binary bloat** with zero general win, because the relaxed eligibility
+  inlined the SAME wrapper at every cold call site too, not just the hot
+  ones. Reverted same day: the fix order was backwards — a per-call-site
+  hotness gate needs to come BEFORE any eligibility relaxation, not after.
+- **Increment 1, take 2** (the corrected version: gate by SIZE instead —
+  `INLINE_BUILTIN_NODE_CAP`, admitting only genuinely thin single-instruction
+  wrappers) shipped flat (998386 → 998482 bytes) and passed every suite — but
+  a compiler BOOTSTRAPPED from that source SIGSEGV'd on `bpp --c`. The
+  regression slipped through because `run_all_c.sh` had run against the OLD
+  `./bpp`, testing the previous codegen's `--c` path, not the freshly
+  bootstrapped one. Reverted again, and the verification gate itself got
+  fixed: bootstrap → INSTALL (fresh inode) → run the suites ON THE INSTALLED
+  binary, always, never on the old one.
+- **Increment 1, take 3** (re-landed with the proper gate, plus the root
+  cause): `classify_inlineable` was comparing callee names via `cg_str_eq`,
+  which reads the global `cg_sbuf` — set only at CODEGEN time, still zero
+  during the analysis pass of the monolithic/`--c` pipeline. Native worked
+  only by accident (a prior module's codegen had already set it). Fixed by
+  comparing against the parse-time `vbuf` instead. This time verified the
+  right way and it stuck: native 192/0/12, C-emit 155/0/49, `bpp --c` clean
+  on the installed binary, audio byte-identical.
+
+With the foundation finally solid, **Increment 2** added a binding path for
+multi-use-param single-return bodies (the fast substitute path silently
+double-evaluates a side-effecting arg used twice — `arr_struct_at` and the
+whole filter chain have this shape), routing them through the existing
+multi-statement splice instead of rejecting them outright. **Increment 3a**
+added the hotness-gate infrastructure the very first attempt was missing
+(`cg_inline_loop_depth`, a new inline tier "hot-only" that only registers a
+callsite inside a loop) — inert on its own, no function marked tier-3 yet.
+**Increment 3b** wired the first real consumer: a guard-clause body
+(`if (C) { return A; } return B;`) normalizes in place to a ternary
+(`return C ? A : B;`), tagged hot-only, which makes `arr_struct_at` inline
+inside `tl_render`'s per-clip loop while staying a normal call at its ~80
+cold call sites elsewhere. First real measured win of the arc: tl_bench
+16.9 → 15.3ms (~10%), compiler binary +1.65% (contained to in-loop sites,
+not all-sites like the reverted attempt).
+
+## 2026-06-19 — `bpp --tags`, the float-leaf lever, and tiny_lofi goes stereo
+
+Opened a design plan for `bpp --tags` (compiler-emitted ctags/etags symbol
+index — pseudo-LSP), sparked by the realization that the load-bearing piece
+already exists: the token→(file, line, offset) resolver `bug`'s own `.bug`
+map already builds. Phased S0→S5, not built yet.
+
+Investigating Increment 4 (relax the T_CALL gate generally) surfaced two
+real blockers before any code: nested binding-path inlining is an
+architectural gap (the callsite-id scheme stamps an id on the caller's OWN
+call node; a nested inlinable call's id would belong to the wrong frame —
+unsafe until a flattening mechanism exists), and the filter chain is
+multi-gate-coupled (`flt_onepole_tick` is float, `moog_taps` is multi-return,
+`moog_slope` is a switch, `tl_channel_process` is float+if — each blocked by
+a DIFFERENT gate, so relaxing T_CALL alone moves nothing). A throwaway
+env-gated probe confirmed it empirically: of the functions blocked purely by
+the T_CALL gate, every single one in `tl_bench` was cold — T_CALL relaxation
+would have bought zero DAW win. The real lever, measured instead of assumed:
+**float-leaf inlining**. `flt_onepole_tick` (a matched-float leaf called 4x/
+sample by `moog_taps`) became inlinable with three spine edits (allow float
+return+params in `classify_inlineable`, force float-param functions to the
+binding tier so a float arg never takes the type-unsafe fast-substitute
+path, force-bind float params in the multi-statement splice) — `moog_taps`'s
+4 `bl` calls collapsed to 0, tl_bench 15.3 → 13.1ms (~14%, ~22% cumulative
+from session start).
+
+A dogfood audit asked a sharper question than "what's next": does the audio
+stack actually EXERCISE the language features being optimized? Measured: the
+whole stack used only `struct` + `: float`. Multi-return = 1 contrived
+internal use (`moog_taps`), `@safe` = 0 (audio's own killer use case!), SIMD =
+0. Optimizing multi-return further would be optimizing an orphan. **Stereo**
+fixes this directly — its natural shape IS multi-return `(float, float)`, and
+it makes the DAW genuinely stereo (it was fake-mono until this point,
+`stbmixer` averaging L+R into one channel by design). A holistic study of the
+language's own data model backed the design call: b++ has exactly two base
+premises (word, float — bit 0 of the type code IS the premise), so the
+arg/return classifier already routes every scalar into one of two 8-register
+banks; b++ can bank 5-8 float returns in registers where C++'s SysV/AAPCS64
+caps out at 2-4 — `moog_step(in, s1..s4) -> (out, s1'..s4')`, 5 floats, is
+exactly the Moog bass shape.
+
+Shipped same day: `tl_channel_process(tr, dry) -> (float, float)` (insert +
+fader, then constant-power pan into L/R — pan gains precomputed once at
+set-time, not per-sample), `tl_render` summing into a real stereo buffer
+(killing the old fake-mono write), and `stbmixer`'s own S2 core — per-voice
+pan gains, dual-channel mix, the mono-collapse averaging gone for good (a
+stereo sample WAV now actually plays in stereo). Mono stayed first-class
+throughout, as a gated common case on the SAME structure (one filter pass),
+never a fork. Closed the day mapping the rest of the DSP/instrument
+architecture against named consumers: **stblfo** extracted immediately (Tier
+1 — 4 named consumers: Leslie rotation, vibrato/tremolo, drum-machine swing,
+filter sweeps — the LFO is the real primitive, the rotary is just one
+consumer of it), with the rotary/`stbenv`/noise staged for the days right
+after.
+
+## 2026-06-22 — closing a multi-GB RAM leak, the rotary graduates, WAV import, and the inliner's nested-call mechanism
+
+Opened with a real production fire: `mini_synth` froze the machine within
+seconds — RSS climbing into multi-GB range. Three stacked bugs, found by
+measurement (`leaks`, `vmmap`, isolated repro binaries), not guesswork: (1)
+`stbwindow.bsm` never set `_stb_frame_ms`, so the per-platform frame-wait was
+a permanent no-op for every TOOL (only `stbgame` set it) — the main loop spun
+as fast as the CPU allowed; (2) macOS's `_stb_poll_events` created one
+`NSAutoreleasePool` at window init and never drained it — every Cocoa
+autoreleased object since then lived for the rest of the process; (3) the big
+one — `_stb_present` wrapped each frame's `CGImage` in an `NSImage` before
+handing it to the view, and an isolated repro proved bare `NSImage alloc/
+init/release`, with NO `NSImageView` even involved, grows RSS to ~13.5GB in 4
+seconds while `leaks` shows a perfectly clean 47KB malloc heap the whole
+time — undocumented AppKit-internal image caching no correct retain/release
+pairing can opt out of. Fixed by writing straight to the backing `CALayer`'s
+`contents` (accepts a `CGImageRef` directly, no `NSImage`, no cache). `ms` now
+holds flat ~68MB/25s, down from multiple GB.
+
+Graduated the Leslie rotary out of `stbmixer`'s single global instance into
+`stb/stbrotary.bsm` — the exact "2nd consumer" trigger the architecture plan
+had named in advance (tiny_lofi taking it as a channel insert). `stbmixer`'s
+public API stayed byte-for-byte unchanged (now wraps one `Rotary` instance
+instead of four bare globals). `tl_channel`'s `Track` gained a second,
+NAMED insert slot (Moog pre-pan, then Rotary post-pan — a fixed two-slot
+chain, not a speculative N-deep polymorphic one, since there are exactly two
+concrete plugin kinds today). Then **WAV import** (slice 6a): `tl_import_wav`
+down-mixes stbsound's always-stereo decode to the engine's existing mono
+convention, verified against adversarial synthetic WAVs (opposite-sign L/R
+downmixes to exactly 0; equal L/R downmixes losslessly). The demo project now
+round-trips a real take — save a channel's dry bass, import it straight back
+as a new clip — proving a take recorded elsewhere becomes a normal Clip with
+zero special-casing.
+
+Closing **slice 3** (select/drag/copy-paste/delete/click-to-seek/faders) took
+two passes because live-testing surfaced three real gaps a code review never
+would have: copy/paste did nothing on macOS (checked only Ctrl, not Cmd, the
+muscle memory a Mac user actually has); clicking the timeline never moved the
+playhead (never built, not a regression); the selection outline was too thin
+to notice. Also added interactive faders (the lane header's volume bar, the
+8 mixer faders, the master) after the same live-test report flagged them as
+dead. Delete needed a real engine-level gap filled first:
+`arr_struct_remove` (swap-remove, O(1)) — `bpp_arr.bsm` is in the COMPILER's
+own import graph, so this needed a full bootstrap cycle, not just a tool
+rebuild.
+
+Then the user actually pressed Play and got ear-hurting noise. Root cause: a
+THIRD hand-rolled `audio_push_frames` caller (`tl_gui_run`) the original
+float-migration grep sweep had never matched, because `tiny_lofi` didn't
+exist yet when that sweep ran — `tl_render` was still writing s16 bytes into
+a buffer the device wire had read as float32 since 2026-06-21's migration.
+Same "horrible modem noise" mechanism as that day's other two instances.
+Fixed by making `tl_render` itself float32-native and moving the s16-on-disk
+conversion into a dedicated `tl_export` pass — verified with a sample-by-
+sample diff (264,600 samples, max difference 1 LSB, pure float32 rounding)
+proving the export path was mathematically equivalent the whole time. The
+SAME bug shape bit `tl_bench` next (its own buffer allocation still used the
+old s16 stride, segfaulting once `tl_render`'s real stride changed under it)
+— fixed, then `tl_bench_flat` was found to have silently drifted out of sync
+with the real engine across two whole feature commits (never updated for
+stereo, never engaged the rotary it was supposed to be modeling) — resynced,
+re-decomposed the gap: x3.0 inliner + x1.55 flat-loop codegen, the inliner
+gap essentially unchanged since 06-18 (confirming Inc 5, multi-return
+inlining, genuinely hadn't started yet).
+
+**Increment 5** opened that exact next piece: lifting the blanket
+`fn_ret_arity > 1` reject to a narrow shape check (trailing multi-return
+`T_RET`, arity matching the call site), fixing a T_RET-multi blind spot in
+four AST helpers along the way (`ast_clone_subst`'s blanket field copy was
+the dangerous one — a cloned multi-return's result array was shared,
+unsubstituted, with the original). **Increment 6 Commit B** then closed the
+deeper architectural gap Inc 4's investigation had named back on the 19th:
+nested-inline registration, letting a function become inlinable even when it
+calls another already-inlinable function (`moog_taps` calling
+`flt_onepole_tick` 4x — exactly what was blocking the chain). `classify_
+inlineable` became a fixpoint (pre-seeded while-loop, since a callee
+declared after its caller needs a second pass to see the callee's
+already-settled state) and a new mechanism pre-registers a nested call's own
+slots into the SAME outer frame during pre-reg, before frame-size finalize —
+provably too late to do this at splice/emission time. One real bug surfaced
+along the way by an EXISTING function (`mixer_get_rotary`), not the new
+synthetic test: a stale callsite id carried into the wrong frame once that
+single-statement tier-1 body became newly eligible — fixed by explicitly
+resetting a cloned T_CALL's `.e` to 0, since only an explicit re-stamp should
+ever set it again. A separate cost-model bug (struct-field addressing
+over-counted as 3 instructions instead of the 1 it actually folds to on both
+chips) got `moog_taps` under the inlining cap, and a scoped multi-return-only
+cap closed the last gap: **moog_taps fully inlines, zero `bl` into
+`flt_onepole_tick`, confirmed via disasm** — and tl_bench showed NO
+measurable movement at all. That null result was itself the answer the
+plan's own decision rule was waiting for: two increments in a row eliminating
+real, confirmed call overhead with zero measured effect means the
+ours-vs-flat gap isn't concentrated in inlinable call overhead anymore —
+time to disassemble the hot loop directly instead of inlining deeper on
+assumption.
+
+## 2026-06-23 — closing the inliner arc, then RegAlloc v2 from zero to Stage E in one day
+
+Re-disassembling `tl_bench`'s hot loop (the Increment 6 closing instruction)
+found the actual remaining cost wasn't calls at all: struct-field load
+addressing was going through the generic expression path (a separate mov+add
+to compute base+offset, THEN a load from offset 0) when ARM64's `LDR`/x86_64's
+ModRM+disp already take that offset directly in one instruction. A run of
+five tightly-scoped perf commits closed this and its siblings in sequence,
+each measured independently: folding the offset into the load (tl_bench
+15.4→14.14ms), addressing through an already-promoted base with no copy at
+all (→13.79ms — and a real ordering bug caught here, where setting the new
+"const-offset" globals BEFORE recursing into a nested struct-field base let
+the nested call's own cleanup clobber them; `test_modulab_character` caught
+the live value corruption), extending the same fold to stores (no tl_bench
+movement — this benchmark is load-dominated, but a correct general
+completion, not a speculative one), extending float compute-in-place to
+struct-field leaves (→13.08ms — the float CIP gate had a T_VAR leaf case but
+never a T_MEMLD one, so any struct-field arithmetic bypassed it entirely),
+and to float comparisons (→13.05ms, within noise — comparisons apparently
+aren't the hot path here). The literal-leaf gap then turned out to be the
+single biggest lever of the whole investigation: `cg_float_tree_need` had no
+`T_LIT` case either, so ANY expression with a float literal operand
+(`r.cur + 0.0001`, the canonical DSP increment/threshold shape) bailed out of
+compute-in-place — fixing it dropped `rotary_tick`'s fmov count from 35 to 5
+(86%) and tl_bench from 13.05 to 12.07ms, the single biggest commit of the
+whole four-part investigation. Float branch fusion (fcmp+b.cc instead of
+fcmp+cset+cbz) shipped next, real and disasm-confirmed, with an HONEST null
+result on wall-clock — a cset/cbz pair off the critical dependency path
+doesn't cost anything on an out-of-order core, the same store-forwarding
+lesson the bootstrap manual already documents for integer loop control.
+
+Two more increments closed the inliner arc's last real gaps in the chain:
+`moog_slope`'s own body ends in a switch (one return per arm, not a single
+trailing return) — a new normalizer rewrites a switch-where-every-arm-returns
+into a single ternary chain, the switch's twin of the existing guard-clause
+normalizer, and a second fix let a nested call buried inside a TRAILING
+RETURN's own expression (`moon_process`'s entire body is `pp=p; return
+moog_slope(...)`) get discovered and spliced — together collapsing
+`moon_process → moog_slope → moog_taps → flt_onepole_tick` to zero `bl`,
+confirmed via disasm, for a modest, honestly-reported ~1.2% tl_bench win (same
+lesson again: bl elimination doesn't proportionally move wall-clock once the
+call itself was cheap).
+
+With the inliner arc's own decision rule satisfied (a session's worth of real
+work moving the needle from 16.9ms to ~10.9ms, ~35% off the session start),
+the user gave the explicit direction to open RegAlloc v2 as its own dedicated
+arc — exactly what `compiler_boost_roadmap.md`'s F.2 had been waiting to be
+unblocked. The cheap floor shipped first: AAPCS64 reserves x19..x28 (ten
+registers) as plain callee-saved, and B3's promotion budget had only ever
+claimed six of them (x19..x24) — found scoping the real arc by noticing
+`games/rts2/rts2_combat.bsm`'s `_combat_step` has 14 simultaneously-live
+integers in a non-leaf loop (the game's own RTS_STRESS mode runs 230v230
+units through this path every frame), spilling 8 of them under the old
+6-register budget. Widening to all ten needed zero new architecture, just
+extending the existing slot table the leaf-only x9..x12 extension had already
+established as the pattern.
+
+Then the full arc, shipped stage by stage, same day, each stage verified
+before the next began: **Stage A** (AST-to-CFG construction — a `CfgBlock` is
+a maximal straight-line sequence with at most two successors; `T_SWITCH`
+modeled as a chain of 2-way branches, mirroring how the inliner's own
+switch-ret normalizer already treats the same shape), verified by the
+strongest invariant available since nothing consumes it yet: every function's
+compiled output bytes stayed byte-IDENTICAL, not just suite-green. **Stage B**
+(liveness — backward dataflow to a fixpoint, one 64-bit word per block since
+the largest function measured stays comfortably under that cap). **Stage C
+prerequisite** (Reverse Postorder linearization — found needed by hand-tracing
+BEFORE writing code: a block's own allocation index is NOT a valid linear
+order, proved on a nested `while(if(while))` shape where a critical edge runs
+from a higher allocation index to a lower one with no actual loop involved).
+**Stage C** (live-interval construction — flattening per-block liveness into
+one `[start_pos, end_pos]` range per variable in RPO position units; the
+load-bearing verification case, two locals defined and consumed entirely
+within their own mutually-exclusive arm, came out as genuinely
+non-overlapping intervals `[2,2]` and `[1,1]` — exactly the property B3's
+reference-count-only heuristic cannot see at all). **Stage D** (the real
+linear-scan allocator, Poletto & Sarkar 1999, shadow mode — deliberately
+chip-agnostic, talking only about a slot COUNT, never a physical register
+name, so the spine/chip split every other rule in this compiler draws stays
+intact). Verified against the compiler's own real production motivator:
+temporarily renamed `_combat_step` to trigger the debug dump, and of its 35
+tracked variables only 7 spilled against a 10-slot budget — the other 28 fit
+by REUSING slots between non-overlapping intervals, the exact thing B3 cannot
+do no matter how wide its pool gets.
+
+Before trusting Stage D's decisions on real code, `regalloc_compare_vs_b3`
+ran unconditionally against the compiler's own self-compile and found 567
+"regression" lines on the first pass. Excluding the inliner's own mangled
+slots (a known, documented pipeline-ordering gap — RegAlloc v2's CFG is built
+from the caller's un-spliced body, so it genuinely cannot see them yet)
+dropped it to 202; investigating the next real case (`stbdraw.bsm`'s
+`blend_px`) found an actual bug — a phantom CFG edge from a dead tail block
+(allocated right after a `T_RET`/`T_BREAK`/`T_CONTINUE`, unreachable by
+construction) was being wired to the next join block because a dead tail has
+the exact same "no successor set yet" shape a genuinely open block has. Fixed
+with an explicit `dead` flag on `CfgBlock`. That alone didn't clear the
+regression — the deeper cause was Stage C's own BLOCK-level granularity
+(collapsing 13+ sequential variable definitions in one straight-line block
+onto the same position, making linear-scan see them as all simultaneously
+live when most never coexist); rewritten to STATEMENT-level granularity.
+Instruction granularity then exposed a third, subtler issue: the DFS that
+builds RPO fully explores one arm before backtracking, so a short,
+mutually-exclusive sibling arm can land far away in linear-position terms
+from a long nested branch it never actually overlaps with in time — fixed
+with real live-range SPLITTING (a variable absent from the "touched" set
+between two positions where it IS present becomes two separate
+`LiveInterval` entries instead of one wide one spanning the gap). Net result:
+567 → 202 → 27 false regressions, the remaining 27 genuine budget-limited
+disagreements between two different, equally-valid spill heuristics — not
+bugs, the exact gap Stage E's own per-function automatic fallback exists to
+absorb safely.
+
+**Stage E** wired the linear-scan into codegen for real, a64-integer first,
+with an automatic fallback: refuses the swap (B3's decision stays completely
+untouched) if `regalloc_compare_vs_b3` found any regression for this exact
+function, or if any variable needed live-range splitting (a single physical
+register per variable can't represent a value moving between two registers
+at a split boundary — codegen had no support for emitting that move yet, a
+deliberately separable future gap). Found and fixed a serious bug while
+wiring this in, caught by `bug --disasm`: the function prologue
+unconditionally zeroed every promoted non-parameter local's register,
+assuming B3's own one-register-one-variable invariant — which slot-sharing
+breaks on purpose. The fix was a removal, not a patch: stack-resident locals
+were never zero-initialized either, so removing the loop makes promoted and
+stack locals behave consistently, verified against the FULL suite (not just
+the regalloc fixtures) plus every real game. This was the first commit in the
+whole arc where bootstrap stopped being byte-IDENTICAL by design (gen1≠gen2
+expected one-cycle oscillation, gen2==gen3 confirms convergence) — every
+earlier stage had been pure analysis with literally zero behavioral change.
+Extended to **float** (d8..d15) the same day, since the project's actual
+audio target is float32 end-to-end and an integer-only Stage E moves nothing
+that matters for it. Two more real, silent-wrong-output bugs surfaced here
+specifically: registers shared across non-overlapping variables were being
+pushed onto the prologue's save list once PER VARIABLE instead of once per
+SLOT, corrupting frame layout (`moog_taps` showed d8/d10 duplicated in both
+prologue and epilogue); and the inliner's own mangled slots — already
+promoted by B3 from a static pre-splice analysis — were completely invisible
+to RegAlloc v2's intervals, letting linear-scan hand one of its OWN variables
+the exact register a mangled slot already held, with no diagnostic, silently
+wrong output (0.0 instead of ~0.177 in the reproduction case). Fixed with a
+blanket `regalloc_has_mangled_promoted` gate — refuse the swap outright for
+any function containing even one mangled slot, full stop, conservative by
+design until a follow-on arc could see through them properly.
+
+That follow-on arc opened the SAME day: "RegAlloc v2 sees through inlined
+call sites," teaching Stage A to recursively expand exactly the shapes the
+mangled-slot gate was blocking, instead of refusing them wholesale. Four
+phases, each scoped narrowly and verified independently before the next:
+Phase 1 (inert plumbing — an inline-translation stack, always empty until
+something pushes onto it); Phase 2 (the simplest real shape — a single-
+statement straight-line callee assigned directly, `flt_onepole_tick`'s own
+shape — caught one real bug along the way: translation has to happen INSIDE
+Stage A's construction, not deferred to Stage B/C, since the translation
+stack is already empty by the time those walkers run); Phase 3a-3d
+(generalizing through multi-statement bodies, nested inlined calls inside an
+expanded callee — caught a real bug reusing the wrong "is this a nested
+call" test, fixed by reusing the real inliner's own positional id-consumption
+protocol instead of reinventing one — multi-target/multi-return assignments
+plus T_MEMST struct writes — caught two real bugs, T_MEMST being rejected
+outright and a return-arity check that silently broke every single-value
+case — and finally control flow inside an expanded callee, `moog_slope`'s
+own switch, built by handing a SYNTHETIC switch node to the exact same CFG
+machinery a real switch in user source already uses rather than
+reimplementing block/edge construction a second time). Phase 4 closed the
+arc by replacing the blanket mangled-slot gate with a precise per-slot one —
+refusing the swap only for a mangled slot that genuinely has NO interval
+anywhere in the new analysis, not merely "this function happens to contain
+one at all." Verified the heaviest way available in the whole arc: confirmed
+via a temporary debug probe that `moog_taps`, `moog_tick`, and `moog_slope` —
+all three previously blocked outright — now receive the real float swap, with
+the audio export's md5 staying bit-for-bit unchanged, the strongest possible
+signal that real DSP-chain output is correct.
+
+A final, separately-rooted bug closed out the night: tools/mini_synth's
+polyphony was silently degrading after a handful of notes. Traced to
+Cocoa's own behavior — a window that loses key-window status (Cmd+Tab,
+clicking elsewhere, a system panel grabbing focus) stops delivering KeyUp
+events entirely, so any key physically held at that exact moment latches
+`_stb_keys[slot]` at 1 forever, its voice sitting in SUSTAIN holding a pool
+slot until all 8 are exhausted. Confirmed unrelated to any of the day's
+compiler work via a disposable git worktree diff against yesterday's
+pre-RegAlloc-v2 commit (identical behavior on both). Fixed the same way the
+existing mouse/modifier self-heal already works: re-derive truth from Cocoa
+every poll (`isKeyWindow`) instead of trusting only the event stream.
+
+## 2026-06-24 — closing the inlined-call-sites arc on the real DSP chain, then a leaf-detection bug from the switch case nobody walked
+
+Three real DSP-chain functions still fell back to B3 after the previous day's
+Phase 4: `moon_process`, `tl_channel_process`, `rotary_tick` — each blocked by
+a genuinely different control-flow shape. Phase 6a opened the day with pure
+mechanical groundwork, zero behavior change: the hand-rolled mini-walker
+driving the whole expansion mechanism was replaced with a direct call into
+`_rg_build_body`, the exact same function that builds the CFG for every
+ordinary function's if/switch/return — verified byte-identical against every
+existing fixture before any new shape was attempted. Phase 6b then closed
+`moon_process`'s gap: its entire body is `pp=p; return moog_slope(pp.flt, in,
+pp.slope);` — the nested call sits DIRECTLY in the trailing return, no
+intermediate assignment. One real gap fixed along the way: the return-arity
+validator rejected ANY call in a return expression outright, with no
+exception for "the call IS the whole expression" — needed once expansion
+itself is recursing into a callee that also ends in a direct return-of-a-
+call. Phase 6c closed `tl_channel_process`'s gap — two nested expandable
+calls each guarded by a plain `if` with no else and no return inside (a
+conditional UPDATE, not an early return) — needed ZERO new emission logic at
+all, since the existing T_IF case already builds real blocks for both arms;
+the whole phase was a validation-side generalization. Phase 6d closed
+`rotary_tick`'s gap — an early return guarding the rest of the body, with
+unrelated code continuing after it to a second, different return — needed a
+genuine architecture change: the boolean then_ok/else_ok representation
+Phase 6c shipped with literally couldn't express "this arm has a return, but
+it's invalid" separately from "this arm has no return, which is fine" — both
+read as the same flag. Replaced with a proper tri-state result everywhere
+before extending it.
+
+Then a critical, latent bug surfaced extending the SAME arc one statement-
+shape further — a plain void call, no assignment at all (`lfo_set_rate(...)`
+inside `rotary_tick`). RegAlloc v2's Stage A had always assumed every
+inlined parameter gets BOUND to a real mangled slot. The real splice actually
+has a per-parameter bind-vs-substitute decision — a `T_VAR`/`T_LIT` argument
+to a never-written parameter gets SUBSTITUTED directly with no slot ever
+created — and every earlier phase had happened to dodge this by accident
+(every real target's substituted parameters were always referenced at the
+very first point inside the callee, with nothing else able to claim the
+"freed" register in between). `vec2_add`'s shape (several body statements,
+substituted params referenced throughout, not just at the top) was the first
+to expose it, and bootstrapping the compiler against its own use of that
+exact shape produced **78,000+ stacked lldb frames** of infinite recursion in
+the fix's first attempt, before a second bug (a substituted parameter
+happening to share its NAME with the caller's own argument, causing
+re-translation against the wrong frame) was found and fixed with a
+zero-translation clone path for already-resolved substitutes. The structural
+fix extracted the real splice's bind-vs-substitute decision into ONE shared
+function both the real splice and RegAlloc v2's analysis now call — the
+single source of truth neither side can silently diverge from again. A
+permanent dump trigger (`__rg_swap_<name>`) was added alongside the existing
+per-stage debug hooks specifically because none of them showed Stage E's
+FINAL gate outcome on their own — confirmed all four real DSP-chain targets
+read clean afterward: `moog_taps`, `moon_process`, and `rotary_tick` get the
+full int+float swap; `tl_channel_process` gets the int swap, with float
+correctly still deferred by one last, separately-scoped gate — live-range
+splitting.
+
+That last gate became the day's second investigation. `regalloc_linear_scan`
+now reserves a split variable's slot through its FULL envelope (the min
+start_pos to max end_pos across every one of its sub-intervals) instead of
+letting the first sub-interval's slot free up the instant its own end_pos
+passes — every sub-interval of the same variable is now guaranteed to land
+on the identical physical register, exactly what Stage E's one-register-per-
+variable apply step requires. `regalloc_has_any_split` was re-scoped from a
+blanket "any split blocks the swap" gate into a safety net checking Stage D's
+own assignment output for genuine inconsistency, rather than the mechanism
+that makes splitting safe in the first place.
+
+Turning that fix on against the one remaining real target it was built for
+(`tl_channel_process`) hung the compiler's gen2→gen3 bootstrap step solid —
+not slow, genuinely stuck, confirmed by letting it run over five real minutes
+of CPU time with no progress. Tracing it down (`bug --disasm`, `lldb`,
+several disposable worktrees isolating which exact piece of the day's change
+was responsible) found the actual cause had nothing to do with the envelope
+logic itself: `cg_b3_walk` — the walker that decides whether a function
+counts as "leaf" (and therefore gets to use the caller-saved x9..x12
+registers on top of the normal callee-saved pool) — had **no case for
+`T_SWITCH` at all**, silently falling into an empty `else {}` and never
+visiting a single statement inside any switch arm. Any `T_CALL` buried
+inside a switch arm (the exact shape of the compiler's own `val_check_node`,
+a large dispatch function) was therefore invisible to leaf detection,
+leaving `cg_fn_leaf` stuck at its initial `1` even for a function that
+genuinely calls out. This is a pre-existing bug, not something introduced by
+today's work — B3's own much coarser heuristic never happened to promote a
+loop counter deep enough inside a switch arm to expose it. RegAlloc v2's
+real liveness analysis did: it handed `val_check_node`'s own duplicate-global
+lookup loop counter a caller-saved `x9` register the leaf-only budget
+reserves specifically because nothing should be able to clobber them
+mid-function — except a real call buried in the SAME switch (`packed_eq`)
+is exactly free to clobber x9 as its own scratch register, silently
+resetting the loop counter back to 0 on every single iteration. Confirmed
+directly: a temporary instrumented build showed the counter incrementing
+past 2 BILLION times while staying at 0 the entire time. Fixed by adding the
+missing `T_SWITCH` case to `cg_b3_walk`, walking every arm and the else
+exactly the way `bpp_regalloc.bsm`'s own CFG-construction walk already does
+for the identical node shape.
+
+Two smaller, independently-real bugs turned up walking the same investigation
+before the fix was trusted: `_a64_b3_select_const` (the pass that promotes
+hot loop constants into whatever register slots locals leave free) inferred
+"the next free slot" from `arr_len(a64_promoted_regs)`'s own LENGTH — an
+invariant that only held while every promotion claimed slots 0, 1, 2, ... in
+strict numeric order, which RegAlloc v2's slot-sharing (deciding a variable's
+slot by start_pos, not by slot number) can legitimately violate; fixed to
+walk the slot space directly instead of trusting the count. And a
+pre-existing `fn_vt_starts`/`funcs` index desync in the parser — a
+cross-module duplicate function definition pushes a `fn_vt_starts` entry at
+function entry, before knowing the parse would turn out to be a duplicate,
+and never consumed it when the duplicate path didn't push a new `funcs`
+slot — permanently shifting every later function's variable-range lookup one
+slot off. Found, fittingly, while diagnosing why the project's OWN `bug`
+debugger couldn't resolve a struct field on a local inside `regalloc_
+linear_scan` itself — the desync corrupted struct-id resolution for every
+function parsed after the first cross-module duplicate, including the one
+this whole investigation needed to inspect.
+
+Full verification closed the day: a new regression fixture
+(`__rg_asn_split_gap`) proves the envelope reservation is load-bearing, not
+coincidental — without it, the fixture's own split variable lands on two
+different slots across its sub-intervals; with it, both halves agree, every
+time. `gen1→gen2→gen3` bootstrap converges byte-identical, native suite
+214/0/12, C-emit suite 172/0/54, all 5 regalloc gates green, `tiny_lofi
+--render`'s audio export matches the documented md5
+(`f61fac72be5077a6e9ef9cae21dde2a1`) exactly. The "RegAlloc v2 sees through
+inlined call sites" arc that opened the day before is now closed: every real
+DSP-chain function in the project gets the swap it qualifies for, and a
+latent leaf-detection bug that predated this whole session by an unknown
+margin is fixed for every future function shaped like `val_check_node`, not
+just the one that happened to expose it today.
