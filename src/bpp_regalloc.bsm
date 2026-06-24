@@ -320,38 +320,63 @@ static _rg_clone_translate(nd) {
 // Does every path through `body_arr` return, using only shapes this
 // stage understands, given the call site assigns into
 // `expected_arity` targets (1 for a plain single-target assignment, N
-// for `a,b,c,d = callee(...)`)? Every check must pass BEFORE any node
-// is emitted — once one statement is appended to the current block,
-// there is no clean way to "undo" a partial expansion if a later
-// statement disqualifies it.
-//
-// Every statement BEFORE the trailing path-terminator must be a plain
-// single-target T_DECL/T_MEMST/T_ASSIGN (the callee's own locals) —
-// control flow other than a TRAILING T_RET or T_SWITCH-of-returns is
-// not yet accepted (T_IF support is Phase 6c/6d's job, a later
-// increment of this same arc — this function returns 0 for it today,
-// same as it always has). A local's RHS may itself be a T_CALL at the
-// EXPRESSION ROOT (`a = flt_onepole_tick(...)`, moog_taps's own
-// shape) as long as THAT call is itself recursively expandable
-// (_rg_is_expandable_inline_assign, mutual recursion with this
-// function — bounded by the inliner's own finite nesting depth, never
-// a real function-recursion cycle since the inliner already rejects
-// recursive functions outright). A call buried deeper inside a larger
-// expression (`x + flt_onepole_tick(...)`) is still rejected — that
-// shape needs splicing a sub-expression's result mid-expression, a
-// separate increment from "the whole RHS IS the call". The trailing
-// return's own arity must match `expected_arity` exactly — the actual
-// call site this stage is for moog_taps's own shape (multi-value
-// T_RET, n.c == expected_arity == 4), not a nested local assignment
-// (single-target locals inside a callee's body are still validated at
-// expected_arity 1, regardless of the OUTER call's own arity).
+// for `a,b,c,d = callee(...)`)? Thin wrapper — the real walk starts at
+// statement 0 (see _rg_stmts_all_paths_return, which recurses into
+// itself for an if's own arms, statement index reset to 0 each time).
 static _rg_body_all_paths_return(body_arr, body_cnt, expected_arity) {
-    auto i, n: Node;
-    if (body_cnt < 1) { return 0; }
-    i = 0;
-    while (i < body_cnt - 1) {
+    return _rg_stmts_all_paths_return(body_arr, body_cnt, 0, expected_arity);
+}
+
+// Walks body_arr[start_idx..body_cnt), returning 1 only if every path
+// through THAT SLICE returns, using only shapes this stage
+// understands. Every check must pass BEFORE any node is emitted —
+// once one statement is appended to the current block, there is no
+// clean way to "undo" a partial expansion if a later statement
+// disqualifies it.
+//
+// T_DECL/T_MEMST/T_ASSIGN (the callee's own locals, or a nested
+// expandable call) never terminate a path — walk past them. A local's
+// RHS may itself be a T_CALL at the EXPRESSION ROOT
+// (`a = flt_onepole_tick(...)`, moog_taps's own shape) as long as THAT
+// call is itself recursively expandable (_rg_is_expandable_inline_assign,
+// mutual recursion with this function — bounded by the inliner's own
+// finite nesting depth, never a real function-recursion cycle since
+// the inliner already rejects recursive functions outright). A call
+// buried deeper inside a larger expression (`x + flt_onepole_tick(...)`)
+// is still rejected — that shape needs splicing a sub-expression's
+// result mid-expression, a separate increment from "the whole RHS IS
+// the call".
+//
+// T_RET terminates the path here, successfully, if its own arity
+// matches `expected_arity` (the actual call site this stage is for
+// moog_taps's own shape, multi-value T_RET, n.c == expected_arity == 4,
+// not a nested local assignment — single-target locals inside a
+// callee's body are still validated at expected_arity 1, regardless
+// of the OUTER call's own arity).
+//
+// T_SWITCH (only as the LAST statement — a switch in the middle,
+// followed by more code, isn't motivated by any real shape yet) keeps
+// its existing all-arms-return validation (_rg_switch_of_returns_ok).
+//
+// T_IF (Phase 6c — tl_channel_process's own
+// `if (tk.flt_on != 0) { wet = moon_process(tk.flt, wet); }` shape):
+// recurse into both arms via _rg_if_terminates. If NEITHER arm
+// terminates (a plain conditional update, today's only accepted
+// shape — an early return, exactly one arm terminating, is Phase 6d's
+// job), the `if` itself doesn't terminate the path either — keep
+// walking statements after it. If BOTH arms terminate, the whole `if`
+// is itself a path terminator (anything textually after it would be
+// dead code — not reasoned about, just not expected in practice).
+//
+// Anything else (T_WHILE, T_BREAK, T_CONTINUE) — reject. Loops stay
+// explicitly out of scope; no real target shape needs one yet.
+static _rg_stmts_all_paths_return(body_arr, body_cnt, start_idx, expected_arity) {
+    auto i, n: Node, if_term;
+    i = start_idx;
+    while (i < body_cnt) {
         n = body_arr[i];
         if (n == 0) { return 0; }
+        if (n.ntype == T_RET) { return _rg_return_arity_ok(n, expected_arity); }
         if (n.ntype == T_DECL) { i++; continue; }
         if (n.ntype == T_MEMST) {
             // A struct-field write (moog_taps's own `mm.s1 = a;`
@@ -363,30 +388,66 @@ static _rg_body_all_paths_return(body_arr, body_cnt, expected_arity) {
             i++;
             continue;
         }
-        if (n.ntype != T_ASSIGN) { return 0; }
-        if (n.b != 0 && n.b.ntype == T_CALL) {
-            // Recursing FROM here means this statement belongs to
-            // some OTHER callee's body — always a nested context, by
-            // definition. See _rg_is_expandable_inline_assign's own
-            // comment for why this matters (.e is meaningless here).
-            // The nested local's OWN target arity matches the nested
-            // call's own return arity — moog_slope's own
-            // `a,b,c,d = moog_taps(m,in);` is exactly this shape
-            // (n.d == 4, the nested callee's own multi-value return).
-            // _rg_is_expandable_inline_assign validates the target
-            // shape (every n.c[i] is a plain T_VAR) itself.
-            if (_rg_is_expandable_inline_assign(n, 1, (n.d > 1) ? n.d : 1) == 0) { return 0; }
-        } else {
-            if (n.d > 1) { return 0; }    // multi-target without a matching nested call — no real shape
-            if (n.a == 0 || n.a.ntype != T_VAR) { return 0; }
-            if (_rg_expr_has_call(n.b)) { return 0; }
+        if (n.ntype == T_ASSIGN) {
+            if (n.b != 0 && n.b.ntype == T_CALL) {
+                // Recursing FROM here means this statement belongs to
+                // some OTHER callee's body — always a nested context,
+                // by definition. See _rg_is_expandable_inline_assign's
+                // own comment for why this matters (.e is meaningless
+                // here). The nested local's OWN target arity matches
+                // the nested call's own return arity — moog_slope's
+                // own `a,b,c,d = moog_taps(m,in);` is exactly this
+                // shape (n.d == 4). _rg_is_expandable_inline_assign
+                // validates the target shape itself.
+                if (_rg_is_expandable_inline_assign(n, 1, (n.d > 1) ? n.d : 1) == 0) { return 0; }
+            } else {
+                if (n.d > 1) { return 0; }    // multi-target without a matching nested call — no real shape
+                if (n.a == 0 || n.a.ntype != T_VAR) { return 0; }
+                if (_rg_expr_has_call(n.b)) { return 0; }
+            }
+            i++;
+            continue;
         }
-        i++;
+        if (n.ntype == T_IF) {
+            if_term = _rg_if_terminates(n, expected_arity);
+            if (if_term < 0) { return 0; }
+            if (if_term == 1) { return 1; }
+            i++;
+            continue;
+        }
+        if (n.ntype == T_SWITCH) {
+            if (i != body_cnt - 1) { return 0; }
+            return _rg_switch_of_returns_ok(n, expected_arity);
+        }
+        return 0;   // T_WHILE, T_BREAK, T_CONTINUE, etc — not yet supported
     }
-    n = body_arr[body_cnt - 1];
-    if (n == 0) { return 0; }
-    if (n.ntype == T_RET) { return _rg_return_arity_ok(n, expected_arity); }
-    if (n.ntype == T_SWITCH) { return _rg_switch_of_returns_ok(n, expected_arity); }
+    return 0;   // fell off the end without returning — not a valid shape
+}
+
+// Does `n` (a T_IF) terminate every path through it? Returns -1 if
+// the if's shape isn't one this stage recognizes at all (a call in
+// the condition, or — for now — exactly one arm terminating, Phase
+// 6d's job), 1 if BOTH arms terminate (the whole if is itself a path
+// terminator), 0 if NEITHER arm terminates (a plain conditional
+// update — tl_channel_process's shape, the only kind Phase 6c
+// accepts; code after the if still needs validating by the caller).
+static _rg_if_terminates(n: Node, expected_arity) {
+    auto then_ok, else_ok;
+    if (_rg_expr_has_call(n.a)) { return -1; }
+    then_ok = _rg_stmts_all_paths_return(n.b, n.c, 0, expected_arity);
+    if (n.e == 0) {
+        // No else: the "condition false" path always falls through to
+        // whatever follows the if, regardless of whether the then-arm
+        // terminates — so the if as a WHOLE can never be a terminator
+        // here. A then-arm that DOES terminate with no else at all is
+        // an early return with an implicit empty else — Phase 6d's
+        // shape, not yet accepted.
+        if (then_ok) { return -1; }
+        return 0;
+    }
+    else_ok = _rg_stmts_all_paths_return(n.d, n.e, 0, expected_arity);
+    if (then_ok && else_ok) { return 1; }
+    if (then_ok || else_ok) { return -1; }   // exactly one terminates — Phase 6d's job
     return 0;
 }
 
