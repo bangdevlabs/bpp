@@ -401,7 +401,21 @@ static _rg_return_arity_ok(ret: Node, expected_arity) {
     if (expected_arity == 1) {
         if (n.c > 1) { return 0; }
         if (n.a == 0) { return 0; }      // void return has no value to bind
-        if (_rg_expr_has_call(n.a)) { return 0; }
+        if (_rg_expr_has_call(n.a)) {
+            // A call buried inside a larger expression is still
+            // rejected — only `return callee(...);` directly (the
+            // moon_process shape) is recognized. Recurse as a NESTED
+            // check (is_nested=1): whether THIS particular return is
+            // reached at the top level or already inside another
+            // expansion, the call itself, if it qualifies at all,
+            // qualifies the same way a nested call always does — its
+            // own `.e` is never meaningful here either way (top-level
+            // callers detect and expand `return callee(...);` BEFORE
+            // ever reaching this validation; by the time this runs,
+            // it's always validating a callee's own body).
+            if (n.a.ntype != T_CALL) { return 0; }
+            return _rg_call_is_expandable(n.a, 1, 1);
+        }
         return 1;
     }
     if (n.c != expected_arity) { return 0; }
@@ -657,8 +671,7 @@ static _rg_next_nested_id() {
 //       _rg_next_nested_id will find a real id for it later, at
 //       expansion time).
 static _rg_is_expandable_inline_assign(nd, is_nested, expected_arity) {
-    auto n: Node, rhs: Node, fidx, fn_rec, body_arr, body_cnt, callee_bcnt;
-    auto i, tnode: Node;
+    auto n: Node, i, tnode: Node;
     n = nd;
     if (n.ntype != T_ASSIGN) { return 0; }
     if (expected_arity == 1) {
@@ -673,7 +686,19 @@ static _rg_is_expandable_inline_assign(nd, is_nested, expected_arity) {
             i++;
         }
     }
-    rhs = n.b;
+    return _rg_call_is_expandable(n.b, is_nested, expected_arity);
+}
+
+// The call-site half of _rg_is_expandable_inline_assign, with no
+// opinion at all about what (if anything) receives the result —
+// shared by T_ASSIGN's own check above (which validates the target
+// shape FIRST, then delegates here) and T_RET's `return callee(...);`
+// detection (Phase 6b — moon_process's shape has no target node to
+// validate at all, the value flows straight into the CALLER's own
+// return).
+static _rg_call_is_expandable(call_node, is_nested, expected_arity) {
+    auto rhs: Node, fidx, fn_rec, body_arr, body_cnt, callee_bcnt;
+    rhs = call_node;
     if (rhs == 0 || rhs.ntype != T_CALL) { return 0; }
     fidx = find_func_idx(rhs.a);
     if (fidx < 0) { return 0; }
@@ -787,21 +812,67 @@ static _rg_build_stmt(nd) {
 
     if (t == T_RET) {
         if (arr_len(rg_inline_stack) > 0) {
-            // Inside an active expansion: this T_RET belongs to the
-            // CALLEE currently being walked, not the function actually
-            // under analysis. Synthesize the assignment(s) into the
-            // active frame's destination, then link the current block
-            // to the expansion's own join block — never "no successor"
-            // — the SAME _rg_link_fallthrough-driven convergence every
-            // ordinary if/switch already relies on. dest_arr == 0 (the
-            // moon_process shape: this expansion sits directly under
-            // the CALLER's own return) is Phase 6b's job — not reached
-            // yet, since nothing pushes that case onto the stack
-            // before then.
+            // The callee currently being walked may ITSELF return
+            // directly from another expandable call (moon_process's
+            // own shape, one level deeper than wherever the outer
+            // expansion started — `return moog_slope(...);` lives
+            // inside moon_process's body, reached here while
+            // moon_process's own frame is active). The result flows
+            // straight through to whatever destination the CURRENT
+            // frame already has (an assignment array, or another
+            // level of "this is really the caller's own return") —
+            // recurse with that SAME destination instead of
+            // synthesizing anything here; the recursive call pushes
+            // its own nested frame and pops back to this one when done.
+            auto _rg_top0, _rg_dest_arr0, _rg_dest_cnt0, _rg_cs_id3;
+            if (n.c <= 1 && n.a != 0 && n.a.ntype == T_CALL) {
+                _rg_top0 = arr_len(rg_inline_join_stack) - 1;
+                _rg_dest_arr0 = arr_get(rg_inline_dest_arr_stack, _rg_top0);
+                _rg_dest_cnt0 = arr_get(rg_inline_dest_cnt_stack, _rg_top0);
+                if (_rg_call_is_expandable(n.a, 1, _rg_dest_cnt0)) {
+                    _rg_cs_id3 = _rg_callsite_id_for(n.a);
+                    if (_rg_cs_id3 >= 0) {
+                        _rg_expand_inline_straightline(n.a, _rg_dest_arr0, _rg_dest_cnt0, _rg_cs_id3);
+                        return 0;
+                    }
+                }
+            }
             auto _rg_top, _rg_dest_arr2, _rg_dest_cnt2, _rg_join, _rg_assigns, _rg_ai;
             _rg_top = arr_len(rg_inline_join_stack) - 1;
             _rg_dest_arr2 = arr_get(rg_inline_dest_arr_stack, _rg_top);
             _rg_dest_cnt2 = arr_get(rg_inline_dest_cnt_stack, _rg_top);
+            if (_rg_dest_arr2 == 0) {
+                // The moon_process shape: this expansion sits directly
+                // under the CALLER's own `return callee(...);` — the
+                // function actually being analysed terminates HERE,
+                // for real, not at this frame's join block (which is
+                // pushed but never reached in this case). Synthesize
+                // a FRESH T_RET from the translated value(s) instead
+                // of an assignment.
+                auto _rg_fresh_ret: Node, _rg_vals, _rg_vi;
+                _rg_fresh_ret = make_node(T_RET);
+                if (_rg_dest_cnt2 == 1) {
+                    _rg_fresh_ret.a = _rg_clone_translate(n.a);
+                } else {
+                    _rg_vals = buf_word(_rg_dest_cnt2);
+                    _rg_vi = 0;
+                    while (_rg_vi < _rg_dest_cnt2) {
+                        _rg_vals[_rg_vi] = _rg_clone_translate(n.b[_rg_vi]);
+                        _rg_vi++;
+                    }
+                    _rg_fresh_ret.b = _rg_vals;
+                    _rg_fresh_ret.c = _rg_dest_cnt2;
+                }
+                _rg_emit(_rg_fresh_ret);
+                _rg_set_succ(rg_cur_block, -1, -1);
+                rg_cur_block = _rg_new_dead_block();
+                return 0;
+            }
+            // Inside an active expansion that DOES assign into named
+            // targets: synthesize the assignment(s), then link the
+            // current block to the expansion's own join block — never
+            // "no successor" — the SAME _rg_link_fallthrough-driven
+            // convergence every ordinary if/switch already relies on.
             _rg_join = arr_get(rg_inline_join_stack, _rg_top);
             _rg_assigns = _rg_ret_to_assign_array(n, _rg_dest_arr2, _rg_dest_cnt2);
             _rg_ai = 0;
@@ -809,6 +880,28 @@ static _rg_build_stmt(nd) {
             _rg_set_succ(rg_cur_block, _rg_join, -1);
             rg_cur_block = _rg_new_dead_block();
             return 0;
+        }
+        // Top level: `return callee(...);` directly (no intermediate
+        // assignment — moon_process's own shape) expands in place
+        // exactly like `a = callee(...)` does, just with dest_arr=0
+        // (handled above on the NEXT time this case fires, once
+        // inside the pushed frame) telling the recursive call to
+        // synthesize a fresh return instead of an assignment. Only
+        // the single-value shape is recognized for now — a multi-
+        // value return whose call lives in n.a is not how the parser
+        // shapes that (n.a is unused, n.b/n.c carry the values), and a
+        // call hiding inside ONE of several multi-return values
+        // (`return x, callee(...);`) is a different, not-yet-motivated
+        // shape, left unrecognized.
+        if (n.c <= 1 && n.a != 0 && n.a.ntype == T_CALL) {
+            auto _rg_cs_id2;
+            if (_rg_call_is_expandable(n.a, 0, 1)) {
+                _rg_cs_id2 = _rg_callsite_id_for(n.a);
+                if (_rg_cs_id2 >= 0) {
+                    _rg_expand_inline_straightline(n.a, 0, 1, _rg_cs_id2);
+                    return 0;
+                }
+            }
         }
         _rg_emit(nd);
         _rg_set_succ(rg_cur_block, -1, -1);
