@@ -9,7 +9,7 @@
 // needs a real liveness-based allocator: explicit control-flow graph,
 // liveness dataflow, live intervals, linear-scan assignment, coalescing.
 // See docs/plans/compiler_boost_roadmap.md (section F.2) for the full
-// staged design and the measured evidence that motivates it (tl_bench's
+// staged design and the measured evidence that motivates it (sf_bench's
 // flat/oracle gap persisting after every call and accumulator shuttle is
 // gone; games/rts2/rts2_combat.bsm's _combat_step needing more
 // simultaneously-live registers than even the widened B3 pool provides).
@@ -184,11 +184,26 @@ global rg_inline_subst_nodes_stack;
 // because nothing B3 emits ever touches the substituted slot.
 global rg_known_substituted_names;
 
+// Set by `--regalloc-debug` (parsed in bpp.bpp). Gates the
+// `REGRESSION ...` line in `regalloc_compare_vs_b3` below — the
+// systematic comparison itself runs unconditionally on every function,
+// every compile (that analysis is the whole point of Stage E's safety
+// net), but printing its findings to stderr is opt-in diagnostic
+// output, same shape as `--dispatch` / `--show-promotions`. Without
+// this gate, EVERY compile of EVERY program printed dozens of
+// "REGRESSION ..." lines for functions the swap correctly declined to
+// touch (font/json/draw/profile helpers in the compiler's own
+// self-compile, none of them real bugs) — confirmed informational
+// noise, not a problem, but noisy enough on every single build that it
+// buried real signal. Default off; pass `--regalloc-debug` to see it.
+global flag_regalloc_debug;
+
 // Initialize the regalloc module. Call once at startup, mirroring
 // init_dispatch()'s own convention — the real per-function state is set
 // fresh by regalloc_build_cfg every time, so this just establishes safe
 // defaults before the first function is ever compiled.
 void init_regalloc() {
+    flag_regalloc_debug = 0;
     rg_blocks = 0;
     rg_cur_block = -1;
     rg_break_stack = arr_new();
@@ -482,7 +497,7 @@ static _rg_body_all_paths_return(body_arr, body_cnt, expected_arity) {
 // actual value from somewhere).
 //
 // Distinguishing 0 from -1 matters: an if-arm with NO return at all
-// (tl_channel_process's `if (tk.flt_on != 0) { wet =
+// (sf_channel_process's `if (tk.flt_on != 0) { wet =
 // moon_process(tk.flt, wet); }`, Phase 6c's shape) is a valid
 // conditional update (0) — but an arm whose trailing T_RET exists yet
 // is itself invalid (wrong arity, or a call buried in a larger
@@ -2515,12 +2530,28 @@ regalloc_compare_vs_b3(assigns, b3_promote, var_names, var_forced_ty, want_float
         if (b3_slot >= 0 && is_flt == want_float && _rg_is_mangled_inline_slot(var_names, vi) == 0) {
             ls_slot = _rg_assign_slot_for(assigns, vi);
             if (ls_slot < 0) {
-                diag_str("REGRESSION ");
-                diag_buf(vbuf + unpack_s(fn_name), unpack_l(fn_name));
-                diag_str(": B3 promoted var ");
-                diag_int(vi);
-                diag_str(" but linear-scan spilled it");
-                diag_newline();
+                // The counter below is the REAL safety gate (the caller
+                // refuses Stage E's swap whenever worse > 0) and always
+                // runs. The print is opt-in diagnostic noise — see
+                // flag_regalloc_debug's header comment above.
+                //
+                // Wording note: this used to print a bare "REGRESSION"
+                // tag, which reads like "something broke" — it does not.
+                // Nothing in the compiled output changes here; B3's
+                // existing, already-running allocation is kept exactly
+                // as-is. The message now leads with the ACTION the
+                // compiler takes (keep B3's register) rather than an
+                // abstract verdict, so a reader doesn't need the Stage
+                // E design history to tell "real bug" from "the safety
+                // net working as intended."
+                if (flag_regalloc_debug) {
+                    diag_str("[regalloc] ");
+                    diag_buf(vbuf + unpack_s(fn_name), unpack_l(fn_name));
+                    diag_str(" var ");
+                    diag_int(vi);
+                    diag_str(": keeping B3's register (linear-scan swap would spill it)");
+                    diag_newline();
+                }
                 worse = worse + 1;
             }
         }
