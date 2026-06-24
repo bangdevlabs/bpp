@@ -87,6 +87,36 @@ __rg_asn_nonoverlap(a) -> word {
     return q;
 }
 
+// vi: a, b (params), x, y, z. `b` ends up the one that SPLITS here --
+// touched once in the if's own condition, then again inside the
+// then-arm's body, with the if-entry block boundary opening a gap
+// between the two touches (hand-traced via the compiler's own dump,
+// not pre-derived like the simpler fixtures above -- this one exists
+// to exercise the split MECHANISM itself, not to pin an exact scan
+// order). Without regalloc_linear_scan's envelope-reservation fix
+// (bpp_regalloc.bsm, see its own header comment), b's FIRST
+// sub-interval would expire the instant its own end_pos passes,
+// freeing its slot for whatever's processed next -- and b's SECOND
+// sub-interval, needing the slot back, could land on a DIFFERENT slot
+// than its first half: the exact inconsistency
+// regalloc_has_any_split's safety net exists to catch, and the thing
+// Stage E's swap can never tolerate (one physical register per
+// variable, fixed for the whole function). WITH the fix, b's slot is
+// reserved through its FULL envelope (both sub-intervals' combined
+// span), so both halves are GUARANTEED to agree -- confirmed by the
+// compile-time dump (`tests/test_regalloc_linscan.sh` checks this
+// exactly) and by the runtime result below.
+__rg_asn_split_gap(a, b) -> word {
+    auto x, y, z;
+    x = a + 1;
+    if (b > 0) {
+        y = b + 2;
+        return y;
+    }
+    z = x + a;
+    return z;
+}
+
 // A call with no arguments that just returns 0 -- exists purely to
 // keep __rg_asn_spill NON-LEAF (cg_fn_leaf clears on any T_CALL),
 // since the budget passed to regalloc_linear_scan mirrors B3's own
@@ -119,5 +149,9 @@ main() {
     if (r != 0 - 6) { return 4; }
     r = __rg_asn_spill(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11);
     if (r != 66) { return 5; }
+    r = __rg_asn_split_gap(5, 1);
+    if (r != 3) { return 6; }
+    r = __rg_asn_split_gap(5, 0 - 1);
+    if (r != 11) { return 7; }
     return 0;
 }

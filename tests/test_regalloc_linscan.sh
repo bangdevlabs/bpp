@@ -41,16 +41,28 @@ echo "$DUMP" | grep -m1 -A4 "ASN __rg_asn_straightline" | grep -q "var 0: slot 0
 echo "$DUMP" | grep -m1 -A4 "ASN __rg_asn_straightline" | grep -q "var 3: slot 0" || fail "straightline var 3 (y): expected slot 0 (a's slot, freed when a expired)"
 
 # n and i each split into two sub-intervals (around the loop exit
-# block, a mutually-exclusive sibling of the body) -- both halves land
-# on the SAME slot here (not a splitting guarantee, just how this
-# specific scan plays out — see the .bpp's own comment for the exact
-# trace), so each var_idx appears twice with matching slots.
+# block, a mutually-exclusive sibling of the body) -- both halves now
+# land on the SAME slot as a GUARANTEE, not a coincidence:
+# regalloc_linear_scan's envelope-reservation fix (bpp_regalloc.bsm)
+# reserves a split variable's slot through its full combined span, so
+# every sub-interval of the same var_idx always agrees.
 LOOP_BLOCK=$(echo "$DUMP" | grep -m1 -A6 "ASN __rg_asn_loop")
 N_SLOTS=$(echo "$LOOP_BLOCK" | grep "var 0:" | grep -oE 'slot [0-9]+' | sort -u)
 I_SLOTS=$(echo "$LOOP_BLOCK" | grep "var 1:" | grep -oE 'slot [0-9]+' | sort -u)
 if [ "$(echo "$N_SLOTS" | wc -l)" -ne 1 ]; then fail "loop var 0 (n): expected both split intervals on the same slot, got: $N_SLOTS"; fi
 if [ "$(echo "$I_SLOTS" | wc -l)" -ne 1 ]; then fail "loop var 1 (i): expected both split intervals on the same slot, got: $I_SLOTS"; fi
 echo "$LOOP_BLOCK" | grep -q "var 2: slot 2" || fail "loop var 2 (sum): expected slot 2"
+
+# The envelope-reservation regression check itself: b splits across
+# the if (condition, then the then-arm's own body) -- both
+# sub-intervals MUST agree on one slot, or Stage E's swap would be
+# unsafe to apply for any function shaped like this. See the .bpp's
+# own comment for the full rationale.
+SPLIT_GAP_BLOCK=$(echo "$DUMP" | grep -m1 -A6 "ASN __rg_asn_split_gap")
+B_SLOTS=$(echo "$SPLIT_GAP_BLOCK" | grep "var 1:" | grep -oE 'slot [0-9]+|spill')
+if [ "$(echo "$B_SLOTS" | wc -l)" -ne 2 ]; then fail "split_gap: expected b (var 1) to appear exactly twice (split), got: $B_SLOTS"; fi
+if [ "$(echo "$B_SLOTS" | sort -u | wc -l)" -ne 1 ]; then fail "split_gap: b's two sub-intervals must agree on one slot, got: $B_SLOTS"; fi
+echo "$B_SLOTS" | grep -q "spill" && fail "split_gap: b should hold a real slot, not spill: $B_SLOTS"
 
 # The load-bearing check: p (var 1) and q (var 2) must land on the
 # SAME slot, since their intervals never overlap -- the property this
@@ -78,5 +90,5 @@ echo "$SPILL_DUMP" | grep "^  var" | grep -v "var 10:" | grep -q "spill" \
 "$OUT" >/dev/null 2>&1 \
     || { echo "FAIL  test_regalloc_linscan: $SRC's own runtime assertions failed (rc=$?)"; exit 1; }
 
-echo "PASS  test_regalloc_linscan  (assign-or-spill verified, p/q slot-sharing confirmed, spill heuristic verified)"
+echo "PASS  test_regalloc_linscan  (assign-or-spill verified, p/q slot-sharing confirmed, spill heuristic verified, split-envelope reservation confirmed)"
 exit 0

@@ -1324,6 +1324,38 @@ cg_b3_walk(nd) {
         arr = n.b; cnt = n.c;
         for (i = 0; i < cnt; i++) { cg_b3_walk(arr[i]); }
     }
+    T_SWITCH {
+        // Layout mirrors bpp_regalloc.bsm's own T_SWITCH walk:
+        // n.a=condition, n.c=arm_count, n.src_tok=arm_bodies
+        // (interleaved [body_arr, bcnt] per arm), n.d/n.e=else
+        // body/count. Without this case the switch fell into the
+        // `else {}` below and cg_b3_walk never saw a single
+        // statement inside any arm — any T_CALL buried in a switch
+        // arm (the common shape for a big dispatch function like
+        // val_check_node) went undetected, leaving cg_fn_leaf stuck
+        // at its initial 1 even though the function calls out.
+        // B3's own walk happened to never promote anything deep
+        // enough inside a switch arm to expose this; RegAlloc v2's
+        // real liveness analysis does, handing a loop counter a
+        // caller-saved x9..x12 register the leaf-only budget
+        // reserves — exactly the registers a real call (e.g.
+        // packed_eq) is free to clobber, silently resetting the
+        // counter on every iteration.
+        auto _sw_bodies, _sw_cnt, _sw_k, _sw_ab, _sw_bc, _sw_i;
+        cg_b3_walk(n.a);
+        _sw_bodies = n.src_tok;
+        _sw_cnt = n.c;
+        _sw_k = 0;
+        while (_sw_k < _sw_cnt) {
+            _sw_ab = _sw_bodies[_sw_k * 2];
+            _sw_bc = _sw_bodies[_sw_k * 2 + 1];
+            for (_sw_i = 0; _sw_i < _sw_bc; _sw_i++) { cg_b3_walk(_sw_ab[_sw_i]); }
+            _sw_k++;
+        }
+        if (n.e > 0) {
+            for (_sw_i = 0; _sw_i < n.e; _sw_i++) { cg_b3_walk(n.d[_sw_i]); }
+        }
+    }
     else { }
     }
 }
@@ -2618,13 +2650,18 @@ void cg_emit_func(fi) {
     // take one, the other, both, or neither) — each only swaps when
     // ALL hold: (1) the systematic comparison just above found zero
     // regressions for that class in this exact function (linear-scan
-    // promotes everything B3 promotes, here); (2) no variable of that
-    // class needed live-range splitting (regalloc_has_any_split) — a
-    // single physical register per variable can't represent a value
-    // that moves between two different registers at a split boundary,
-    // and codegen has no support for emitting that move yet
-    // (separable future work, the same shape as coalescing); (3) no
-    // mangled inline slot in THIS function is UNCOVERED by Stage A's
+    // promotes everything B3 promotes, here); (2) Stage D's own
+    // assignment output has no internal inconsistency
+    // (regalloc_has_any_split, bpp_regalloc.bsm) — regalloc_linear_scan's
+    // envelope-reservation scheme guarantees every sub-interval of a
+    // live-range-split variable already lands on the IDENTICAL slot
+    // (the apply step still writes only ONE physical register per
+    // variable into cg_var_promote for the whole function, exactly as
+    // before; a split variable is simply indistinguishable from an
+    // unsplit one by the time Stage E sees it), so this check is a
+    // safety net catching a genuine regression in that guarantee, not
+    // the mechanism that makes splitting safe; (3) no mangled inline
+    // slot in THIS function is UNCOVERED by Stage A's
     // own analysis (regalloc_has_uncovered_mangled_promoted,
     // bpp_regalloc.bsm) -- a mangled slot B3 promoted that genuinely
     // has no interval anywhere is still invisible to the linear-scan
@@ -2647,13 +2684,13 @@ void cg_emit_func(fi) {
     _rg_applied_int = 0; _rg_applied_flt = 0;
 
     if (_rg_worse == 0 && _rg_mangled == 0) {
-        _rg_split = regalloc_has_any_split(_rg_ivl_int);
+        _rg_split = regalloc_has_any_split(_rg_asn);
         if (_rg_split == 0) {
             _rg_applied_int = call(p.regalloc_apply, _rg_asn);
         }
     }
     if (_rg_worse_flt == 0 && _rg_mangled == 0) {
-        _rg_split_flt = regalloc_has_any_split(_rg_ivl_flt);
+        _rg_split_flt = regalloc_has_any_split(_rg_asn_flt);
         if (_rg_split_flt == 0) {
             _rg_applied_flt = call(p.regalloc_apply_float, _rg_asn_flt);
         }

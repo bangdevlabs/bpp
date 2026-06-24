@@ -2094,30 +2094,70 @@ static _rg_sort_order_by_start(intervals) {
     return order;
 }
 
-// Finds `var_idx`'s own entry in `assigns` (built earlier in the same
-// scan, one entry per interval already processed) and forces it to -1
-// — used when an already-assigned active interval loses its slot to a
-// later, longer-lived spill decision.
+// Finds `var_idx`'s entries in `assigns` (built earlier in the same
+// scan, one entry per interval already processed) and forces ALL of
+// them to -1 — used when an already-assigned active interval loses
+// its slot to a later, longer-lived spill decision. A live-range-
+// split variable can already own SEVERAL entries by this point (one
+// per sub-interval already decided via the "decided != -2" reuse path
+// in regalloc_linear_scan) — stopping at the first match would leave
+// every earlier sub-interval's entry pointing at a slot this victim
+// no longer holds (the incoming interval just took it), producing two
+// live variables sharing one physical register. Visiting every match
+// keeps every sub-interval's recorded slot consistent with the single
+// decision now living in var_decided.
 static void _rg_force_spill(assigns, var_idx) {
     auto n, i, asn: RegAssign;
     n = arr_struct_count(assigns);
     i = 0;
     while (i < n) {
         asn = arr_struct_at(assigns, i);
-        if (asn.var_idx == var_idx) { asn.slot = -1; return; }
+        if (asn.var_idx == var_idx) { asn.slot = -1; }
         i++;
     }
 }
 
 // Computes a register assignment for every interval in `intervals`
 // (Stage C's own output), against a logical slot budget of `budget`.
-// Returns an arr_struct of RegAssign, one entry per variable. SHADOW
-// MODE — see this section's own header comment; nothing reads this
-// yet.
+// Returns an arr_struct of RegAssign, one entry per interval — for a
+// variable with NO live-range splitting that's the same as one entry
+// per variable; for a SPLIT variable (more than one LiveInterval
+// sharing a var_idx) every entry is guaranteed to carry the IDENTICAL
+// slot (or all spill together) — see the envelope-reservation comment
+// below for why and how. This guarantee is what lets Stage E's apply
+// step (_a64_regalloc_apply / _a64_regalloc_apply_float,
+// a64_codegen.bsm — ONE physical register per var_idx for the WHOLE
+// function, no mechanism to change it mid-function) safely commit a
+// split variable's swap: from Stage E's perspective a split variable
+// is indistinguishable from one that was never split at all.
 regalloc_linear_scan(intervals, budget) {
     auto order, n, i, idx, cur: LiveInterval, active, k, act: _RgActive;
     auto assigns, asn: RegAssign, free_slots, slot;
     auto worst_k, worst_end, worst_var;
+    auto envelope_end, var_decided, vi2, cur2: LiveInterval, decided;
+
+    // Precompute each var_idx's ENVELOPE end_pos — the max end_pos
+    // across every LiveInterval entry sharing that var_idx. A split
+    // variable is the SAME logical variable reused across two (or
+    // more) non-overlapping sub-intervals; instead of letting the
+    // FIRST sub-interval's slot go free the instant ITS OWN end_pos
+    // passes (today's bug — regalloc_has_any_split exists precisely
+    // because that could let something else claim the slot during the
+    // gap, then collide when the variable's later sub-interval needs
+    // it back), the slot is held through the entire envelope. The gap
+    // between sub-intervals is treated as still "spoken for," exactly
+    // as if Stage C had never split the interval in the first place.
+    envelope_end = buf_word(64);
+    vi2 = 0;
+    while (vi2 < 64) { *(envelope_end + vi2 * 8) = -1; vi2++; }
+    i = 0;
+    while (i < arr_struct_count(intervals)) {
+        cur2 = arr_struct_at(intervals, i);
+        if (cur2.end_pos > *(envelope_end + cur2.var_idx * 8)) {
+            *(envelope_end + cur2.var_idx * 8) = cur2.end_pos;
+        }
+        i++;
+    }
 
     order = _rg_sort_order_by_start(intervals);
     n = arr_len(order);
@@ -2127,10 +2167,34 @@ regalloc_linear_scan(intervals, budget) {
     slot = budget - 1;
     while (slot >= 0) { free_slots = arr_push(free_slots, slot); slot--; }
 
+    // Per-var_idx decision cache: -2 ("not yet seen this scan") is a
+    // sentinel distinct from every real outcome (a slot index, always
+    // >= 0, or -1 for spill). The FIRST sub-interval of a var_idx runs
+    // the full expire/allocate/spill logic below and records its
+    // outcome here; every LATER sub-interval of the SAME var_idx skips
+    // straight to that recorded outcome — this is what guarantees
+    // every sub-interval of a split variable agrees.
+    var_decided = buf_word(64);
+    vi2 = 0;
+    while (vi2 < 64) { *(var_decided + vi2 * 8) = -2; vi2++; }
+
     i = 0;
     while (i < n) {
         idx = arr_get(order, i);
         cur = arr_struct_at(intervals, idx);
+
+        decided = *(var_decided + cur.var_idx * 8);
+        if (decided != -2) {
+            // A later sub-interval of a variable already decided —
+            // the envelope reservation above already protects this
+            // slot through this exact point, so no fresh allocation,
+            // no expire/spill bookkeeping, just repeat the decision.
+            asn = arr_struct_at(assigns, arr_struct_alloc(assigns));
+            asn.var_idx = cur.var_idx;
+            asn.slot = decided;
+            i++;
+            continue;
+        }
 
         // EXPIRE: release any live active entry whose end_pos already
         // precedes this interval's start -- its slot is free again.
@@ -2152,7 +2216,7 @@ regalloc_linear_scan(intervals, budget) {
             asn.slot = slot;
             act = arr_struct_at(active, arr_struct_alloc(active));
             act.var_idx = cur.var_idx;
-            act.end_pos = cur.end_pos;
+            act.end_pos = *(envelope_end + cur.var_idx * 8);
             act.slot = slot;
             act.dead = 0;
         } else {
@@ -2177,12 +2241,15 @@ regalloc_linear_scan(intervals, budget) {
                 act = arr_struct_at(active, worst_k);
                 asn.slot = act.slot;
                 _rg_force_spill(assigns, worst_var);
+                *(var_decided + worst_var * 8) = -1;   // a later sub-interval of the SAME victim must also see spill
                 act.var_idx = cur.var_idx;
-                act.end_pos = cur.end_pos;
+                act.end_pos = *(envelope_end + cur.var_idx * 8);
             }
         }
+        *(var_decided + cur.var_idx * 8) = asn.slot;
         i++;
     }
+
     return assigns;
 }
 
@@ -2489,28 +2556,37 @@ regalloc_filter_intervals_by_type(intervals, var_forced_ty, want_float) {
 // ── Stage E support — is this function safe to wire up? ────────────
 //
 // A variable with live-range splitting can own several LiveInterval
-// entries (different sub-intervals, possibly different slots, never
-// overlapping in time). The chip-side swap (regalloc_apply) writes ONE
-// physical register per variable into cg_var_promote — there is no
-// codegen support today for moving a value between two different
-// registers at a split boundary. Rather than build that (separable
-// future work — Stage F territory, the same shape as coalescing),
-// Stage E simply refuses the swap for any function where splitting
-// happened at all, falling back to B3 entirely for that function.
-// Conservative, but correct: B3 never had this problem in the first
-// place (it has no notion of split ranges), so refusing is always
-// SAFE, only ever a missed opportunity.
-regalloc_has_any_split(intervals) {
-    auto n, i, it: LiveInterval, seen, vi;
-    n = arr_struct_count(intervals);
-    seen = arr_new();
+// entries (different sub-intervals, never overlapping in time).
+// regalloc_linear_scan's own envelope-reservation scheme (see its
+// header comment) now GUARANTEES every sub-interval of a split
+// variable lands on the identical slot (or all spill together) — the
+// chip-side swap (regalloc_apply) writes ONE physical register per
+// variable into cg_var_promote for the WHOLE function, and a split
+// variable is now indistinguishable from one that was never split at
+// all from Stage E's point of view. So this is no longer the primary
+// mechanism that makes the swap safe — it's a SAFETY NET: takes
+// Stage D's own output (`assigns`, NOT the raw intervals) and flags
+// only a genuine inconsistency, two RegAssign entries for the same
+// var_idx with DIFFERENT slots. With the envelope fix in place this
+// should never fire in practice; keeping the check means a future
+// regression in that logic still gets caught here instead of
+// silently corrupting output, the same defense-in-depth Stage E's
+// other gates (regalloc_compare_vs_b3,
+// regalloc_has_uncovered_mangled_promoted) already follow.
+regalloc_has_any_split(assigns) {
+    auto n, i, asn: RegAssign, seen_slot, vi;
+    n = arr_struct_count(assigns);
+    seen_slot = buf_word(64);
     vi = 0;
-    while (vi < 64) { seen = arr_push(seen, 0); vi++; }
+    while (vi < 64) { *(seen_slot + vi * 8) = -2; vi++; }   // -2 = not seen yet
     i = 0;
     while (i < n) {
-        it = arr_struct_at(intervals, i);
-        if (arr_get(seen, it.var_idx) != 0) { return 1; }
-        arr_set(seen, it.var_idx, 1);
+        asn = arr_struct_at(assigns, i);
+        if (*(seen_slot + asn.var_idx * 8) == -2) {
+            *(seen_slot + asn.var_idx * 8) = asn.slot;
+        } else if (*(seen_slot + asn.var_idx * 8) != asn.slot) {
+            return 1;
+        }
         i++;
     }
     return 0;

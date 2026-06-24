@@ -739,11 +739,33 @@ _a64_regalloc_apply_float(assigns) {
 // inside a loop (weight >= 1000) are worth a register; straight-line
 // constants stay inline.
 void _a64_b3_select_const() {
-    auto used, n, best_idx, best_wt, ci, reg;
-    used = arr_len(a64_promoted_regs);   // next free promotion slot after locals
+    auto slot, n, best_idx, best_wt, ci, reg, pi, pn, _taken;
+    // `arr_len(a64_promoted_regs)` used to stand in for "next free
+    // slot" back when every promotion claimed slots 0, 1, 2, ...
+    // strictly in order (B3's own one-pick-per-slot policy never
+    // skips one). RegAlloc v2's slot-sharing breaks that invariant:
+    // a variable's slot is decided by start_pos order, not by slot
+    // number, so a64_promoted_regs can legitimately contain (say)
+    // slots 0, 3, 1 with slot 2 never claimed at all. Treating its
+    // LENGTH as "the next numeric slot" would then hand out slot 2's
+    // physical register as if it were free when slot 3 is the one
+    // actually still open — colliding with whichever variable already
+    // holds it. Walk the slot space directly and skip any slot whose
+    // physical register is already in the promoted list.
+    slot = 0;
     n = arr_len(cg_const_val);
     while (1) {
-        reg = _a64_b3_reg_at(used);      // callee-saved, then caller-saved in a leaf
+        reg = _a64_b3_reg_at(slot);
+        while (reg >= 0) {
+            _taken = 0;
+            pn = arr_len(a64_promoted_regs);
+            for (pi = 0; pi < pn; pi++) {
+                if (arr_get(a64_promoted_regs, pi) == reg) { _taken = 1; pi = pn; }
+            }
+            if (_taken == 0) { break; }
+            slot++;
+            reg = _a64_b3_reg_at(slot);
+        }
         if (reg < 0) { return; }
         best_idx = -1;
         best_wt = 999;                   // threshold: only loop constants (>= 1000)
@@ -758,7 +780,7 @@ void _a64_b3_select_const() {
         arr_set(cg_const_reg, best_idx, reg);
         a64_promoted_regs = arr_push(a64_promoted_regs, reg);
         _a64_b3_claim_freelist(reg);
-        used++;
+        slot++;
     }
 }
 

@@ -2029,8 +2029,9 @@ static void parse_function(is_stub, is_static, is_void) {
     //    Two different non-entry modules both define the same function
     //    with real bodies, and neither is a driver. This is likely a
     //    bug. Emit E221.
-    auto _dup_idx, _dup_found;
+    auto _dup_idx, _dup_found, _real_dup_idx;
     _dup_found = 0;
+    _real_dup_idx = -1;
     for (_dup_idx = 0; _dup_idx < func_cnt; _dup_idx++) {
         if (packed_eq(*(funcs[_dup_idx] + FN_NAME), name_p)) {
             auto _existing_body;
@@ -2075,6 +2076,7 @@ static void parse_function(is_stub, is_static, is_void) {
             arr_set(fn_ret_arity, _dup_idx, ret_arity);
             arr_set(fn_ret_types, _dup_idx, ret_types);
             _dup_found = 1;
+            _real_dup_idx = _dup_idx;
             _dup_idx = func_cnt;
         }
     }
@@ -2088,6 +2090,25 @@ static void parse_function(is_stub, is_static, is_void) {
         fn_ret_hint   = arr_push(fn_ret_hint, ret_hint);
         fn_ret_arity  = arr_push(fn_ret_arity, ret_arity);
         fn_ret_types  = arr_push(fn_ret_types, ret_types);
+    } else {
+        // This call's own fn_vt_starts entry (pushed at function entry,
+        // before knowing whether this parse would turn out to be a
+        // cross-module duplicate) does NOT correspond to a new funcs
+        // slot -- funcs[_real_dup_idx] already existed and was just
+        // overwritten in place above. Point that EXISTING slot's start
+        // at THIS parse's variables (the real body just parsed, not
+        // whatever the earlier stub/forward-decl had) and drop the
+        // just-pushed entry, so fn_vt_starts stays index-aligned with
+        // funcs/func_cnt -- get_var_type_in_fn (and every
+        // cg_cur_fn_idx-based lookup downstream, including the bug
+        // debugger's struct-id resolution) indexes by funcs position,
+        // not by "the Nth parse_function call." Without this, every
+        // cross-module duplicate after the first permanently shifts
+        // fn_vt_starts one slot ahead of funcs, and get_var_type_in_fn
+        // silently searches the wrong function's variable range for
+        // every function parsed afterward.
+        arr_set(fn_vt_starts, _real_dup_idx, arr_get(fn_vt_starts, arr_len(fn_vt_starts) - 1));
+        arr_truncate(fn_vt_starts, arr_len(fn_vt_starts) - 1);
     }
 
     // Fix 2: enforce main() only in the entry file (module 0).
