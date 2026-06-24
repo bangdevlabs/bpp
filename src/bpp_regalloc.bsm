@@ -1805,28 +1805,57 @@ static _rg_is_mangled_inline_slot(var_names, vi) {
     return buf_eq(vbuf + unpack_s(nm), "_inl", 4);
 }
 
-// Stage E's own extra gate, beyond regalloc_compare_vs_b3: does THIS
-// function have any mangled inline slot B3 already promoted to a real
-// register? Excluding mangled slots from the comparison above only
-// keeps them from causing a false "regression" — it does NOT mean
-// linear-scan's own budget accounting knows about them. RegAlloc v2's
-// CFG/intervals are built from the caller's un-spliced body, so a
-// mangled slot's register is completely invisible to the linear-scan
-// that just ran — it can (and, on stb/stbfilter.bsm's moog_taps, did)
-// pick the SAME physical register for one of ITS OWN variables,
-// because nothing told it that slot was already spoken for. Found via
+// Does `vi` appear as the var_idx of any LiveInterval in `intervals`?
+// Linear scan — intervals per function are few enough that this is
+// cheap, and it only runs once per mangled-promoted variable, not per
+// statement.
+static _rg_var_in_intervals(intervals, vi) {
+    auto n, i, it: LiveInterval;
+    n = arr_struct_count(intervals);
+    i = 0;
+    while (i < n) {
+        it = arr_struct_at(intervals, i);
+        if (it.var_idx == vi) { return 1; }
+        i++;
+    }
+    return 0;
+}
+
+// Stage E's own extra gate, beyond regalloc_compare_vs_b3. The
+// original (now superseded — git log has its own header for the full
+// story) version refused the swap whenever B3 promoted ANY mangled
+// inline slot at all, full stop: RegAlloc v2's CFG/intervals used to
+// be built only from the caller's un-spliced body, so a mangled
+// slot's register was completely invisible to the linear-scan that
+// ran — it could (and, on stb/stbfilter.bsm's moog_taps, did) pick
+// the SAME physical register for one of its own variables, because
+// nothing told it that slot was already spoken for. Found via
 // `bug --disasm`: corrupted output (0.0 instead of a real filtered
-// value), no crash, no diagnostic — just silently wrong. Refusing the
-// swap entirely whenever B3 promoted ANY mangled slot is the safe
-// answer until inline splicing happens before this analysis instead
-// of after it (a pipeline reordering, not a quick fix).
-regalloc_has_mangled_promoted(b3_promote, var_names) {
+// value), no crash, no diagnostic — just silently wrong.
+//
+// The "RegAlloc v2 sees through inlined call sites" arc (this file's
+// own top header) has since taught Stage A to recursively expand a
+// wide and growing set of real inlined-call shapes (straight-line,
+// multi-statement, nested, multi-return, struct writes, switch-of-
+// returns) directly into real intervals for those mangled slots — so
+// the blanket refusal became needlessly conservative; most of the
+// real DSP chain's mangled slots ARE covered today. This function
+// refuses the swap only when a mangled slot B3 promoted genuinely has
+// NO interval anywhere in this function's analysis (neither pool) —
+// the actual signature of "this shape is still invisible to Stage A,"
+// not merely "this function happens to contain a mangled slot at
+// all." A mangled slot that DOES have a real interval was reached by
+// one of the expansion shapes this arc supports, and its liveness is
+// exactly as trustworthy as any native local's.
+regalloc_has_uncovered_mangled_promoted(b3_promote, var_names, ivl_int, ivl_flt) {
     auto n, vi;
     n = arr_len(b3_promote);
     vi = 0;
     while (vi < n) {
         if (arr_get(b3_promote, vi) >= 0 && _rg_is_mangled_inline_slot(var_names, vi) != 0) {
-            return 1;
+            if (_rg_var_in_intervals(ivl_int, vi) == 0 && _rg_var_in_intervals(ivl_flt, vi) == 0) {
+                return 1;
+            }
         }
         vi++;
     }
