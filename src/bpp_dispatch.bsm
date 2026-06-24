@@ -1538,6 +1538,368 @@ static _cgb_walk(nd) {
     return 0;
 }
 
+// Default worker count for the auto-injected job_init call (used by
+// both the early prescan below and the late post-hoc check further
+// down). Mirrors `_MS_DEFAULT_WORKERS` in bpp_maestro.bsm (same
+// number, duplicated for the same reason `_DSP_MAP_MIN_N` duplicates
+// `_OUTLINE_MIN_N` — this module reasons about the user program's
+// AST, it does not import the runtime module whose constant it
+// mirrors). Declared here, ahead of its first use — unlike a
+// function name, a `const` is plain textual substitution and must be
+// declared before the point it is used in the same module.
+const _DSP_DEFAULT_WORKERS = 4;
+
+// ── Early freeze-point prescan (closes the "auto job_init" loop) ────
+//
+// `_dsp_auto_init_job_pool` (further down, called from
+// `rewrite_dispatch_loops`) only helps a captureless MAP candidate
+// that `promote_globals` already accepted via Rule 4 (a PHASE_BASE
+// reader or writer) — rare, because most loop bodies with side
+// effects aren't PHASE_BASE. The far more common shape — a global
+// written ONLY by main() (Rule 3's "all writers are main, pre>0,
+// post==0" eligibility) — never reaches that point at all: Rule 3 is
+// gated on `_dsp_has_freeze`, which only becomes true once an
+// EXISTING literal call to job_init / maestro_run / maestro_configure
+// is found in main()'s body. Chicken-and-egg: the whole point of this
+// feature is to make that call unnecessary, but Rule 3 cannot promote
+// the global the candidate needs until the call already exists.
+//
+// This prescan runs BEFORE `call_graph_build` (and therefore before
+// its own freeze walk, `_dsp_walk_main_for_freeze`): a loose,
+// body-safety-free shape check — does ANY `@safe` function contain a
+// top-level ascending for-loop with a literal-step / `i < bound`
+// condition? If so, and main() does not already manage its own freeze
+// point, inject `job_init(_DSP_DEFAULT_WORKERS)` as the literal first
+// statement of main() right now. By the time `_dsp_walk_main_for_freeze`
+// runs moments later, it sees a real freeze marker and Rule 3 promotes
+// normally — no special-casing needed anywhere else downstream.
+//
+// Deliberately conservative in the SAFE direction, not the strict one:
+// a false positive here (an `@safe` loop that looks dispatchable but
+// later fails the real body-safety walk in `_fdc_try_candidate`) costs
+// nothing but 4 idle worker threads for the program's lifetime — every
+// real safety gate downstream (`promote_globals`, `_fdc_subtree_safe`,
+// the floor guards) still runs exactly as before and can reject
+// anything this loose scan let through. There is no correctness risk
+// in firing this prescan "too often," only a tiny, bounded, one-time
+// startup cost when it fires and nothing downstream actually uses it.
+
+// Pure loop-header shape check — step `i = i + K` (K > 0 literal) and
+// condition `i < bound` — with NO body inspection. Mirrors
+// `_fdc_try_candidate`'s steps A/B/C (further down) minus the parts
+// that need globals already classified, which is exactly what this
+// prescan runs before.
+static _dsp_prescan_loop_shape_ok(wh_p) {
+    auto (wh, cond, step): Node;
+    auto (cond_lhs, cond_rhs): Node;
+    auto (step_lhs, step_rhs, step_rhs_l, step_rhs_r): Node;
+    wh = wh_p;
+    if (wh.e == 0) { return 0; }
+    step = wh.e;
+    if (step.ntype != T_ASSIGN) { return 0; }
+    step_lhs = step.a;
+    if (step_lhs.ntype != T_VAR) { return 0; }
+    step_rhs = step.b;
+    if (step_rhs.ntype != T_BINOP) { return 0; }
+    if (_fdc_op_char(step_rhs.a) != '+') { return 0; }
+    step_rhs_l = step_rhs.b;
+    step_rhs_r = step_rhs.c;
+    if (step_rhs_l.ntype != T_VAR) { return 0; }
+    if (step_rhs_r.ntype != T_LIT) { return 0; }
+    if (_fdc_is_int_lit(step_rhs_r.a) == 0) { return 0; }
+    if (parse_int_lit_value(step_rhs_r.a) <= 0) { return 0; }
+    cond = wh.a;
+    if (cond.ntype != T_BINOP) { return 0; }
+    if (_fdc_op_char(cond.a) != '<') { return 0; }
+    cond_lhs = cond.b;
+    cond_rhs = cond.c;
+    if (cond_lhs.ntype != T_VAR) { return 0; }
+    if (cond_rhs.ntype != T_LIT) {
+        if (cond_rhs.ntype != T_VAR) { return 0; }
+    }
+    if (_dsp_prescan_body_has_nested_loop(wh)) { return 0; }
+    return 1;
+}
+
+// True if `nd`'s subtree contains a T_WHILE or T_SWITCH anywhere
+// inside it. A nested loop inside a dispatch candidate's body is a
+// KNOWN, documented MVP limitation (how_to_dev_b++.md §5.6: "The body
+// has no nested loops...") — `_fdc_subtree_safe` (further down)
+// unconditionally rejects it via its own `T_WHILE, T_SWITCH { return
+// 0; }` case. Mirrored here so both the prescan and the W033 warning
+// below treat it the same documented way: never a candidate, never a
+// surprise worth a diagnostic. `mixer_fill` (stb/stbmixer.bsm) is the
+// worked example — its outer per-sample loop wraps an inner
+// per-voice loop, by design, and was never going to qualify.
+static _dsp_subtree_has_nested_loop(nd) {
+    auto (n): Node;
+    auto t, i, arr, cnt;
+    if (nd == 0) { return 0; }
+    n = nd;
+    t = n.ntype;
+    if (t == T_WHILE) { return 1; }
+    if (t == T_SWITCH) { return 1; }
+    if (t == T_IF) {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) {
+            if (_dsp_subtree_has_nested_loop(arr[i])) { return 1; }
+        }
+        if (n.e > 0) {
+            arr = n.d; cnt = n.e;
+            for (i = 0; i < cnt; i++) {
+                if (_dsp_subtree_has_nested_loop(arr[i])) { return 1; }
+            }
+        }
+        return 0;
+    }
+    if (t == T_BLOCK) {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) {
+            if (_dsp_subtree_has_nested_loop(arr[i])) { return 1; }
+        }
+        return 0;
+    }
+    return 0;
+}
+
+// Walks `wh_p`'s (a T_WHILE node) own body statements for a nested
+// loop — see `_dsp_subtree_has_nested_loop` above for why this
+// disqualifies a candidate unconditionally.
+static _dsp_prescan_body_has_nested_loop(wh_p) {
+    auto (wh): Node;
+    auto i, body_arr, body_cnt;
+    wh = wh_p;
+    body_arr = wh.b;
+    body_cnt = wh.c;
+    for (i = 0; i < body_cnt; i++) {
+        if (_dsp_subtree_has_nested_loop(body_arr[i])) { return 1; }
+    }
+    return 0;
+}
+
+// Returns the funcs[] index of the first `@safe` function containing
+// a top-level loop matching the shape above, or -1 if none qualifies.
+// `fn_phase_hint` is populated by the PARSER at parse time (the
+// `@safe` annotation itself), so it is already valid here — no
+// analysis pass has to run first. The caller needs the INDEX (not
+// just a yes/no) so it can find where main() first calls this
+// specific host and inject the freeze marker right there — see
+// `prescan_inject_job_init`'s own header comment for why position
+// matters.
+static _dsp_prescan_find_safe_loop_host() {
+    auto i, fn_rec, body_arr, body_cnt, j, stmt: Node;
+    for (i = 0; i < func_cnt; i++) {
+        if (arr_get(fn_phase_hint, i) != PHASE_SAFE) { continue; }
+        fn_rec = funcs[i];
+        body_arr = *(fn_rec + FN_BODY);
+        body_cnt = *(fn_rec + FN_BCNT);
+        if (body_arr == 0) { continue; }
+        for (j = 0; j < body_cnt; j++) {
+            stmt = body_arr[j];
+            if (stmt != 0) {
+                if (stmt.ntype == T_WHILE) {
+                    if (_dsp_prescan_loop_shape_ok(stmt)) { return i; }
+                }
+            }
+        }
+    }
+    return -1;
+}
+
+// True if `nd`'s expression subtree contains a direct call to the
+// function named `target_name_p`, anywhere within it — covers a bare
+// expression-statement call, a call nested inside an assignment's
+// right-hand side, inside a binop, inside a condition, etc. Used to
+// find the first top-level statement in main() that actually invokes
+// a dispatch-candidate host, so the injected job_init lands right
+// before real usage starts instead of before the program's own setup
+// work (see `prescan_inject_job_init`).
+static _dsp_subtree_calls_fn(nd, target_name_p) {
+    auto (n): Node;
+    auto t, i, arr, cnt;
+    if (nd == 0) { return 0; }
+    n = nd;
+    t = n.ntype;
+    if (t == T_CALL) {
+        if (packed_eq(n.a, target_name_p)) { return 1; }
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) {
+            if (_dsp_subtree_calls_fn(arr[i], target_name_p)) { return 1; }
+        }
+        return 0;
+    }
+    if (t == T_ASSIGN) {
+        if (_dsp_subtree_calls_fn(n.a, target_name_p)) { return 1; }
+        return _dsp_subtree_calls_fn(n.b, target_name_p);
+    }
+    if (t == T_BINOP) {
+        if (_dsp_subtree_calls_fn(n.b, target_name_p)) { return 1; }
+        return _dsp_subtree_calls_fn(n.c, target_name_p);
+    }
+    if (t == T_TERNARY) {
+        if (_dsp_subtree_calls_fn(n.a, target_name_p)) { return 1; }
+        if (_dsp_subtree_calls_fn(n.b, target_name_p)) { return 1; }
+        return _dsp_subtree_calls_fn(n.c, target_name_p);
+    }
+    if (t == T_UNARY) { return _dsp_subtree_calls_fn(n.b, target_name_p); }
+    if (t == T_MEMLD) { return _dsp_subtree_calls_fn(n.a, target_name_p); }
+    if (t == T_MEMST) {
+        if (_dsp_subtree_calls_fn(n.a, target_name_p)) { return 1; }
+        return _dsp_subtree_calls_fn(n.b, target_name_p);
+    }
+    if (t == T_ADDR) { return _dsp_subtree_calls_fn(n.a, target_name_p); }
+    if (t == T_RET)  { return _dsp_subtree_calls_fn(n.a, target_name_p); }
+    if (t == T_IF) {
+        if (_dsp_subtree_calls_fn(n.a, target_name_p)) { return 1; }
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) {
+            if (_dsp_subtree_calls_fn(arr[i], target_name_p)) { return 1; }
+        }
+        if (n.e > 0) {
+            arr = n.d; cnt = n.e;
+            for (i = 0; i < cnt; i++) {
+                if (_dsp_subtree_calls_fn(arr[i], target_name_p)) { return 1; }
+            }
+        }
+        return 0;
+    }
+    if (t == T_WHILE) {
+        if (_dsp_subtree_calls_fn(n.a, target_name_p)) { return 1; }
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) {
+            if (_dsp_subtree_calls_fn(arr[i], target_name_p)) { return 1; }
+        }
+        if (n.e != 0) { return _dsp_subtree_calls_fn(n.e, target_name_p); }
+        return 0;
+    }
+    if (t == T_BLOCK) {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) {
+            if (_dsp_subtree_calls_fn(arr[i], target_name_p)) { return 1; }
+        }
+        return 0;
+    }
+    return 0;
+}
+
+// True if `main_idx`'s CURRENT body already contains a top-level call
+// to maestro_run / maestro_configure / job_init — the program manages
+// its own freeze point and this prescan must leave it alone. job_init
+// is idempotent, but injecting AHEAD of a deliberate non-default
+// `job_init(N)` / `maestro_configure(...)` call would silently make
+// OUR call win the race and discard the program's own worker-count
+// choice.
+static _dsp_main_already_has_freeze_call(main_idx) {
+    auto fn_rec, body_arr, body_cnt, j, stmt: Node, name_p, l;
+    fn_rec = funcs[main_idx];
+    body_arr = *(fn_rec + FN_BODY);
+    body_cnt = *(fn_rec + FN_BCNT);
+    if (body_arr == 0) { return 0; }
+    for (j = 0; j < body_cnt; j++) {
+        stmt = body_arr[j];
+        if (stmt != 0) {
+            if (stmt.ntype == T_CALL) {
+                name_p = stmt.a;
+                l = unpack_l(name_p);
+                if (l == 11) {
+                    if (buf_eq(vbuf + unpack_s(name_p), "maestro_run", 11)) { return 1; }
+                }
+                if (l == 17) {
+                    if (buf_eq(vbuf + unpack_s(name_p), "maestro_configure", 17)) { return 1; }
+                }
+                if (l == 8) {
+                    if (buf_eq(vbuf + unpack_s(name_p), "job_init", 8)) { return 1; }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// Finds main()'s funcs[] slot independently of `_dsp_main_idx` (which
+// `call_graph_build`, called right after this prescan, has not set
+// yet — this prescan must run standalone, before anything else).
+static _dsp_prescan_find_main_idx() {
+    auto i, fname;
+    for (i = 0; i < func_cnt; i++) {
+        fname = *(funcs[i] + FN_NAME);
+        if (unpack_l(fname) == 4) {
+            if (buf_eq(vbuf + unpack_s(fname), "main", 4)) { return i; }
+        }
+    }
+    return -1;
+}
+
+// Entry point — called once, right before `call_graph_build`, from
+// both the modular and monolithic pipelines in bpp.bpp.
+void prescan_inject_job_init() {
+    auto main_idx, ji_idx, ji_name, fn_rec, body_arr, body_cnt, new_body, i;
+    auto call_node: Node, args_arr, lit_n: Node;
+    auto host_idx, host_name, insert_at, stmt: Node;
+
+    main_idx = _dsp_prescan_find_main_idx();
+    if (main_idx < 0) { return; }
+    if (_dsp_main_already_has_freeze_call(main_idx)) { return; }
+
+    host_idx = _dsp_prescan_find_safe_loop_host();
+    if (host_idx < 0) { return; }
+
+    ji_name = _dsp_pack_name("job_init", 8);
+    ji_idx = _dsp_find_func_idx(ji_name);
+    if (ji_idx < 0) { return; }   // bpp_job.bsm somehow absent — nothing to call
+
+    lit_n = _dsp_make_int_lit(_DSP_DEFAULT_WORKERS);
+    args_arr = malloc(8);
+    *(args_arr) = lit_n;
+    call_node = make_node(T_CALL);
+    call_node.a = ji_name;
+    call_node.b = args_arr;
+    call_node.c = 1;
+
+    fn_rec = funcs[main_idx];
+    body_arr = *(fn_rec + FN_BODY);
+    body_cnt = *(fn_rec + FN_BCNT);
+
+    // Find the first top-level statement in main() that calls the
+    // dispatch-candidate host (directly, or nested inside an
+    // expression), and insert job_init immediately BEFORE it — not
+    // before everything. promote_globals's Rule 3 needs main()'s own
+    // setup writes (allocations, etc.) that run earlier to still
+    // count as "pre-freeze"; injecting at position 0 unconditionally
+    // would push those writes into the "post-freeze" bucket instead
+    // and defeat the exact promotion this feature exists to unlock.
+    // Falls back to position 0 only when the host is never called
+    // from a top-level statement in main (called indirectly, nested
+    // deeper, via fn_ptr, or unreachable from main directly) — still
+    // strictly better than not injecting at all.
+    host_name = *(funcs[host_idx] + FN_NAME);
+    insert_at = 0;
+    for (i = 0; i < body_cnt; i++) {
+        stmt = body_arr[i];
+        if (stmt != 0) {
+            if (_dsp_subtree_calls_fn(stmt, host_name)) {
+                insert_at = i;
+                i = body_cnt;
+            }
+        }
+    }
+
+    new_body = malloc((body_cnt + 1) * 8);
+    for (i = 0; i < insert_at; i++) {
+        *(new_body + i * 8) = body_arr[i];
+    }
+    *(new_body + insert_at * 8) = call_node;
+    for (i = insert_at; i < body_cnt; i++) {
+        *(new_body + (i + 1) * 8) = body_arr[i];
+    }
+    *(fn_rec + FN_BODY) = new_body;
+    *(fn_rec + FN_BCNT) = body_cnt + 1;
+    // No fn_calls edge-wiring here on purpose: call_graph_build's own
+    // per-function walk (which runs right after this returns) will
+    // visit the injected call naturally while it walks main()'s body
+    // for the first time, exactly as if the programmer had written it.
+}
+
 // Build the call graph for every parsed function. Populates fn_calls[],
 // fn_address_taken[], fn_locally_impure[] in lockstep with funcs[].
 // ALSO populates the per-global use-def arrays (glob_writers, glob_readers)
@@ -3961,6 +4323,92 @@ void find_dispatch_candidates() {
     }
 }
 
+// True if `wh_p` (a T_WHILE node) is one of the accepted entries in
+// `dispatch_candidates`. Linear scan — the candidate list is small
+// (a handful of loops per program, not thousands), so this is cheap
+// relative to the AST walk that built it.
+static _dsp_while_in_candidates(wh_p) {
+    auto k, n;
+    n = arr_len(dispatch_candidates);
+    for (k = 0; k < n; k++) {
+        if (arr_get(dispatch_candidates, k) == wh_p) { return 1; }
+    }
+    return 0;
+}
+
+// W033 — an `@safe` function contains a loop shaped for auto-dispatch
+// (same loose, body-safety-free shape check as the prescan above:
+// ascending `i = i + K` with K > 0 literal, condition `i < bound`)
+// that never made it into `dispatch_candidates` at all. The `@safe`
+// annotation promised "this loop can run on a worker"; something in
+// the body (a global `promote_globals` did not promote, an impure
+// call, an unsupported sub-shape) silently kept it serial, and
+// without this warning the only way to learn that was to already know
+// to pass `--dispatch` — exactly the trap `bench_autovec_compute.bpp`
+// fell into (`[dispatch] 0 candidate loop(s)`, discovered only by
+// disassembly, not by any compiler feedback).
+//
+// Deliberately does NOT fire for a loop that WAS accepted into
+// `dispatch_candidates` and a later stage chose to keep it serial on
+// purpose — the N-below-floor guards in `rewrite_dispatch_loops`
+// (`_DSP_MAP_MIN_N`, `_OUTLINE_MIN_N`) are the compiler correctly
+// deciding dispatch isn't worth it for a small trip count, not a bug
+// to report. Only "never became a candidate at all" is in scope —
+// per Tonify Rule 28, a diagnostic earns its keep by catching one
+// specific, well-understood class of surprise, not by flagging every
+// loop the optimizer declined to touch.
+//
+// ALSO skips any function whose address is taken (`fn_address_taken`)
+// — that means it's already registered as a callback / job target
+// elsewhere (CoreAudio's `fn_ptr(_aud_square_cb)`, `job_submit(fn_ptr
+// (particle_base_job), ...)`), so `@safe` there is doing the W026
+// bounded-contract job, not promising "this loop gets auto-dispatched."
+// Real, audited examples this exclusion was written FOR: both
+// `_stb_audio_macos.bsm` callbacks and `games/snake/particles.bsm`'s
+// `particle_base_job` — confirmed false positives during this
+// feature's own verification pass, not a hypothetical.
+void warn_unfired_safe_loops() {
+    auto i, fn_rec, body_arr, body_cnt, j, stmt: Node;
+    for (i = 0; i < func_cnt; i++) {
+        if (arr_get(fn_phase_hint, i) != PHASE_SAFE) { continue; }
+        if (arr_get(fn_address_taken, i) != 0) { continue; }
+        fn_rec = funcs[i];
+        body_arr = *(fn_rec + FN_BODY);
+        body_cnt = *(fn_rec + FN_BCNT);
+        if (body_arr == 0) { continue; }
+        for (j = 0; j < body_cnt; j++) {
+            stmt = body_arr[j];
+            if (stmt != 0) {
+                if (stmt.ntype == T_WHILE) {
+                    if (_dsp_prescan_loop_shape_ok(stmt)) {
+                        if (_dsp_while_in_candidates(stmt) == 0) {
+                            diag_warn(33);
+                            diag_str("'@safe' function '");
+                            diag_packed(*(fn_rec + FN_NAME));
+                            diag_str("' has a loop shaped for auto-dispatch but it never qualified");
+                            diag_newline();
+                            diag_loc(*(fn_rec + FN_SRC_TOK));
+                            diag_show_line(*(fn_rec + FN_SRC_TOK));
+                            diag_str("  = note: the loop's step/condition shape matched, but its body");
+                            diag_newline();
+                            diag_str("          was rejected (an unpromoted global, an impure call, or");
+                            diag_newline();
+                            diag_str("          an unsupported sub-shape)");
+                            diag_newline();
+                            diag_str("  = help: run `bpp --dispatch` for the full candidate list and");
+                            diag_newline();
+                            diag_str("          `--show-promotions` to see which global blocked it");
+                            diag_newline();
+                            diag_str("  = see:  docs/manual/how_to_dev_b++.md Section 5.6 (outlining)");
+                            diag_newline();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Print the dispatch-candidate list to stderr. Triggered by the flag
 // `--dispatch`. Pure visibility for Stage 1 — no code generation
 // changes, the programmer simply sees which loops Stage 2 will
@@ -4973,6 +5421,90 @@ static _dsp_pack_cstr(s) {
 static extrn _dsp_red_k_p;
 static extrn _dsp_red_ci_p;
 
+// Mirrors `_OUTLINE_MIN_N` in src/bpp_job.bsm (keep the two in sync —
+// duplicated rather than imported because this module reasons about
+// the USER PROGRAM's AST at compile time, not the runtime symbol).
+// The captureless MAP rewrite below has no chunked variant: it always
+// dispatches through `job_parallel_for`, which submits ONE job PER
+// ITERATION (Shape B in bpp_job.bsm's synth contract) — fine for the
+// explicit user-facing API where each iteration is substantial work,
+// but catastrophic for an auto-detected loop with a small trip count
+// called repeatedly (every per-element submit pays full SPSC-queue
+// overhead with nothing to amortize it against). Below this floor,
+// leave the loop serial instead of rewriting it — exactly the same
+// protection `_outline_dispatch` already gives the captured-outlining
+// path. Found via bench_autovec_compute.bpp: N=32768, called 6000
+// times, ran 51.5s dispatched vs ~135ms serial — a ~380x regression
+// from "parallelizing" a loop too small to amortize the dispatch cost.
+const _DSP_MAP_MIN_N = 524288;
+
+// Auto-injects `job_init(_DSP_DEFAULT_WORKERS)` as the FIRST statement
+// of main() when smart-dispatch rewrote at least one loop into a real
+// worker-pool call (job_parallel_for / job_parallel_for_data /
+// job_parallel_reduce) but the program never established its own
+// freeze point. Without this, `@safe` + an eligible loop compiles to
+// a dispatch call that silently runs serial forever (job_init was
+// never called, so `_job_inited == 0` and every dispatch helper's own
+// fallback kicks in) — correct, but defeats the entire point of
+// writing `@safe` in the first place, with zero feedback to the
+// programmer. This mirrors what `maestro_run()` already does for
+// itself unconditionally (`job_init(_ms_n_workers)`, bpp_maestro.bsm
+// :172, spawned before anything else runs) — the same "write @safe
+// + a normal loop, the compiler does the rest" principle as `auto`
+// for variables and the auto-injected prelude.
+//
+// Front-loaded as the literal first statement for the same reason
+// maestro_run front-loads it: on macOS, NSApplication's single- to
+// multi-thread transition breaks if pthread_create runs after
+// NSApplication is already up, so workers must spawn before any
+// window/GPU/audio init the rest of main() might do.
+//
+// Caller (`rewrite_dispatch_loops`) only invokes this when
+// `_dsp_has_freeze == 0` — if the program already calls job_init /
+// maestro_run / maestro_configure itself (perhaps with a deliberately
+// non-default worker count), that check skips this entirely. Without
+// it, job_init's own idempotency ("calling twice is a no-op") would
+// make whichever call runs FIRST win, silently discarding a
+// deliberate explicit worker count.
+static void _dsp_auto_init_job_pool() {
+    auto ji_idx, ji_name, fn_rec, body_arr, body_cnt, new_body, i;
+    auto call_node: Node, args_arr, lit_n: Node, callees;
+
+    ji_name = _dsp_pack_name("job_init", 8);
+    ji_idx = _dsp_find_func_idx(ji_name);
+    if (ji_idx < 0) { return; }   // bpp_job.bsm not imported — nothing to call
+
+    lit_n = _dsp_make_int_lit(_DSP_DEFAULT_WORKERS);
+    args_arr = malloc(8);
+    *(args_arr) = lit_n;
+    call_node = make_node(T_CALL);
+    call_node.a = ji_name;
+    call_node.b = args_arr;
+    call_node.c = 1;
+
+    fn_rec = funcs[_dsp_main_idx];
+    body_arr = *(fn_rec + FN_BODY);
+    body_cnt = *(fn_rec + FN_BCNT);
+
+    new_body = malloc((body_cnt + 1) * 8);
+    *(new_body) = call_node;
+    for (i = 0; i < body_cnt; i++) {
+        *(new_body + 8 + i * 8) = body_arr[i];
+    }
+    *(fn_rec + FN_BODY) = new_body;
+    *(fn_rec + FN_BCNT) = body_cnt + 1;
+
+    // Wire the new edge so the caller's mark_reachable() (which runs
+    // right after this) sees job_init as reachable from main.
+    callees = arr_get(fn_calls, _dsp_main_idx);
+    if (callees == 0) {
+        callees = arr_new();
+        arr_set(fn_calls, _dsp_main_idx, callees);
+    }
+    callees = arr_push(callees, ji_idx);
+    arr_set(fn_calls, _dsp_main_idx, callees);
+}
+
 // Transform every candidate loop into a call to job_parallel_for and
 // wire the new edges so mark_reachable sees the synth function and
 // the job runtime as reachable. Runs after synthesize_loop_fn.
@@ -4980,7 +5512,8 @@ void rewrite_dispatch_loops() {
     auto n, i, wh: Node, src_fi, bound_n, synth_idx, synth_name;
     auto jpf_name, fnptr_name, jpf_idx, jpr_idx, runtime_idx;
     auto fnptr_call: Node, synth_var: Node, args_arr, inner_args_arr;
-    auto callees;
+    auto callees, _any_dispatched;
+    _any_dispatched = 0;
 
     n = arr_len(dispatch_candidates);
     if (n == 0) { return; }
@@ -5174,6 +5707,22 @@ void rewrite_dispatch_loops() {
                 }
             }
             if (_did_outline == 0) {
+                // Floor guard (see _DSP_MAP_MIN_N above): a literal bound
+                // below the floor stays serial — job_parallel_for's
+                // per-iteration submit cost is not worth paying when the
+                // trip count can't amortize it. Non-literal bounds (a
+                // "stable global" per Rule 38) keep today's unguarded
+                // behaviour; teaching this path a runtime check too is
+                // tracked future work, not part of this fix.
+                auto _bn: Node;
+                _bn = bound_n;
+                if (_bn.ntype == T_LIT) {
+                    if (_fdc_is_int_lit(_bn.a)) {
+                        if (parse_int_lit_value(_bn.a) < _DSP_MAP_MIN_N) {
+                            continue;
+                        }
+                    }
+                }
                 // Standard MAP rewrite — no captures.
                 synth_var = make_node(T_VAR);
                 synth_var.a = synth_name;
@@ -5209,6 +5758,17 @@ void rewrite_dispatch_loops() {
         }
         callees = arr_push(callees, runtime_idx);
         arr_set(fn_calls, src_fi, callees);
+        _any_dispatched++;
+    }
+
+    // Auto-init the worker pool (see _dsp_auto_init_job_pool's own
+    // header comment) when at least one candidate above actually
+    // turned into a worker-pool call AND the program never set up
+    // its own freeze point. The autovec in-place rewrite (`continue`d
+    // before reaching the edge-recording block above) never counts
+    // here — it needs no worker pool at all.
+    if (_any_dispatched > 0 && _dsp_has_freeze == 0 && _dsp_main_idx >= 0) {
+        _dsp_auto_init_job_pool();
     }
 
     // Rebuild reachability. Seeds include every address-taken
