@@ -98,6 +98,19 @@ global rg_continue_stack;  // arr_new() of block indices (continue targets)
 // deeper than the top.
 global rg_inline_stack;
 
+// Parallel to rg_inline_stack: how many of the current frame's own
+// nested inlined calls have already been consumed. A NESTED call's
+// T_CALL node NEVER carries a real id in `.e` — `_inline_register_nested`
+// (bpp_dispatch.bsm) explicitly never stamps the shared callee body,
+// only the splice-time CLONE does. Pre-reg instead recorded the
+// sequence of nested ids in `_inline_nested_ids[outer_id]`, in the
+// exact left-to-right discovery order `_inline_find_nested_calls`
+// walks the body — the same protocol `_cg_inline_splice_prelude`/
+// `_inline_stamp_nested` already consume positionally at emission
+// time, reused verbatim here rather than reinvented. See
+// _rg_callsite_id_for's own comment for the consumer.
+global rg_inline_nk_stack;
+
 // Initialize the regalloc module. Call once at startup, mirroring
 // init_dispatch()'s own convention — the real per-function state is set
 // fresh by regalloc_build_cfg every time, so this just establishes safe
@@ -108,6 +121,7 @@ void init_regalloc() {
     rg_break_stack = arr_new();
     rg_continue_stack = arr_new();
     rg_inline_stack = arr_new();
+    rg_inline_nk_stack = arr_new();
 }
 
 // Allocate a fresh, empty block in the function currently under
@@ -281,9 +295,16 @@ static _rg_clone_translate(nd) {
 // to "undo" a partial expansion if a later statement disqualifies it.
 // Every statement BEFORE the trailing T_RET must be a plain
 // single-target T_DECL or T_ASSIGN (the callee's own locals) — no
-// control flow, no T_CALL anywhere (still rejected: a nested inlined
-// call needs its own frame pushed mid-walk, which is Phase 3b, not
-// this increment).
+// control flow anywhere. A local's RHS may itself be a T_CALL at the
+// EXPRESSION ROOT (`a = flt_onepole_tick(...)`, moog_taps's own
+// shape) as long as THAT call is itself recursively expandable
+// (_rg_is_expandable_inline_assign, mutual recursion with this
+// function — bounded by the inliner's own finite nesting depth, never
+// a real function-recursion cycle since the inliner already rejects
+// recursive functions outright). A call buried deeper inside a larger
+// expression (`x + flt_onepole_tick(...)`) is still rejected — that
+// shape needs splicing a sub-expression's result mid-expression, a
+// separate increment from "the whole RHS IS the call".
 static _rg_inline_body_is_straightline(body_arr, body_cnt) {
     auto i, n: Node;
     if (body_cnt < 1) { return 0; }
@@ -295,7 +316,15 @@ static _rg_inline_body_is_straightline(body_arr, body_cnt) {
         if (n.ntype != T_ASSIGN) { return 0; }
         if (n.d > 1) { return 0; }                  // multi-target local — later increment
         if (n.a == 0 || n.a.ntype != T_VAR) { return 0; }
-        if (_rg_expr_has_call(n.b)) { return 0; }
+        if (n.b != 0 && n.b.ntype == T_CALL) {
+            // Recursing FROM here means this statement belongs to
+            // some OTHER callee's body — always a nested context, by
+            // definition. See _rg_is_expandable_inline_assign's own
+            // comment for why this matters (.e is meaningless here).
+            if (_rg_is_expandable_inline_assign(n, 1) == 0) { return 0; }
+        } else if (_rg_expr_has_call(n.b)) {
+            return 0;
+        }
         i++;
     }
     n = body_arr[body_cnt - 1];
@@ -331,13 +360,17 @@ static _rg_expr_has_call(nd) {
 // fresh declaration would add nothing), then synthesize the final
 // assignment into `dest_var_node` (the T_VAR the original call's
 // result was being assigned to) from the callee's cloned+translated
-// return expression. Caller (_rg_build_stmt) has already confirmed
-// eligibility via _rg_inline_body_is_straightline.
-static void _rg_expand_inline_straightline(call_node, dest_var_node) {
-    auto id, fidx, fn_rec, params, pcnt, body_arr, body_cnt;
+// return expression. Caller (_rg_build_stmt or this same function,
+// recursing for a nested call) has already confirmed eligibility via
+// _rg_inline_body_is_straightline and resolved `id` — the caller's
+// job, never this function's, since a TOP-LEVEL call site's id lives
+// in call_node.e while a NESTED one never does (see
+// _rg_callsite_id_for's own comment for why) — this function does not
+// care which source it came from.
+static void _rg_expand_inline_straightline(call_node, dest_var_node, id) {
+    auto fidx, fn_rec, params, pcnt, body_arr, body_cnt;
     auto args, argc, i, param_name, mangled, slot_var: Node, arg_expr, translated_arg;
-    auto bind_n: Node, n: Node, last: Node, final_n: Node, local_n: Node;
-    id = call_node.e;
+    auto bind_n: Node, n: Node, last: Node, final_n: Node, local_n: Node, nested_id;
     fidx = find_func_idx(call_node.a);
     fn_rec = funcs[fidx];
     params = *(fn_rec + FN_PARS);
@@ -374,15 +407,29 @@ static void _rg_expand_inline_straightline(call_node, dest_var_node) {
     // T_ASSIGN resolve through the callee's mangled slots. T_DECL
     // carries no value to translate — its slot is already registered.
     rg_inline_stack = arr_push(rg_inline_stack, id);
+    rg_inline_nk_stack = arr_push(rg_inline_nk_stack, 0);
     i = 0;
     while (i < body_cnt - 1) {
         n = body_arr[i];
         if (n.ntype == T_ASSIGN) {
-            local_n = make_node(T_ASSIGN);
-            local_n.a = _rg_clone_translate(n.a);
-            local_n.b = _rg_clone_translate(n.b);
-            local_n.d = 0;
-            _rg_emit(local_n);
+            nested_id = -1;
+            if (n.b != 0 && n.b.ntype == T_CALL) { nested_id = _rg_callsite_id_for(n.b); }
+            if (nested_id >= 0) {
+                // A nested inlined call (moog_taps's own shape: 4
+                // calls to flt_onepole_tick) — recurse with the SAME
+                // outer frame still on top, so the nested call's own
+                // arguments translate through THIS callee's mangled
+                // slots, exactly as a real evaluation order would.
+                // The recursive call pushes/pops its OWN frame for
+                // the nested callee around its own body.
+                _rg_expand_inline_straightline(n.b, _rg_clone_translate(n.a), nested_id);
+            } else {
+                local_n = make_node(T_ASSIGN);
+                local_n.a = _rg_clone_translate(n.a);
+                local_n.b = _rg_clone_translate(n.b);
+                local_n.d = 0;
+                _rg_emit(local_n);
+            }
         }
         i++;
     }
@@ -399,22 +446,105 @@ static void _rg_expand_inline_straightline(call_node, dest_var_node) {
         _rg_emit(final_n);
     }
     arr_pop(rg_inline_stack);
+    arr_pop(rg_inline_nk_stack);
+}
+
+// Resolve the callsite id to use for expanding `call_node`, or -1 if
+// it isn't (or can no longer be confirmed as) an inlined call site at
+// all. At the TOP level (rg_inline_stack empty), the id is whatever
+// the caller's own real AST already carries in call_node.e —
+// _inline_register_callsite stamped it directly, since the caller's
+// body is never shared with anyone else.
+//
+// Inside an active expansion, call_node IS a node from a callee's
+// SHARED canonical body (read from funcs[fidx], never cloned) — and
+// _inline_register_nested explicitly never stamps `.e` there (only a
+// splice-time CLONE gets that treatment, via _inline_stamp_nested).
+// So `.e` is always 0 here, useless for detection. Instead: confirm
+// this T_CALL genuinely qualifies as a registered nested call (the
+// EXACT eligibility test _inline_find_nested_calls itself applies —
+// fn_inlineable plus the same "multi-stmt or tier-2" gate), then
+// consume the next id from the current frame's own sequence
+// (_rg_next_nested_id) — the same `_inline_nested_ids[outer_id]`
+// positional-consumption protocol _cg_inline_splice_prelude/
+// _inline_stamp_nested already use at emission time, never
+// reinvented. The order this function is called in, across one
+// callee's body, MUST match _inline_find_nested_calls' own
+// left-to-right discovery order — true today because Phase 3b only
+// recognizes a call at a statement's RHS root, processed in the same
+// order the body's own statements are walked.
+static _rg_callsite_id_for(call_node) {
+    auto fidx, fn_rec2, callee_bcnt2;
+    if (arr_len(rg_inline_stack) == 0) {
+        return (call_node.e > 0) ? call_node.e : -1;
+    }
+    fidx = find_func_idx(call_node.a);
+    if (fidx < 0 || arr_get(fn_inlineable, fidx) == 0) { return -1; }
+    fn_rec2 = funcs[fidx];
+    callee_bcnt2 = *(fn_rec2 + FN_BCNT);
+    if (callee_bcnt2 <= 1 && arr_get(fn_inlineable, fidx) != 2) { return -1; }
+    return _rg_next_nested_id();
+}
+
+// Consume and return the current (topmost) frame's next nested-call
+// id, or -1 if its sequence is exhausted (shouldn't happen if
+// _rg_callsite_id_for's own eligibility check agrees with what
+// pre-reg actually discovered — both walk the same shared body with
+// the same case list, so they can't disagree).
+static _rg_next_nested_id() {
+    auto top_idx, outer_id, nk, nested_ids, result;
+    top_idx = arr_len(rg_inline_stack) - 1;
+    outer_id = arr_get(rg_inline_stack, top_idx);
+    nk = arr_get(rg_inline_nk_stack, top_idx);
+    if (outer_id >= arr_len(_inline_nested_ids)) { return -1; }
+    nested_ids = arr_get(_inline_nested_ids, outer_id);
+    if (nested_ids == 0 || nk >= arr_len(nested_ids)) { return -1; }
+    result = arr_get(nested_ids, nk);
+    arr_set(rg_inline_nk_stack, top_idx, nk + 1);
+    return result;
 }
 
 // Is `nd` a T_ASSIGN whose RHS is directly an inlined call site this
 // stage knows how to expand (single target, single-statement RHS —
 // the shape every real flt_onepole_tick-style call site takes)?
-static _rg_is_expandable_inline_assign(nd) {
-    auto n: Node, rhs: Node, fidx, fn_rec, body_arr, body_cnt;
+//
+// `is_nested` distinguishes the two contexts this is called from
+// (mirrors _rg_callsite_id_for's own split, but at VALIDATION time,
+// before any frame is pushed and before any nested-id is consumed):
+//   0 — _rg_build_stmt, validating a TOP-LEVEL call site against the
+//       caller's own real (never shared) AST — `.e` is meaningful and
+//       required here: it's the real inliner's own confirmation that
+//       THIS exact call site was chosen for inlining (a function can
+//       be fn_inlineable yet still NOT have every call site of it
+//       actually registered, e.g. a tier-3 hot-only callee at a cold
+//       site never gets a callsite_id at all).
+//   1 — recursing from _rg_inline_body_is_straightline, validating a
+//       statement that lives inside some OTHER callee's shared body.
+//       `.e` is ALWAYS 0 there (_inline_register_nested never stamps
+//       the shared body) — so this checks the same fn_inlineable +
+//       size-tier test _inline_find_nested_calls itself applies,
+//       which is what actually determines whether pre-reg registered
+//       this exact call as a nested one (and therefore whether
+//       _rg_next_nested_id will find a real id for it later, at
+//       expansion time).
+static _rg_is_expandable_inline_assign(nd, is_nested) {
+    auto n: Node, rhs: Node, fidx, fn_rec, body_arr, body_cnt, callee_bcnt;
     n = nd;
     if (n.ntype != T_ASSIGN) { return 0; }
     if (n.d > 1) { return 0; }                  // multi-target — later increment
     if (n.a == 0 || n.a.ntype != T_VAR) { return 0; }
     rhs = n.b;
     if (rhs == 0 || rhs.ntype != T_CALL) { return 0; }
-    if (rhs.e == 0) { return 0; }                // not an inlined call site at all
     fidx = find_func_idx(rhs.a);
     if (fidx < 0) { return 0; }
+    if (is_nested == 0) {
+        if (rhs.e == 0) { return 0; }            // not a call site the real inliner chose
+    } else {
+        if (arr_get(fn_inlineable, fidx) == 0) { return 0; }
+        fn_rec = funcs[fidx];
+        callee_bcnt = *(fn_rec + FN_BCNT);
+        if (callee_bcnt <= 1 && arr_get(fn_inlineable, fidx) != 2) { return 0; }
+    }
     fn_rec = funcs[fidx];
     body_arr = *(fn_rec + FN_BODY);
     body_cnt = *(fn_rec + FN_BCNT);
@@ -574,8 +704,8 @@ static _rg_build_stmt(nd) {
     // opaque statement. Every other shape (multi-target, multi-return,
     // control flow in the callee, or simply not an inlined call at
     // all) falls through unchanged to the plain-statement case below.
-    if (t == T_ASSIGN && _rg_is_expandable_inline_assign(nd)) {
-        _rg_expand_inline_straightline(n.b, n.a);
+    if (t == T_ASSIGN && _rg_is_expandable_inline_assign(nd, 0)) {
+        _rg_expand_inline_straightline(n.b, n.a, n.b.e);
         return 0;
     }
 
@@ -608,6 +738,7 @@ regalloc_build_cfg(body_arr, body_cnt) -> ptr {
     rg_break_stack = arr_new();
     rg_continue_stack = arr_new();
     rg_inline_stack = arr_new();
+    rg_inline_nk_stack = arr_new();
     rg_cur_block = _rg_new_block();
     _rg_build_body(body_arr, body_cnt);
     return rg_blocks;
