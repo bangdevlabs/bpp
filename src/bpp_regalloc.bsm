@@ -111,6 +111,31 @@ global rg_inline_stack;
 // _rg_callsite_id_for's own comment for the consumer.
 global rg_inline_nk_stack;
 
+// Parallel to rg_inline_stack: where a T_RET encountered WHILE this
+// frame is active should land. Two arrays (a "struct of arrays" over
+// the same stack depth, since arr_push only ever stores one word per
+// entry) rather than packing both into one word — dest_cnt is small
+// (1 or N) and dest_arr is a real pointer, no value range to exploit
+// for packing that would be worth the unpacking cost on every T_RET.
+// dest_arr == 0 is the one special case: it means "this frame's
+// expansion sits directly under the CALLER's own trailing return"
+// (moon_process's `return moog_slope(...);` shape) — a T_RET hit here
+// synthesizes a FRESH T_RET (of the function actually being analysed)
+// instead of an assignment into named targets.
+global rg_inline_dest_arr_stack;
+global rg_inline_dest_cnt_stack;
+
+// Parallel to rg_inline_stack: the block every path through the
+// CURRENT frame's expansion must reach. Pushed once, right before
+// _rg_build_body walks the callee's statements — every T_RET inside
+// (at any depth of if/switch nesting within this SAME frame) links to
+// this exact block via the ordinary _rg_link_fallthrough every other
+// CFG construction site already uses; the surrounding control flow
+// (an enclosing if/switch arm in the callee being expanded) decides
+// what happens to flow that reaches it, exactly as it would for a
+// plain fallthrough in any ordinary function today.
+global rg_inline_join_stack;
+
 // Initialize the regalloc module. Call once at startup, mirroring
 // init_dispatch()'s own convention — the real per-function state is set
 // fresh by regalloc_build_cfg every time, so this just establishes safe
@@ -122,6 +147,9 @@ void init_regalloc() {
     rg_continue_stack = arr_new();
     rg_inline_stack = arr_new();
     rg_inline_nk_stack = arr_new();
+    rg_inline_dest_arr_stack = arr_new();
+    rg_inline_dest_cnt_stack = arr_new();
+    rg_inline_join_stack = arr_new();
 }
 
 // Allocate a fresh, empty block in the function currently under
@@ -289,15 +317,20 @@ static _rg_clone_translate(nd) {
     return orig;   // unreachable given the straightline + no-T_CALL gate
 }
 
-// Does `body_arr` describe a callee this stage can expand in place,
-// given the call site assigns into `expected_arity` targets (1 for a
-// plain single-target assignment, N for `a,b,c,d = callee(...)`)?
-// Every check must pass BEFORE any node is emitted — once one
-// statement is appended to the current block, there is no clean way
-// to "undo" a partial expansion if a later statement disqualifies it.
-// Every statement BEFORE the trailing T_RET must be a plain
-// single-target T_DECL or T_ASSIGN (the callee's own locals) — no
-// control flow anywhere. A local's RHS may itself be a T_CALL at the
+// Does every path through `body_arr` return, using only shapes this
+// stage understands, given the call site assigns into
+// `expected_arity` targets (1 for a plain single-target assignment, N
+// for `a,b,c,d = callee(...)`)? Every check must pass BEFORE any node
+// is emitted — once one statement is appended to the current block,
+// there is no clean way to "undo" a partial expansion if a later
+// statement disqualifies it.
+//
+// Every statement BEFORE the trailing path-terminator must be a plain
+// single-target T_DECL/T_MEMST/T_ASSIGN (the callee's own locals) —
+// control flow other than a TRAILING T_RET or T_SWITCH-of-returns is
+// not yet accepted (T_IF support is Phase 6c/6d's job, a later
+// increment of this same arc — this function returns 0 for it today,
+// same as it always has). A local's RHS may itself be a T_CALL at the
 // EXPRESSION ROOT (`a = flt_onepole_tick(...)`, moog_taps's own
 // shape) as long as THAT call is itself recursively expandable
 // (_rg_is_expandable_inline_assign, mutual recursion with this
@@ -312,7 +345,7 @@ static _rg_clone_translate(nd) {
 // T_RET, n.c == expected_arity == 4), not a nested local assignment
 // (single-target locals inside a callee's body are still validated at
 // expected_arity 1, regardless of the OUTER call's own arity).
-static _rg_inline_body_is_straightline(body_arr, body_cnt, expected_arity) {
+static _rg_body_all_paths_return(body_arr, body_cnt, expected_arity) {
     auto i, n: Node;
     if (body_cnt < 1) { return 0; }
     i = 0;
@@ -415,7 +448,7 @@ static _rg_switch_of_returns_ok(sw: Node, expected_arity) {
 // _rg_expr_uses' own case list (expression nodes only — this is only
 // ever called on a callee's single return expression, never a
 // statement). Used to reject nested inlined calls for this increment
-// (see _rg_inline_body_is_straightline's own comment for why).
+// (see _rg_body_all_paths_return's own comment for why).
 static _rg_expr_has_call(nd) {
     auto n: Node, t;
     if (nd == 0) { return 0; }
@@ -430,11 +463,12 @@ static _rg_expr_has_call(nd) {
 }
 
 // Build the array of synthesized `dest[i] = <translated value>`
-// assignments a T_RET turns into when it's the tail of an inlined
-// expansion — the same shape whether it lands directly in the current
-// block (a plain trailing T_RET) or inside one arm of a synthetic
-// switch (see _rg_emit_switch_of_returns below). Caller has already
-// confirmed (_rg_return_arity_ok) that `ret`'s arity matches dest_cnt.
+// assignments a T_RET turns into when it's encountered while an
+// expansion is active — called directly from _rg_build_stmt's own
+// T_RET case now (see its header comment), regardless of how deep
+// inside if/switch nesting that T_RET lives within the callee being
+// walked. Caller has already confirmed (_rg_return_arity_ok) that
+// `ret`'s arity matches dest_cnt.
 static _rg_ret_to_assign_array(ret: Node, dest_arr, dest_cnt) {
     auto out, final_n: Node, i;
     out = buf_word(dest_cnt);
@@ -458,71 +492,26 @@ static _rg_ret_to_assign_array(ret: Node, dest_arr, dest_cnt) {
     return out;
 }
 
-// Emit a plain trailing T_RET's translated value(s) directly into the
-// current block — the original (Phase 2/3a-c) shape.
-static void _rg_emit_ret_as_assigns(ret: Node, dest_arr, dest_cnt) {
-    auto assigns, i;
-    assigns = _rg_ret_to_assign_array(ret, dest_arr, dest_cnt);
-    i = 0;
-    while (i < dest_cnt) { _rg_emit(assigns[i]); i++; }
-}
-
-// Emit the moog_slope shape: a callee whose trailing statement is a
-// T_SWITCH where every arm (and the mandatory else,
-// _rg_switch_of_returns_ok already confirmed both) is a single T_RET.
-// Builds a SYNTHETIC T_SWITCH — same condition (translated), same arm
-// VALUES (literals, shared as-is — no T_VAR to translate), but every
-// arm/else body replaced by its own assign-array — then hands it to
-// _rg_build_stmt. This reuses the CFG machinery a real switch in user
-// code already gets (new blocks per arm, join block, fallthrough
-// edges) instead of reimplementing it: _rg_build_stmt's own T_RET case
-// only fires for a REAL return, and there is none left in this
-// synthetic tree — every arm now ends in a plain assignment, which
-// falls through to the join block exactly like any other arm would.
-static void _rg_emit_switch_of_returns(sw: Node, dest_arr, dest_cnt) {
-    auto arm_bodies, arm_count, k, ab, stmt: Node, new_arm_bodies, new_sw: Node;
-    arm_bodies = sw.src_tok;
-    arm_count = sw.c;
-    new_arm_bodies = buf_word(arm_count * 2);
-    k = 0;
-    while (k < arm_count) {
-        ab = arm_bodies[k * 2];
-        stmt = ab[0];
-        new_arm_bodies[k * 2] = _rg_ret_to_assign_array(stmt, dest_arr, dest_cnt);
-        new_arm_bodies[k * 2 + 1] = dest_cnt;
-        k++;
-    }
-    new_sw = make_node(T_SWITCH);
-    new_sw.a = _rg_clone_translate(sw.a);
-    new_sw.b = sw.b;            // arm-comparison VALUES are literals — shared verbatim
-    new_sw.c = arm_count;
-    new_sw.d = _rg_ret_to_assign_array(sw.d[0], dest_arr, dest_cnt);
-    new_sw.e = dest_cnt;
-    new_sw.src_tok = new_arm_bodies;
-    _rg_build_stmt(new_sw);
-}
-
 // Expand ONE inlined call site in place: bind every (param, arg) pair,
-// walk the callee's own locals (each T_ASSIGN cloned+translated, each
-// T_DECL skipped — its mangled slot already exists from pre-reg, a
-// fresh declaration would add nothing), then synthesize one final
-// assignment per entry of `dest_arr` (the T_VAR(s) the original
-// call's result(s) were being assigned to — a 1-element array for a
-// plain `a = callee(...)`, an N-element array for moog_taps's own
-// `a,b,c,d = callee(...)` shape) from the matching slice of the
-// callee's cloned+translated return expression(s) — or, for the
-// moog_slope shape, from whichever arm of a synthesized switch fires
-// (see _rg_emit_switch_of_returns). Caller (_rg_build_stmt or this
-// same function, recursing for a nested call) has already confirmed
-// eligibility via _rg_inline_body_is_straightline and resolved `id` —
-// the caller's job, never this function's, since a TOP-LEVEL call
-// site's id lives in call_node.e while a NESTED one never does (see
-// _rg_callsite_id_for's own comment for why) — this function does not
-// care which source it came from.
+// then walk the callee's ENTIRE body via _rg_build_body — every
+// T_DECL/T_MEMST/T_ASSIGN inside translates as it's stored, every
+// T_IF/T_SWITCH builds real blocks exactly as it would for an
+// ordinary function, and every T_RET (at ANY depth of nesting within
+// THIS frame) synthesizes the assignment(s) into `dest_arr` (the
+// T_VAR(s) the original call's result(s) were being assigned to — a
+// 1-element array for a plain `a = callee(...)`, an N-element array
+// for moog_taps's own `a,b,c,d = callee(...)` shape) instead of
+// ending the function — see _rg_build_stmt's own T_RET case. Caller
+// (_rg_build_stmt or this same function, recursing for a nested call)
+// has already confirmed eligibility via _rg_body_all_paths_return and
+// resolved `id` — the caller's job, never this function's, since a
+// TOP-LEVEL call site's id lives in call_node.e while a NESTED one
+// never does (see _rg_callsite_id_for's own comment for why) — this
+// function does not care which source it came from.
 static void _rg_expand_inline_straightline(call_node, dest_arr, dest_cnt, id) {
     auto fidx, fn_rec, params, pcnt, body_arr, body_cnt;
     auto args, argc, i, param_name, mangled, slot_var: Node, arg_expr, translated_arg;
-    auto bind_n: Node, n: Node, last: Node, local_n: Node, nested_id;
+    auto bind_n: Node, join_blk;
     fidx = find_func_idx(call_node.a);
     fn_rec = funcs[fidx];
     params = *(fn_rec + FN_PARS);
@@ -554,73 +543,38 @@ static void _rg_expand_inline_straightline(call_node, dest_arr, dest_cnt, id) {
         i++;
     }
 
-    // Walk the callee's own locals (everything before the trailing
-    // return) WITH the new frame active, so both sides of each
-    // T_ASSIGN resolve through the callee's mangled slots. T_DECL
-    // carries no value to translate — its slot is already registered.
+    // Walk the callee's ENTIRE body with the new frame active, via the
+    // SAME _rg_build_body every ordinary function's CFG is built with
+    // — every T_DECL/T_MEMST/T_ASSIGN/T_IF/T_SWITCH inside is handled
+    // by the existing, already-correct machinery; T_ASSIGN's own
+    // expandable-call check (above, in _rg_build_stmt) fires again
+    // recursively for any nested call, and T_RET (also in
+    // _rg_build_stmt) synthesizes the destination assignment(s) and
+    // links to `join_blk` instead of ending the function — this is
+    // the actual generalization this phase exists for: no new
+    // control-flow logic written here at all.
+    join_blk = _rg_new_block();
     rg_inline_stack = arr_push(rg_inline_stack, id);
     rg_inline_nk_stack = arr_push(rg_inline_nk_stack, 0);
-    i = 0;
-    while (i < body_cnt - 1) {
-        n = body_arr[i];
-        if (n.ntype == T_ASSIGN) {
-            nested_id = -1;
-            if (n.b != 0 && n.b.ntype == T_CALL) { nested_id = _rg_callsite_id_for(n.b); }
-            if (nested_id >= 0) {
-                // A nested inlined call (moog_taps's own shape: 4
-                // calls to flt_onepole_tick, or moog_slope's own
-                // `a,b,c,d = moog_taps(m,in);`) — recurse with the
-                // SAME outer frame still on top, so the nested call's
-                // own arguments translate through THIS callee's
-                // mangled slots, exactly as a real evaluation order
-                // would. The recursive call pushes/pops its OWN frame
-                // for the nested callee around its own body. Target
-                // arity mirrors the nested call's own return arity —
-                // _rg_inline_body_is_straightline already confirmed
-                // they match.
-                auto _rg_nested_dest, _rg_nested_arity, _rg_k;
-                _rg_nested_arity = (n.d > 1) ? n.d : 1;
-                _rg_nested_dest = buf_word(_rg_nested_arity);
-                if (_rg_nested_arity == 1) {
-                    _rg_nested_dest[0] = _rg_clone_translate(n.a);
-                } else {
-                    _rg_k = 0;
-                    while (_rg_k < _rg_nested_arity) {
-                        _rg_nested_dest[_rg_k] = _rg_clone_translate(n.c[_rg_k]);
-                        _rg_k++;
-                    }
-                }
-                _rg_expand_inline_straightline(n.b, _rg_nested_dest, _rg_nested_arity, nested_id);
-            } else {
-                local_n = make_node(T_ASSIGN);
-                local_n.a = _rg_clone_translate(n.a);
-                local_n.b = _rg_clone_translate(n.b);
-                local_n.d = 0;
-                _rg_emit(local_n);
-            }
-        } else if (n.ntype == T_MEMST) {
-            local_n = make_node(T_MEMST);
-            local_n.a = _rg_clone_translate(n.a);
-            local_n.b = _rg_clone_translate(n.b);
-            _rg_emit(local_n);
-        }
-        i++;
-    }
+    rg_inline_dest_arr_stack = arr_push(rg_inline_dest_arr_stack, dest_arr);
+    rg_inline_dest_cnt_stack = arr_push(rg_inline_dest_cnt_stack, dest_cnt);
+    rg_inline_join_stack = arr_push(rg_inline_join_stack, join_blk);
 
-    // The trailing statement is either a plain T_RET
-    // (_rg_inline_body_is_straightline's original shape) or a
-    // moog_slope-shaped T_SWITCH whose every arm (and mandatory else)
-    // is itself a single, validated T_RET. Either way, the frame is
-    // still active here, so every translation below sees the right
-    // mangled slots.
-    last = body_arr[body_cnt - 1];
-    if (last.ntype == T_RET) {
-        _rg_emit_ret_as_assigns(last, dest_arr, dest_cnt);
-    } else {
-        _rg_emit_switch_of_returns(last, dest_arr, dest_cnt);
-    }
+    _rg_build_body(body_arr, body_cnt);
+
     arr_pop(rg_inline_stack);
     arr_pop(rg_inline_nk_stack);
+    arr_pop(rg_inline_dest_arr_stack);
+    arr_pop(rg_inline_dest_cnt_stack);
+    arr_pop(rg_inline_join_stack);
+
+    // A body that falls off the end without an explicit return
+    // shouldn't happen for a non-void callee (_rg_body_all_paths_return
+    // already rejected anything that doesn't return on every path) —
+    // this fallthrough link is the same safety net ordinary T_IF/
+    // T_SWITCH construction already keeps for the analogous case.
+    _rg_link_fallthrough(rg_cur_block, join_blk);
+    rg_cur_block = join_blk;
 }
 
 // Resolve the callsite id to use for expanding `call_node`, or -1 if
@@ -693,7 +647,7 @@ static _rg_next_nested_id() {
 //       be fn_inlineable yet still NOT have every call site of it
 //       actually registered, e.g. a tier-3 hot-only callee at a cold
 //       site never gets a callsite_id at all).
-//   1 — recursing from _rg_inline_body_is_straightline, validating a
+//   1 — recursing from _rg_body_all_paths_return, validating a
 //       statement that lives inside some OTHER callee's shared body.
 //       `.e` is ALWAYS 0 there (_inline_register_nested never stamps
 //       the shared body) — so this checks the same fn_inlineable +
@@ -734,7 +688,7 @@ static _rg_is_expandable_inline_assign(nd, is_nested, expected_arity) {
     fn_rec = funcs[fidx];
     body_arr = *(fn_rec + FN_BODY);
     body_cnt = *(fn_rec + FN_BCNT);
-    return _rg_inline_body_is_straightline(body_arr, body_cnt, expected_arity);
+    return _rg_body_all_paths_return(body_arr, body_cnt, expected_arity);
 }
 
 // Build the CFG for one statement, updating rg_cur_block to whatever
@@ -832,6 +786,30 @@ static _rg_build_stmt(nd) {
     }
 
     if (t == T_RET) {
+        if (arr_len(rg_inline_stack) > 0) {
+            // Inside an active expansion: this T_RET belongs to the
+            // CALLEE currently being walked, not the function actually
+            // under analysis. Synthesize the assignment(s) into the
+            // active frame's destination, then link the current block
+            // to the expansion's own join block — never "no successor"
+            // — the SAME _rg_link_fallthrough-driven convergence every
+            // ordinary if/switch already relies on. dest_arr == 0 (the
+            // moon_process shape: this expansion sits directly under
+            // the CALLER's own return) is Phase 6b's job — not reached
+            // yet, since nothing pushes that case onto the stack
+            // before then.
+            auto _rg_top, _rg_dest_arr2, _rg_dest_cnt2, _rg_join, _rg_assigns, _rg_ai;
+            _rg_top = arr_len(rg_inline_join_stack) - 1;
+            _rg_dest_arr2 = arr_get(rg_inline_dest_arr_stack, _rg_top);
+            _rg_dest_cnt2 = arr_get(rg_inline_dest_cnt_stack, _rg_top);
+            _rg_join = arr_get(rg_inline_join_stack, _rg_top);
+            _rg_assigns = _rg_ret_to_assign_array(n, _rg_dest_arr2, _rg_dest_cnt2);
+            _rg_ai = 0;
+            while (_rg_ai < _rg_dest_cnt2) { _rg_emit(_rg_assigns[_rg_ai]); _rg_ai++; }
+            _rg_set_succ(rg_cur_block, _rg_join, -1);
+            rg_cur_block = _rg_new_dead_block();
+            return 0;
+        }
         _rg_emit(nd);
         _rg_set_succ(rg_cur_block, -1, -1);
         rg_cur_block = _rg_new_dead_block();
@@ -885,31 +863,91 @@ static _rg_build_stmt(nd) {
     }
 
     // `a = <inlined call>` or `a,b,c,d = <inlined call>` where the
-    // callee is a straight-line body (matching return arity) — expand
-    // it in place (see "Seeing through an inlined call site" above)
-    // instead of treating the call as an opaque statement. Every
-    // other shape (control flow in the callee, a call buried deeper
-    // inside an expression, or simply not an inlined call at all)
-    // falls through unchanged to the plain-statement case below.
+    // callee's body has all paths returning (see "Seeing through an
+    // inlined call site" above) — expand it in place instead of
+    // treating the call as an opaque statement. This fires identically
+    // whether `nd` is a TOP-LEVEL statement or one being walked INSIDE
+    // an active expansion (rg_inline_stack non-empty) — _rg_is_nested
+    // and _rg_callsite_id_for both already distinguish the two
+    // contexts internally, so this site needs no separate case for
+    // either. The destination is cloned+translated through whatever
+    // frame is currently active (a no-op at the top level, where the
+    // stack is empty and translation falls through to the name
+    // unchanged). Every other shape (control flow this stage doesn't
+    // recognize, a call buried deeper inside an expression, or simply
+    // not an inlined call at all) falls through unchanged to the
+    // plain-statement case below.
     if (t == T_ASSIGN && n.b != 0 && n.b.ntype == T_CALL) {
-        auto _rg_arity, _rg_dest_arr;
+        auto _rg_arity, _rg_dest_arr, _rg_is_nested, _rg_cs_id, _rg_di;
         _rg_arity = (n.d > 1) ? n.d : 1;
-        if (_rg_is_expandable_inline_assign(nd, 0, _rg_arity)) {
-            if (n.d > 1) {
-                _rg_dest_arr = n.c;
-            } else {
-                _rg_dest_arr = buf_word(1);
-                _rg_dest_arr[0] = n.a;
+        _rg_is_nested = (arr_len(rg_inline_stack) > 0) ? 1 : 0;
+        if (_rg_is_expandable_inline_assign(nd, _rg_is_nested, _rg_arity)) {
+            _rg_cs_id = _rg_callsite_id_for(n.b);
+            if (_rg_cs_id >= 0) {
+                _rg_dest_arr = buf_word(_rg_arity);
+                if (_rg_arity == 1) {
+                    _rg_dest_arr[0] = _rg_clone_translate(n.a);
+                } else {
+                    _rg_di = 0;
+                    while (_rg_di < _rg_arity) {
+                        _rg_dest_arr[_rg_di] = _rg_clone_translate(n.c[_rg_di]);
+                        _rg_di++;
+                    }
+                }
+                _rg_expand_inline_straightline(n.b, _rg_dest_arr, _rg_arity, _rg_cs_id);
+                return 0;
             }
-            _rg_expand_inline_straightline(n.b, _rg_dest_arr, _rg_arity, n.b.e);
-            return 0;
         }
     }
 
     // Plain statement (T_ASSIGN, T_MEMST, T_DECL, expression-statement,
-    // etc.) — none of these split blocks, just append.
+    // etc.) — none of these split blocks, just append. Outside any
+    // expansion (the common case — every ordinary function the
+    // compiler has ever analysed), `nd` is stored as-is, same as
+    // always. INSIDE an active expansion, this statement belongs to
+    // the callee currently being walked and carries its NATIVE
+    // param/local names — it must be cloned+translated before
+    // storage, for the exact same reason _rg_clone_translate's own
+    // header comment gives for expressions: there is no "later" for
+    // rg_inline_stack, Stage B/C only ever see this node after Stage A
+    // has long finished and every frame is back to empty.
+    if (arr_len(rg_inline_stack) > 0) {
+        auto _rg_translated_stmt;
+        _rg_translated_stmt = _rg_clone_translate_stmt(nd);
+        if (_rg_translated_stmt != 0) { _rg_emit(_rg_translated_stmt); }
+        return 0;
+    }
     _rg_emit(nd);
     return 0;
+}
+
+// Clone+translate a STATEMENT (as opposed to _rg_clone_translate,
+// which only ever handles expression nodes) for storage while inside
+// an active expansion. Only the shapes _rg_body_all_paths_return
+// accepts as a callee local need handling here — T_DECL needs no
+// translation at all (its mangled slot already exists from pre-reg;
+// emitting a fresh declaration would add nothing, so this returns 0 —
+// _rg_emit already no-ops on a 0 node, mirrored from
+// _rg_build_stmt's own `if (nd == 0) { return 0; }` guard).
+static _rg_clone_translate_stmt(nd) {
+    auto n: Node, cl: Node;
+    if (nd == 0) { return 0; }
+    n = nd;
+    if (n.ntype == T_DECL) { return 0; }
+    if (n.ntype == T_ASSIGN) {
+        cl = make_node(T_ASSIGN);
+        cl.a = _rg_clone_translate(n.a);
+        cl.b = _rg_clone_translate(n.b);
+        cl.d = 0;
+        return cl;
+    }
+    if (n.ntype == T_MEMST) {
+        cl = make_node(T_MEMST);
+        cl.a = _rg_clone_translate(n.a);
+        cl.b = _rg_clone_translate(n.b);
+        return cl;
+    }
+    return nd;   // unreachable given _rg_body_all_paths_return's own gate
 }
 
 static _rg_build_body(arr, cnt) {
@@ -936,6 +974,9 @@ regalloc_build_cfg(body_arr, body_cnt) -> ptr {
     rg_continue_stack = arr_new();
     rg_inline_stack = arr_new();
     rg_inline_nk_stack = arr_new();
+    rg_inline_dest_arr_stack = arr_new();
+    rg_inline_dest_cnt_stack = arr_new();
+    rg_inline_join_stack = arr_new();
     rg_cur_block = _rg_new_block();
     _rg_build_body(body_arr, body_cnt);
     return rg_blocks;
