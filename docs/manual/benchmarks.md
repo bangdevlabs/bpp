@@ -552,6 +552,73 @@ simultaneously-live locals for B3 to ever leave anything on the table,
 so the systematic comparison clears, the swap applies, and the result
 is identical to B3's own decision by construction.
 
+## 2026-06-23 (later still) — "RegAlloc v2 sees through inlined call
+sites" arc closes; final re-measurement
+
+The evaluation just above was honest at the time, but its central
+caveat — `moog_taps`/`moog_slope`/`tl_channel_process`/`moon_process`/
+`rotary_tick` "all inline something internally and correctly fall
+back to B3" — is now stale. A same-day follow-on arc taught Stage A's
+own analysis to recursively expand a growing set of real inlined-call
+shapes (straight-line, multi-statement, nested calls, multi-target/
+multi-return, struct-field writes, switch-of-returns) directly into
+real intervals for the mangled slots those shapes create, then
+replaced the blanket "any mangled slot present -> refuse" gate with a
+precise one ("only refuse if a mangled slot genuinely has no interval
+at all"). Confirmed via a temporary debug probe (reverted before
+shipping): `moog_taps`, `moog_tick`, and `moog_slope` — all three
+previously blocked outright — now receive the real swap.
+`tl_channel_process`/`rotary_tick`/`moon_process` still don't (each
+hides its nested call inside a trailing return EXPRESSION rather than
+a plain statement's RHS — a shape this arc doesn't recognize yet,
+separately scoped future work).
+
+Re-measured exactly the same two benchmarks, min-of-5, same machine,
+on the binary with this arc fully installed:
+
+| benchmark | min-of-5 | vs gcc -O2 |
+|---|---|---|
+| `tl_bench` (ours, call-heavy) | 9.98 ms (300×) | ~2.68× |
+| `bench_codegen` biquad | 47.43 ms | 0.96× (parity, within noise) |
+| `bench_codegen` lcg | 20.52 ms | 0.96× (parity, within noise) |
+| `bench_codegen` xform | 6.60 ms | 1.10× |
+| `bench_codegen` manylive | 136.23 ms | 1.57× |
+
+**`tl_bench`: 10.14 ms → 9.98 ms, a real but small ~1.6% on top of the
+~30.5% the day's earlier arcs had already banked.** Smaller than
+hoped given three previously-untouched functions in the hot chain
+now genuinely swap — the honest read is that `moog_taps`/`moog_tick`/
+`moog_slope` are each called once per channel per sample (not in a
+tight inner loop of their own), so even a real win inside them is a
+small fraction of `tl_render`'s total cost; the chain's actual
+remaining bottleneck is elsewhere (most likely the surrounding loop
+structure and the three functions that still don't qualify, which
+collectively do more of the per-sample work). Reported honestly
+rather than inflated — this is the same lesson the branch-fusion
+commit earlier in the inliner arc already taught: a real, verified,
+disasm-confirmed improvement doesn't always move wall-clock time
+proportionally to how much code it touches.
+
+`bench_codegen`'s other three kernels are flat (within noise) from
+before this arc, as expected (none of them have any mangled slot at
+all). `manylive` at 1.57× is within the same noise band already
+established (1.58-1.72× across today's session) and is, again, not
+touched by anything in this arc (pure integer, no inlined calls).
+
+Net honest verdict for the day: **the float Stage E extension plus
+the "sees through inlined call sites" arc together are a genuine,
+disasm-verified capability win for the register allocator** (it now
+correctly shares registers across non-overlapping mangled-slot
+lifetimes in real, complex, multi-level DSP functions, where it
+previously couldn't see those variables at all) — but on THIS
+specific benchmark, the wall-clock payoff is modest because the
+newly-covered functions aren't where most of the per-sample time
+goes. The capability is real and durable; the next measurable win on
+`tl_bench` specifically needs either the remaining three uncovered
+functions or a different part of the chain entirely — not assumed,
+to be found by re-disassembling, per this whole project's standing
+discipline.
+
 ## Adding a benchmark
 
 A new runtime benchmark self-times with the bpp_bench helpers and prints a
