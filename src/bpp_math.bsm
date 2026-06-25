@@ -322,17 +322,13 @@ exp_f(x: float) {
 // ── Natural log + decibels ───────────────────────────────────
 //
 // log_f(x): range-reduce x = m * 2^k with m in [1, 2) (repeated
-// doubling/halving, same style as exp_f's own range reduction), then
-// 8 Newton iterations on ln(m) using exp_f as the inverse function:
-// y_{n+1} = y_n - 1 + m / exp_f(y_n). This is the standard "solve
-// f(y) = exp(y) - m = 0 via Newton" derivation (f'(y) = exp(y), so the
-// update is y - f(y)/f'(y) = y - 1 + m/exp(y)) — reuses exp_f instead of
-// deriving a second from-scratch series, and converges quadratically:
-// hand-verified to 4-decimal accuracy by the 3rd iteration for the
-// worst case (m=2, y0=1.0); 8 iterations matches sqrt's own Newton
-// count for headroom. log(x) = k*ln2 + log(m). Domain guard mirrors
-// sqrt's convention: x <= 0 has no real logarithm, return 0.0 rather
-// than propagate garbage.
+// doubling/halving, same style as exp_f's own range reduction), then a direct
+// atanh series for ln(m) — see the function body for the derivation. (An
+// earlier version solved ln(m) by Newton iteration on exp_f; profiling the
+// compressor showed that inlined exp_f's whole series once per iteration and
+// dominated the per-sample cost, so it was replaced by the direct, exp-free
+// series.) log(x) = k*ln2 + log(m). Domain guard mirrors sqrt's convention:
+// x <= 0 has no real logarithm, return 0.0 rather than propagate garbage.
 //
 // amp_to_db_f / db_to_amp_f: the two-line decibel conversions every
 // audio plugin needs (20*log10(amp) and 10^(db/20), rewritten in terms
@@ -344,18 +340,32 @@ exp_f(x: float) {
 // own domain guard would otherwise read back as 0.0 — exactly backwards,
 // that is 0 dB, not silence) reports a large negative number instead.
 log_f(x: float) {
-    auto (m, k, y): float;
+    auto (m, k, s, s2, term, sum, den): float;
     auto i;
     if (x <= 0.0) { return 0.0; }
     m = x;
     k = 0.0;
     while (m >= 2.0) { m = m * 0.5; k = k + 1.0; }
     while (m < 1.0)  { m = m * 2.0; k = k - 1.0; }
-    y = m - 1.0;
-    for (i = 0; i < 8; i++) {
-        y = y - 1.0 + m / exp_f(y);
+    // ln(m) for m in [1, 2) via the atanh series: with s = (m-1)/(m+1),
+    // ln(m) = 2*(s + s^3/3 + s^5/5 + ...). Because |s| <= 1/3 over the reduced
+    // range, the series converges fast — 6 terms reach ~8-digit accuracy. This
+    // REPLACES the previous Newton-on-exp method (which inlined exp_f's full
+    // series once per iteration); profiling the compressor showed that made
+    // log_f the dominant per-sample cost. The direct series does no exp at all,
+    // so it is several times cheaper AND removes the inlined exp_f's register
+    // pressure from log_f's body. log(x) = k*ln2 + ln(m).
+    s   = (m - 1.0) / (m + 1.0);
+    s2  = s * s;
+    term = 1.0;          // running s^(2*i)
+    sum  = 1.0;          // 1 + s^2/3 + s^4/5 + ...
+    den  = 3.0;          // denominator 3, 5, 7, ...
+    for (i = 1; i < 6; i++) {
+        term = term * s2;
+        sum  = sum + term / den;
+        den  = den + 2.0;
     }
-    return k * 0.6931471805599453 + y;
+    return k * 0.6931471805599453 + 2.0 * s * sum;
 }
 
 amp_to_db_f(amp: float) {

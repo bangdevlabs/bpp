@@ -80,7 +80,8 @@ struct Compressor {
     mode,
     release_idx,
     ratio: float,
-    threshold_db: float
+    threshold_db: float,
+    knee_low_amp: float
 }
 
 // Init hook for symmetry with the other cartridges (stbrotary, stbfilter).
@@ -126,6 +127,10 @@ comp_new(sample_rate: float) -> ptr {
     c.threshold_db = 0.0 - 6.0;
     c.release_idx  = COMP_REL_500;
     c.release_g    = _comp_coeff_from_ms(_comp_release_ms(COMP_REL_500), sample_rate);
+    // Linear-domain lower edge of the knee, precomputed so the per-sample hot
+    // path can reject a below-knee sample WITHOUT calling the (expensive) log —
+    // see comp_process. Recomputed whenever the threshold changes.
+    c.knee_low_amp = db_to_amp_f(c.threshold_db - _COMP_KNEE_DB * 0.5);
     return c;
 }
 
@@ -160,6 +165,8 @@ void comp_set_threshold_db(compressor: Compressor, threshold_db: float) {
     auto c: Compressor;
     c = compressor;
     c.threshold_db = threshold_db;
+    // Keep the precomputed linear knee edge in sync (see comp_process).
+    c.knee_low_amp = db_to_amp_f(threshold_db - _COMP_KNEE_DB * 0.5);
 }
 
 comp_get_mode(compressor: Compressor) {
@@ -199,12 +206,19 @@ comp_process(compressor: Compressor, in: float) -> float {
     if (lvl > c.env) { g = c.attack_g; } else { g = c.release_g; }
     c.env = c.env + g * (lvl - c.env);
 
+    // Below the knee in the LINEAR domain — the common case — return untouched
+    // WITHOUT paying for the per-sample log. Exactly equivalent to the old
+    // `2*over <= -knee` dB test (amplitude is monotonic in dB), but the
+    // amp_to_db_f below only runs for samples actually in or above the knee,
+    // where the gain math genuinely needs the dB value. Profiling showed this
+    // log dominated the compressor's cost, and a real signal sits below the
+    // knee most of the time.
+    if (c.env <= c.knee_low_amp) {
+        return in;
+    }
+
     level_db = amp_to_db_f(c.env);
     over = level_db - c.threshold_db;
-
-    if (2.0 * over <= 0.0 - _COMP_KNEE_DB) {
-        return in;     // below the knee — untouched, the common case
-    }
 
     if (2.0 * abs_f(over) <= _COMP_KNEE_DB) {
         auto knee_term: float;
