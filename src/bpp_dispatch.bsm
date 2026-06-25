@@ -94,6 +94,24 @@ static auto _fn_reg_global;      // arr<arr<packed>>: per-fi parallel list of gl
 // themselves explicitly during Pass A.
 static auto _fn_callers;         // arr<arr<int>>: callers per callee
 
+// S4 hotness propagation (Inc 8, docs/plans/inliner_arc.md). The
+// existing S4 threshold heuristics (_inline_caller_fanout, the call
+// site's own `n.d` loop depth) are both SHALLOW — one hop. They miss
+// exactly the shape a real-time DSP chain has: `sf_render`'s per-sample
+// loop calls `sf_channel_process`, which calls `zener_process`, which
+// calls `comp_process`, which calls `db_to_amp_f`, which calls `exp_f`
+// — the loop is 5 calls away from `exp_f`, so neither shallow signal
+// ever sees it. `fn_max_call_loop_depth[fi]` is the max `n.d` (T_CALL's
+// own parser-stamped loop-depth field, S4 P0a) among every DIRECT call
+// site anywhere in the program that calls fi — built for free inside
+// `_cgb_walk`'s existing T_CALL discovery (same node, same pass, no new
+// walk). `fn_hot_transitive[fi]` is the propagated result: 1 if fi is
+// called directly from inside a loop, OR fi is called by some function
+// that is itself hot — computed via a fixpoint over `_fn_callers`
+// (capped passes, same shape as classify_inlineable's own fixpoint).
+static auto fn_max_call_loop_depth;  // arr<int>: max loop depth among direct call sites
+static auto fn_hot_transitive;       // arr<int>: 1 if hot, directly or transitively
+
 // Per-global registered origins (V3 Session 4 Pass B). Captures every
 // `fn_ptr(name)` literal that any caller passes to a registration
 // helper at the corresponding param_idx. `_glob_origin_names` is a
@@ -108,11 +126,21 @@ extrn fn_inlineable;       // arr<int>: inline tier for each function —
                           //   3 = HOT-ONLY (bigger / control-flow-normalised body): binding
                           //       splice, but only at IN-LOOP call sites so a widely-used
                           //       accessor (arr_struct_at) does not bloat cold sites. Inc 3.
-                          // Tiers 2 + 3 both route through cg_emit_inline_multi gated on the
-                          // pre-reg-stamped callsite id (n.e > 0); the only difference is that
-                          // the pre-reg walk registers a tier-3 callsite ONLY when it sits
-                          // inside a loop (cg_inline_loop_depth > 0). The chips' fast-path
-                          // gate is therefore `fn_inlineable == 1` (tiers 2 + 3 fall to binding).
+                          //   4 = OVERSIZED, COST-GATED (Inc 8, S4 wiring): body exceeds the
+                          //       free node cap (INLINE_BODY_NODE_CAP/_MULTIRET) but is under
+                          //       the absolute backstop and otherwise shape-eligible. Binding
+                          //       splice, but only when _inline_pre_reg_walk's per-callsite
+                          //       _inline_cost <= _inline_threshold check clears — a function
+                          //       like exp_f (bpp_math.bsm, cost 78) splices at a call site
+                          //       proven hot via fn_hot_transitive (a real-time DSP chain
+                          //       several calls deep) and falls through to a real `bl` at a
+                          //       cold one, same call site, same function, different outcome.
+                          // Tiers 2 + 3 + 4 all route through cg_emit_inline_multi gated on the
+                          // pre-reg-stamped callsite id (n.e > 0); the difference is which
+                          // call sites the pre-reg walk registers at all (tier 3: only in-loop;
+                          // tier 4: only cost-cleared; both fall through to a real `bl` at any
+                          // call site they don't register). The chips' fast-path gate is
+                          // therefore `fn_inlineable == 1` (tiers 2/3/4 all fall to binding).
 // Loop-nesting depth tracked by the inline pre-reg walk so the hotness gate can
 // tell an in-loop (hot) call site from a cold one. Spine-owned, reset per
 // function in _inline_pre_reg_walk_body; both backends drive the same walk, so
@@ -128,6 +156,9 @@ extrn fn_void_inlineable;  // arr<int>: 1 if a void / statement-context callee i
                           // exists. See docs/plans/legacy/sidequest_void_inline.md.
 extrn _lazy_emit_ready;    // 1 after mark_reachable has populated fn_reachable.
                           // Codegen checks this before filtering — if 0, emit everything.
+extrn cg_cur_fn_idx;       // funcs[] index of the function pre_reg_vars is currently
+                          // walking — Inc 8's tier-4 cost-vs-threshold check in
+                          // _inline_pre_reg_walk reads this as the call site's caller_idx.
 
 // ── Per-global use-def tracking (smart promotion) ──────────
 // Built by call_graph_build() during the same AST walk that populates
@@ -1061,6 +1092,8 @@ static void init_glob_origins() {
     _glob_origin_names   = arr_new();
     _glob_origin_targets = arr_new();
     _fn_callers          = arr_new();
+    fn_max_call_loop_depth = arr_new();
+    fn_hot_transitive      = arr_new();
 }
 
 // Find the slot index for a given global packed name. Returns the
@@ -1129,6 +1162,48 @@ static void _dsp_build_callers() {
             arr_set(_fn_callers, callee_idx,
                     arr_push(arr_get(_fn_callers, callee_idx), i));
         }
+    }
+}
+
+// S4 hotness propagation (Inc 8) — must run AFTER `_dsp_build_callers`
+// (it walks `_fn_callers`, the inverse call graph that function just
+// built). Seeds `fn_hot_transitive[fi] = 1` for any fi with a direct
+// call site inside a loop (`fn_max_call_loop_depth[fi] > 0`), then
+// propagates down the call graph: if G is hot and G calls F, F is hot
+// too — a real-time DSP chain five calls deep (`sf_render`'s per-sample
+// loop -> ... -> `exp_f`) all become hot, not just the one direct call
+// site that happens to sit textually inside a loop. Fixpoint capped at
+// 8 passes, same shape and same cap as `classify_inlineable`'s own
+// fixpoint (eligibility only ever grows — comparing a simple sum across
+// passes is a rigorous "nothing changed" test here too).
+static void _dsp_build_hot_transitive() {
+    auto i, j, callers, n, changed, sum_before, sum_after, iter;
+    for (i = 0; i < func_cnt; i++) {
+        if (arr_get(fn_max_call_loop_depth, i) > 0) {
+            arr_set(fn_hot_transitive, i, 1);
+        }
+    }
+    sum_before = -1;
+    changed = 1;
+    iter = 0;
+    while (changed && iter < 8) {
+        for (i = 0; i < func_cnt; i++) {
+            if (arr_get(fn_hot_transitive, i)) { continue; }
+            callers = arr_get(_fn_callers, i);
+            if (callers == 0) { continue; }
+            n = arr_len(callers);
+            for (j = 0; j < n; j++) {
+                if (arr_get(fn_hot_transitive, arr_get(callers, j))) {
+                    arr_set(fn_hot_transitive, i, 1);
+                    break;
+                }
+            }
+        }
+        sum_after = 0;
+        for (i = 0; i < func_cnt; i++) { sum_after += arr_get(fn_hot_transitive, i); }
+        changed = (sum_after != sum_before);
+        sum_before = sum_after;
+        iter++;
     }
 }
 
@@ -1384,6 +1459,13 @@ static _cgb_walk(nd) {
         callee_idx = _dsp_find_func_idx(name_p);
         if (callee_idx >= 0) {
             _cgb_calls = arr_push(_cgb_calls, callee_idx);
+            // S4 hotness (Inc 8): n.d is THIS call site's own parser-
+            // stamped loop depth (S4 P0a) — already sitting on the node
+            // we're visiting, no separate walk needed. Track the max
+            // across every direct call site anywhere in the program.
+            if (n.d > arr_get(fn_max_call_loop_depth, callee_idx)) {
+                arr_set(fn_max_call_loop_depth, callee_idx, n.d);
+            }
         } else {
             // Not a user function — must be an extern or builtin. If it's
             // not a known-pure extern, treat as local impurity (call could
@@ -1925,6 +2007,15 @@ call_graph_build() {
         fn_vt_locs    = arr_push(fn_vt_locs, 0);
         fn_effect = arr_push(fn_effect, PHASE_AUTO);
         fn_effect_next = arr_push(fn_effect_next, PHASE_AUTO);
+        fn_max_call_loop_depth = arr_push(fn_max_call_loop_depth, 0);
+        fn_hot_transitive = arr_push(fn_hot_transitive, 0);
+    }
+    // Reset for re-runs (bootstrap recompiles call_graph_build more than
+    // once) — direct call-site loop depth is read fresh from `_cgb_walk`
+    // below every time, so stale max-from-a-previous-run must not linger.
+    for (i = 0; i < func_cnt; i++) {
+        arr_set(fn_max_call_loop_depth, i, 0);
+        arr_set(fn_hot_transitive, i, 0);
     }
 
     // Grow per-global arrays to match glob_cnt. Each slot is its own arr<int>.
@@ -2053,6 +2144,7 @@ call_graph_build() {
     // for ALL functions, so no helper is examined before all its
     // own registrations have been recorded.
     _dsp_build_callers();
+    _dsp_build_hot_transitive();
     for (i = 0; i < func_cnt; i++) {
         if (dsp_is_reg_helper(i)) { _glob_origins_capture(i); }
     }
@@ -6662,11 +6754,12 @@ static _inline_cost(fn_idx, args_arr, arg_cnt) {
 // saved call-frame on every iteration, while at a one-shot
 // startup site the same body is just bloat.
 //
-// Per Q2 of the S4 design doc:
+// Per Q2 of the S4 design doc, plus Inc 8's hotness-propagation term:
 //
 //   threshold = INLINE_BASE_THRESHOLD              # default 30
-//   if caller in hot path:    threshold *= 2
-//   if callsite in loop:      threshold *= 1.5
+//   if caller in hot path (fanout):     threshold *= 2
+//   if callsite in loop (shallow):      threshold *= 1.5
+//   if caller is hot TRANSITIVELY:      threshold *= 3      (Inc 8)
 //
 // Caller hotness = caller has many call sites itself, signalled
 // by `arr_len(_fn_callers[caller_idx])`. A heavily-called caller
@@ -6681,11 +6774,27 @@ static _inline_cost(fn_idx, args_arr, arg_cnt) {
 // Switch arms intentionally do NOT bump the counter — one-shot
 // dispatch, not repetition (see commit 5ca27fa rationale).
 //
-// Not called by any consumer yet. P3a's `classify_inlineable_v2`
-// will be the first; cg_emit_call's splice point in each chip
-// (a64_codegen:1200, x64_codegen:953) will be the second.
+// Both signals above are SHALLOW (one hop: does THIS call site sit in
+// a loop; does the caller have many direct callers). Neither sees a
+// real-time DSP chain where the loop is several calls away (`sf_render`'s
+// per-sample loop -> sf_channel_process -> zener_process -> comp_process
+// -> db_to_amp_f -> exp_f — the loop is 5 calls from exp_f). Inc 8's
+// `fn_hot_transitive[caller_idx]` (built by `_dsp_build_hot_transitive`,
+// propagated over the whole call graph, not just one hop) catches that
+// case. ×3 — bigger than either shallow multiplier — because "proven
+// reachable from an actual loop, at any depth" is strictly more
+// information than "this caller merely has many callers" or "this one
+// call site happens to sit in a loop textually"; chosen to clear
+// `exp_f`'s measured cost (78) from a cold-looking base (30) once a
+// real DSP chain proves it hot, not picked to hit that number exactly —
+// re-measure if a second real candidate needs a different value.
+//
+// First consumer: `_inline_pre_reg_walk`'s per-callsite cost-vs-
+// threshold gate (Inc 8) — the second of the two places this comment
+// used to say "not called yet."
 const INLINE_BASE_THRESHOLD = 30;
 const INLINE_HOT_FANOUT     = 10;
+const INLINE_HOT_TRANSITIVE_MULT = 3;
 
 static _inline_caller_fanout(caller_idx) {
     auto callers;
@@ -6711,6 +6820,11 @@ static _inline_threshold(callee_idx, caller_idx, call_node) {
         if (n.d > 0) {
             // Q2 specifies × 1.5; integer-safe as × 3 / 2.
             threshold = threshold * 3 / 2;
+        }
+    }
+    if (caller_idx >= 0 && caller_idx < arr_len(fn_hot_transitive)) {
+        if (arr_get(fn_hot_transitive, caller_idx)) {
+            threshold = threshold * INLINE_HOT_TRANSITIVE_MULT;
         }
     }
     return threshold;
@@ -6978,7 +7092,7 @@ _inline_register_callsite_slots(fidx) {
     // function's nested calls is skipped.
     if (already_registering == 0) {
         arr_set(_inline_registering, fidx, 1);
-        _inline_register_nested(id, body_arr, body_cnt);
+        _inline_register_nested(id, body_arr, body_cnt, fidx);
         arr_set(_inline_registering, fidx, 0);
     }
     return id;
@@ -7013,7 +7127,15 @@ void _inline_register_callsite(call_node, fidx) {
 // exactly, both walks visit nodes in identical order by construction —
 // this is what lets the two phases agree without any other
 // coordination, and why the shared body itself is never mutated.
-_inline_find_nested_calls(nd, out_arr) {
+// `owner_fidx` (Inc 8): the function whose body this AST belongs to —
+// needed ONLY for the tier-4 cost-vs-threshold check below (caller_idx
+// for `_inline_threshold`). Threaded through every recursive call so
+// registration time (`_inline_register_nested`) and splice time
+// (`_cg_inline_splice_prelude` / `_inline_stamp_nested`) ALWAYS agree on
+// exactly which nested calls qualify — they must find the identical set,
+// in the identical order, or the positional `nested_ids[nk]` stamping
+// downstream silently reads the wrong id for the wrong call.
+_inline_find_nested_calls(nd, out_arr, owner_fidx) {
     auto n: Node, t, arr, cnt, i, fidx, fn_rec2, callee_bcnt2;
     if (nd == 0) { return out_arr; }
     n = nd;
@@ -7021,36 +7143,49 @@ _inline_find_nested_calls(nd, out_arr) {
     if (t == T_CALL) {
         arr = n.b; cnt = n.c;
         i = 0;
-        while (i < cnt) { out_arr = _inline_find_nested_calls(arr[i], out_arr); i++; }
+        while (i < cnt) { out_arr = _inline_find_nested_calls(arr[i], out_arr, owner_fidx); i++; }
         fidx = find_func_idx(n.a);
         if (fidx >= 0 && arr_get(fn_inlineable, fidx)) {
-            fn_rec2 = funcs[fidx];
-            callee_bcnt2 = *(fn_rec2 + FN_BCNT);
-            if (callee_bcnt2 > 1 || arr_get(fn_inlineable, fidx) == 2) {
-                out_arr = arr_push(out_arr, n);
+            if (arr_get(fn_inlineable, fidx) == 4) {
+                // Inc 8: oversized, cost-gated — same per-callsite check
+                // as the top-level walker, just reached through a nested
+                // body instead of directly. owner_fidx is the function
+                // whose body n lives in (e.g. db_to_amp_f, itself being
+                // spliced into comp_process) — fn_hot_transitive[owner_fidx]
+                // is what lets exp_f clear here once db_to_amp_f's own
+                // hotness has propagated up from the real DSP loop.
+                if (_inline_cost(fidx, n.b, n.c) <= _inline_threshold(fidx, owner_fidx, n)) {
+                    out_arr = arr_push(out_arr, n);
+                }
+            } else {
+                fn_rec2 = funcs[fidx];
+                callee_bcnt2 = *(fn_rec2 + FN_BCNT);
+                if (callee_bcnt2 > 1 || arr_get(fn_inlineable, fidx) == 2) {
+                    out_arr = arr_push(out_arr, n);
+                }
             }
         }
         return out_arr;
     }
     switch (t) {
-    T_BINOP   { out_arr = _inline_find_nested_calls(n.b, out_arr); out_arr = _inline_find_nested_calls(n.c, out_arr); }
-    T_UNARY   { out_arr = _inline_find_nested_calls(n.b, out_arr); }
-    T_MEMLD   { out_arr = _inline_find_nested_calls(n.a, out_arr); }
-    T_ADDR    { out_arr = _inline_find_nested_calls(n.a, out_arr); }
+    T_BINOP   { out_arr = _inline_find_nested_calls(n.b, out_arr, owner_fidx); out_arr = _inline_find_nested_calls(n.c, out_arr, owner_fidx); }
+    T_UNARY   { out_arr = _inline_find_nested_calls(n.b, out_arr, owner_fidx); }
+    T_MEMLD   { out_arr = _inline_find_nested_calls(n.a, out_arr, owner_fidx); }
+    T_ADDR    { out_arr = _inline_find_nested_calls(n.a, out_arr, owner_fidx); }
     T_TERNARY {
-        out_arr = _inline_find_nested_calls(n.a, out_arr);
-        out_arr = _inline_find_nested_calls(n.b, out_arr);
-        out_arr = _inline_find_nested_calls(n.c, out_arr);
+        out_arr = _inline_find_nested_calls(n.a, out_arr, owner_fidx);
+        out_arr = _inline_find_nested_calls(n.b, out_arr, owner_fidx);
+        out_arr = _inline_find_nested_calls(n.c, out_arr, owner_fidx);
     }
-    T_ASSIGN  { out_arr = _inline_find_nested_calls(n.a, out_arr); out_arr = _inline_find_nested_calls(n.b, out_arr); }
-    T_MEMST   { out_arr = _inline_find_nested_calls(n.a, out_arr); out_arr = _inline_find_nested_calls(n.b, out_arr); }
+    T_ASSIGN  { out_arr = _inline_find_nested_calls(n.a, out_arr, owner_fidx); out_arr = _inline_find_nested_calls(n.b, out_arr, owner_fidx); }
+    T_MEMST   { out_arr = _inline_find_nested_calls(n.a, out_arr, owner_fidx); out_arr = _inline_find_nested_calls(n.b, out_arr, owner_fidx); }
     T_RET {
         if (n.c > 1) {
             arr = n.b; cnt = n.c;
             i = 0;
-            while (i < cnt) { out_arr = _inline_find_nested_calls(arr[i], out_arr); i++; }
+            while (i < cnt) { out_arr = _inline_find_nested_calls(arr[i], out_arr, owner_fidx); i++; }
         } else {
-            out_arr = _inline_find_nested_calls(n.a, out_arr);
+            out_arr = _inline_find_nested_calls(n.a, out_arr, owner_fidx);
         }
     }
     // Control-flow leaf bodies (2026-06-24) — same extension as
@@ -7063,27 +7198,27 @@ _inline_find_nested_calls(nd, out_arr) {
     // than necessary. Closing it here too so log_f's OWN inlining of
     // exp_f survives one level further out.
     T_IF {
-        out_arr = _inline_find_nested_calls(n.a, out_arr);
+        out_arr = _inline_find_nested_calls(n.a, out_arr, owner_fidx);
         arr = n.b; cnt = n.c;
         i = 0;
-        while (i < cnt) { out_arr = _inline_find_nested_calls(arr[i], out_arr); i++; }
+        while (i < cnt) { out_arr = _inline_find_nested_calls(arr[i], out_arr, owner_fidx); i++; }
         if (n.e > 0) {
             arr = n.d; cnt = n.e;
             i = 0;
-            while (i < cnt) { out_arr = _inline_find_nested_calls(arr[i], out_arr); i++; }
+            while (i < cnt) { out_arr = _inline_find_nested_calls(arr[i], out_arr, owner_fidx); i++; }
         }
     }
     T_WHILE {
-        out_arr = _inline_find_nested_calls(n.a, out_arr);
+        out_arr = _inline_find_nested_calls(n.a, out_arr, owner_fidx);
         arr = n.b; cnt = n.c;
         i = 0;
-        while (i < cnt) { out_arr = _inline_find_nested_calls(arr[i], out_arr); i++; }
-        if (n.e != 0) { out_arr = _inline_find_nested_calls(n.e, out_arr); }
+        while (i < cnt) { out_arr = _inline_find_nested_calls(arr[i], out_arr, owner_fidx); i++; }
+        if (n.e != 0) { out_arr = _inline_find_nested_calls(n.e, out_arr, owner_fidx); }
     }
     T_BLOCK {
         arr = n.b; cnt = n.c;
         i = 0;
-        while (i < cnt) { out_arr = _inline_find_nested_calls(arr[i], out_arr); i++; }
+        while (i < cnt) { out_arr = _inline_find_nested_calls(arr[i], out_arr, owner_fidx); i++; }
     }
     else { }
     }
@@ -7099,7 +7234,7 @@ _inline_find_nested_calls(nd, out_arr) {
 // cap needed). Records the resulting ids, in discovery order, in
 // `_inline_nested_ids[outer_id]` for splice time to consume positionally.
 // Registers; never stamps `.e` on anything — see `_inline_find_nested_calls`.
-void _inline_register_nested(outer_id, body_arr, body_cnt) {
+void _inline_register_nested(outer_id, body_arr, body_cnt, owner_fidx) {
     auto i, found, n: Node, fidx, nested_id, ids, last_stmt: Node, scan_cnt;
     // Scope to exactly the statements splice-time's own per-statement
     // loop will clone+walk: when the body ends in T_RET, that trailing
@@ -7131,7 +7266,7 @@ void _inline_register_nested(outer_id, body_arr, body_cnt) {
     found = arr_new();
     i = 0;
     while (i < scan_cnt) {
-        found = _inline_find_nested_calls(body_arr[i], found);
+        found = _inline_find_nested_calls(body_arr[i], found, owner_fidx);
         i++;
     }
     // _inline_find_nested_calls already has its own correct T_RET case
@@ -7139,7 +7274,7 @@ void _inline_register_nested(outer_id, body_arr, body_cnt) {
     // statement reuses that, rather than duplicating the n.c>1 branch
     // here a third time.
     if (last_stmt.ntype == T_RET) {
-        found = _inline_find_nested_calls(last_stmt, found);
+        found = _inline_find_nested_calls(last_stmt, found, owner_fidx);
     }
     if (arr_len(found) == 0) { return 0; }
     ids = arr_new();
@@ -7185,7 +7320,20 @@ void _inline_pre_reg_walk(nd) {
         }
         fidx = find_func_idx(n.a);
         if (fidx >= 0) {
-            if (arr_get(fn_inlineable, fidx)) {
+            if (arr_get(fn_inlineable, fidx) == 4) {
+                // Inc 8 (S4 wiring): oversized, cost-gated tier — checked
+                // BEFORE the generic multi-statement branch below (a
+                // tier-4 body is almost always body_cnt > 1, which would
+                // otherwise swallow it into the unconditional-splice
+                // path and defeat the whole point of gating it). Admit
+                // only when this SPECIFIC call site's cost clears its
+                // threshold — exp_f (cost 78) clears at a call site
+                // proven hot via fn_hot_transitive (threshold -> 90),
+                // and stays a real `bl` at any call site that isn't.
+                if (_inline_cost(fidx, n.b, n.c) <= _inline_threshold(fidx, cg_cur_fn_idx, n)) {
+                    _inline_register_callsite(n, fidx);
+                }
+            } else if (arr_get(fn_inlineable, fidx)) {
                 fn_rec = funcs[fidx];
                 callee_bcnt = *(fn_rec + FN_BCNT);
                 // body_cnt > 1 (multi-stmt) OR fn_inlineable == 2 (a single-
@@ -7370,6 +7518,18 @@ const INLINE_MULTIRET_NODE_CAP = 70;
 // the first attempt — see docs/plans/inliner_arc.md). ~10 admits the thin u8/16/
 // 32/64 + float load/store wrappers and rejects multi-peek bodies (read_u16be …).
 const INLINE_BUILTIN_NODE_CAP = 10;
+// Inc 8 (S4 wiring) — the ABSOLUTE backstop for tier 4 (oversized,
+// cost-gated) candidates. Past the free cap, admission is decided
+// per-callsite by cost-vs-threshold (_inline_threshold tops out around
+// 90-135 in realistic stacked-multiplier cases, 270 in the all-three
+// theoretical max) — this backstop exists purely to avoid wasting a
+// cost computation, and an actual splice, on a body no realistic
+// threshold would ever clear anyway. 3x the free cap is a round, generous
+// multiple, not a measured number — there is no candidate yet that needs
+// the exact value tuned; revisit with one if it ever gates something
+// real out.
+const INLINE_BODY_NODE_CAP_HARD = 150;
+const INLINE_MULTIRET_NODE_CAP_HARD = 210;
 
 // Inc 3b — normalise a guard-clause body to a single-return ternary, IN PLACE.
 // A body of EXACTLY the shape
@@ -7569,7 +7729,7 @@ void classify_inlineable() {
     auto i, fn_rec, body_arr, body_cnt, params, pcnt;
     auto last_stmt: Node, ret_stmt: Node, ret_expr, j, ok, refs;
     auto phase, body_cost, want_void, want_bind, was_guard, has_float_param;
-    auto ret_arity;
+    auto ret_arity, is_oversized;
     auto fp_changed, fp_iter, fp_sum_before, fp_sum_after, fp_si;
     while (arr_len(fn_inlineable) < func_cnt) {
         fn_inlineable = arr_push(fn_inlineable, 0);
@@ -7699,9 +7859,40 @@ void classify_inlineable() {
         // Inc 6: multi-return bodies get the separate, scoped cap (see
         // its own comment) — single-return bodies are unaffected, exact
         // same threshold as before this increment.
+        //
+        // Inc 8 (S4 wiring): a body over the free cap is no longer an
+        // automatic reject. It becomes tier 4 — "oversized, cost-gated"
+        // — ADMITTED ONLY if Inc 8's per-callsite cost-vs-threshold check
+        // (_inline_pre_reg_walk) clears it at that SPECIFIC call site;
+        // every cold call site still falls through to a real `bl`, same
+        // as an ungated tier-3 cold site already does. Tiers 1-3 below
+        // are completely unchanged — this only ever ADDS candidates that
+        // were previously rejected outright, never changes behavior for
+        // anything that already qualified under the free cap. A second,
+        // larger backstop (3x the free cap) still hard-rejects anything
+        // no realistic threshold would ever admit — avoids wasting a
+        // cost computation, and avoids splicing something absurd at the
+        // rare callsite with every multiplier stacked.
+        // 99 is _inline_count_nodes's SENTINEL ("genuinely disqualified" —
+        // T_SWITCH, an early return inside control flow, any other
+        // unsupported shape), not a real cost measurement. It happens to
+        // be bigger than the OLD caps (50/70) so the old plain `> CAP`
+        // check rejected it for free; Inc 8's HARD backstop (150/210) is
+        // bigger than 99, so the same check would silently let a sentinel
+        // through as "merely oversized" without this explicit guard —
+        // caught the hard way: a T_SWITCH body got promoted to tier 4 and
+        // crashed `_a64_emit_switch_jtbl` (jump-table emission has never
+        // had splice support; switch normalisation is a SEPARATE rewrite
+        // earlier in this same function, not a splice-time capability).
+        is_oversized = 0;
+        if (body_cost >= 99) { continue; }
         if (ret_arity > 1) {
-            if (body_cost > INLINE_MULTIRET_NODE_CAP) { continue; }
-        } else if (body_cost > INLINE_BODY_NODE_CAP) { continue; }
+            if (body_cost > INLINE_MULTIRET_NODE_CAP_HARD) { continue; }
+            if (body_cost > INLINE_MULTIRET_NODE_CAP) { is_oversized = 1; }
+        } else {
+            if (body_cost > INLINE_BODY_NODE_CAP_HARD) { continue; }
+            if (body_cost > INLINE_BODY_NODE_CAP) { is_oversized = 1; }
+        }
         // Inc 6: a T_CALL to a target that is ALREADY fn_inlineable does
         // not disqualify this body (it composes — see
         // _inline_has_disqualifying_tcall's own comment). Everything
@@ -7771,7 +7962,19 @@ void classify_inlineable() {
         // the pre-reg walk registers — and the codegen inlines — only its in-loop
         // call sites. Otherwise tier 2 (multi-use param) / tier 1 (thin), both
         // inlined at every call site.
-        if (was_guard) {
+        // Inc 8: tier 4 takes priority over every other tier — an
+        // oversized body's admission is decided per-callsite by
+        // _inline_pre_reg_walk's cost-vs-threshold check (below this
+        // function), not by the splice-mechanism concerns (was_guard /
+        // want_bind / has_float_param / multi-return) the other tiers
+        // exist to route correctly. Those concerns still matter for HOW
+        // tier 4 splices once admitted — _inline_pre_reg_walk's tier-4
+        // branch always uses the binding splice (cg_emit_inline_multi),
+        // which already handles float params / multi-statement bodies
+        // / multi-return correctly regardless of tier number.
+        if (is_oversized) {
+            arr_set(fn_inlineable, i, 4);
+        } else if (was_guard) {
             arr_set(fn_inlineable, i, 3);
         } else if (want_bind || has_float_param || ret_arity > 1) {
             // has_float_param forces tier 2 so a float param never takes the

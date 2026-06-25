@@ -744,3 +744,98 @@ Bootstrap byte-stable (gen2==gen3, confirmed AFTER both bug fixes — the
 hang and the corruption were both pre-fix-only), suite 219/0/12, C-emit
 176/0/55, all regalloc/autovec gates green, real games + sound_fusion +
 zener_comp compile clean, sound_fusion's audio md5 unchanged.
+
+## Increment 8 — wire up S4 + call-graph hotness propagation, same day
+
+The user pushed back on Inc 7's "measured, not a bug, didn't raise the
+shared cap" conclusion: a hand-picked node-count ceiling is the wrong
+shape of answer when nobody knows what a real b++ program will look
+like. Pointed at the dormant **S4 cost model** (`_inline_cost`,
+`_inline_threshold` — designed, never wired to a consumer, sitting in
+this same file since before this session) as evidence the codebase
+already half-agrees. Confirmed by hand that wiring S4 AS DESIGNED still
+would not have admitted `exp_f`: its only hotness signals are SHALLOW
+(does THIS call site sit in a textual loop; does the caller have 10+
+direct callers) — neither one reaches `exp_f`, five calls below the
+actual hot loop (`sf_render`'s per-sample mix -> `sf_channel_process` ->
+`zener_process` -> `comp_process` -> `db_to_amp_f` -> `exp_f`). User's
+call: build BOTH — S4 wiring AND a transitive hotness signal that
+reaches the real loop.
+
+**Shipped same day.** Three pieces:
+
+1. **`fn_max_call_loop_depth` + `fn_hot_transitive`** (new, in
+   `call_graph_build`/`_cgb_walk`) — the max parser-stamped loop depth
+   (`T_CALL.d`, already on every call node, S4 P0a) among every DIRECT
+   call site into a function, then propagated transitively over
+   `_fn_callers` (a fixpoint, same shape/cap as `classify_inlineable`'s
+   own): if G is hot and G calls F, F is hot too. Built for free inside
+   `_cgb_walk`'s existing T_CALL discovery — no new walk.
+
+2. **Tier 4 — "oversized, cost-gated"** (`classify_inlineable`). A body
+   over the existing free cap (50/70) no longer means outright
+   rejection: under a new, generous backstop (150/210 — round, not
+   measured; nothing needs it tuned yet) it becomes tier 4, admitted
+   ONLY per-callsite via `_inline_cost(...) <= _inline_threshold(...)`.
+   Tiers 1-3 are completely unchanged — tier 4 only ever ADDS candidates
+   that were previously rejected outright. `_inline_threshold` gained a
+   third multiplier, `×3` when the caller is `fn_hot_transitive` — bigger
+   than the existing `×2` (fanout) / `×1.5` (textual loop) because
+   "provably reachable from a real loop, at any depth" is strictly more
+   information than either shallow signal.
+
+3. **Threaded `owner_fidx` through the whole nested-call-discovery path**
+   (`_inline_find_nested_calls`, `_inline_register_nested`,
+   `_inline_stamp_nested`, `_cg_inline_splice_prelude`) — tier 4's cost
+   check has to fire identically at registration time AND splice time, or
+   the positional `nested_ids[nk]` stamping silently reads the wrong id
+   for the wrong call. This is the part that actually matters for
+   `exp_f`: it is never called directly from a hot top-level site, only
+   NESTED inside `db_to_amp_f`'s own body — without this threading, the
+   tier-4 check would only ever run at the (irrelevant) top level.
+
+**Two bugs caught before this shipped, both via `bug` per
+`docs/manual/debug_with_bug.md` rather than ad-hoc prints once pointed
+at the right tool:**
+
+- **A genuine SENTINEL bug, not a logic error.** `_inline_count_nodes`
+  returns **99** as a "fully disqualified" sentinel (T_SWITCH, an early
+  return inside control flow — Inc 7's own fix). 99 was always smaller
+  than the OLD caps (50/70), so a plain `> CAP` check rejected it for
+  free. The new HARD backstop (150/210) is BIGGER than 99 — so the same
+  comparison silently let a disqualified body through as "merely
+  oversized." A T_SWITCH-bodied function got promoted to tier 4 and
+  crashed compiling `sound_fusion.bpp` (segfault, `_a64_emit_switch_jtbl`
+  — jump-table emission has no splice support, was never supposed to be
+  reached this way). `bug --tui --break-all` caught it in one run — the
+  backtrace landed exactly on the crash frame. Fixed with an explicit
+  `if (body_cost >= 99) { continue; }` ahead of the backstop comparison,
+  independent of its exact value.
+- Lesson generalizes: any time an existing magic number doubles as both
+  "a real measurement" and "a sentinel," a SECOND magic number added
+  nearby (here, a backstop meant to be generous) can silently change
+  which one wins. Check sentinels explicitly; never let them ride on
+  "happens to be smaller than the old threshold."
+
+**Measured result**: `comp_process`'s `bl` count dropped from 2 to 1.
+`db_to_amp_f` (cost 5) — once `fn_hot_transitive` propagates hot from
+`sf_render`'s per-sample loop, through `sf_channel_process` ->
+`zener_process` -> `comp_process`, all the way down to `db_to_amp_f` —
+now inlines into `comp_process` directly, AND its own nested call to
+`exp_f` (cost 78, tier 4, cleared via the SAME propagated hotness)
+inlines too: the disassembly shows `exp_f`'s full range-reduce-and-series
+body spliced in, zero `bl` anywhere in that chain. `amp_to_db_f` still
+doesn't inline — correctly: it calls `log_f`, still disqualified by its
+own early-return domain guard (Inc 7), and Inc 6's composability rule
+correctly declines to wave through a call to a non-inlinable callee
+regardless of tier or hotness. Binary size: byte-identical on
+`sound_fusion`'s total size (content hash differs — net code-size delta
+from this one swap is effectively zero, call overhead removed roughly
+offsetting the duplicated body).
+
+Bootstrap byte-stable (gen2==gen3, confirmed after the sentinel fix),
+suite 219/0/12, C-emit 176/0/55, all gates green, real games +
+sound_fusion + zener_comp compile clean, audio md5 unchanged, the
+pre-existing moog-filter-chain inlining (tiers 1-3) verified unchanged
+by spot-checking `sf_channel_process`'s own `bl` count (still exactly 2:
+`rotary_tick`, `zener_process` — unaffected by tier 4's introduction).
