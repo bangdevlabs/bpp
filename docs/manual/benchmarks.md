@@ -619,6 +619,59 @@ functions or a different part of the chain entirely — not assumed,
 to be found by re-disassembling, per this whole project's standing
 discipline.
 
+## 2026-06-24 — full catalog re-run after the inliner Inc 7/8 arc
+(control-flow leaf bodies, S4 cost model + hotness propagation, the
+wide-literal regression fix — `docs/plans/inliner_arc.md`'s
+addenda have the per-commit detail) + the TG12345 compressor/zener_comp
+arc + the stbaudio/stbmixer dB-hack replacement
+
+User's own request after the inliner work landed: re-run the whole
+catalog, not just the one named benchmark that motivated the day's
+changes — exactly the discipline that caught the regression below in
+the first place.
+
+| Benchmark | Historical (2026-06-23) | Today | Verdict |
+|---|---|---|---|
+| `bench_compile.sh` bootstrap | 0.29-0.31s | 0.31s | unchanged |
+| `bench_codegen` biquad vs gcc -O2 | 0.96-1.03× | 1.075× | within noise |
+| `bench_codegen` lcg vs gcc -O2 | 0.96-1.01× | 1.042× | within noise |
+| `bench_codegen` xform vs gcc -O2 | 1.10-1.13× | **1.141×** | **was ~2× mid-session — see the regression+fix below; back to historical band** |
+| `bench_codegen` manylive vs gcc -O2 | 1.57-1.72× | 1.443× | better, within the established noise band |
+| `sf_bench` (stereo, ours) | 9.98 ms / 300× | **9.82 ms / ~298×** | unchanged-to-slightly-better — confirms today's compressor/inliner work didn't cost the real DSP hot path anything |
+| `sf_bench_flat` (stereo) | 5.20-5.30 ms | 5.33 ms | unchanged |
+| `sf_bench` oracle (gcc -O2, stereo) | 3.68-3.91 ms | 3.88 ms | unchanged |
+| `bench_compose` | 3× (72.5→19.4 ms) | 3× (70.0→22.1 ms) | unchanged, PASS |
+| `bench_simd_raw` | ~3× | 2.58× (prints as "2x", int-floor) | within noise, same int-floor print quirk as ever |
+| `bench_mixed_auto.sh` | PASS | PASS | — |
+| `bench_autovec_gate.sh` | PASS | PASS | — |
+| `bench_outline` | 92% vs hand-written explicit | 105% vs explicit, 4× vs serial | healthy, within noise |
+| `bench_ecs_iter` | 0.95× | 0.92× (92%) | within the informational band |
+| `bench_ecs_physics_simd` | 2×, PASS | 2×, PASS (positions match) | unchanged |
+| `bench_ecs_scheduler` | 45% of sequential | 64% of sequential, PASS | within noise (small absolute times, 12.9ms/8.3ms) |
+| `bench_ecs_sparse_query` | 2.95-13.82× (10%/2% buckets) | 2.76× / 12.29× (same buckets) | unchanged |
+| `bench_stbflow` (A* vs flow) | 4× | 6× | better, within the historical 4-6× band across sessions |
+| `tablah` / `tablah_opt` | totals ~48/~39 ms | ~51.6/~43.3 ms | within noise, same 24544-item filter result both variants |
+
+**The one real finding: `xform` regressed to ~2× mid-session, fixed
+same day.** Caught by this exact re-run discipline — see
+`docs/plans/inliner_arc.md`'s "A real ~2x regression" section for the
+full root-cause (VI-2 unconditionally splicing a void loop body whose
+two 64-bit constants lost hot-constant-promotion hoisting once spliced)
+and the fix (disqualify loop bodies with wide integer constants,
+`_inline_has_wide_lit`). Re-verified after the fix as part of this same
+re-run: back to 1.141×, matching history.
+
+**Audio correctness:** confirmed against `f61fac72be5077a6e9ef9cae21dde2a1`
+— unchanged across every commit of the day's session, compressor
+included (off by default in the demo project).
+
+**Takeaway:** the whole catalog holds at parity or better against its
+own history once the one real regression (caught by re-running this
+exact catalog, not by the synthetic correctness suite) was found and
+fixed. `sf_bench` — the benchmark that actually matters, the real
+call-heavy float32 DAW render — is unchanged-to-slightly-better despite
+a full day of compiler-internals work landing underneath it.
+
 ## Adding a benchmark
 
 A new runtime benchmark self-times with the bpp_bench helpers and prints a
