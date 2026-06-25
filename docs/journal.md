@@ -14780,3 +14780,39 @@ optionally exclusive/hog mode + a small buffer for low latency, and likely movin
 from the high-level AudioQueue to an AUHAL/HAL output unit. The UAD DSP itself
 (Console/UAD plugins) is reachable only through UAD's own SDK, not as a plain
 CoreAudio device. A stbaudio / _stb_audio_macos enhancement, future work.
+
+Then the compiler lever the deflated compressor had teed up — and measuring it
+first overturned the premise (again). The plan was "promote log_f's float locals
+to d8-d15 to kill its spill." Disassembling log_f showed there IS no local spill:
+the 7 locals are already promoted to d8-d14 (8 of its loads/stores are just the
+prologue/epilogue save+restore of those callee-saved registers). The real waste
+was the OTHER ~17 loads — each a float CONSTANT materialised as a 3-instruction
+`adrp x8 / add x8 / ldr d,[x8]` pool access, with the loop-invariant ones
+(2.0/0.5/1.0 in the range-reduce whiles) re-materialised every iteration. The
+right lever was therefore not register promotion (already done) but cheaper
+constant emission: AArch64 has `fmov d, #imm`, a single instruction that loads
+any of 256 encodable float constants (±(1+k/16)*2^e, k 0..15, e -3..4) — which
+covers exactly the common DSP constants 1.0/2.0/0.5/3.0/etc. New `_a64_fmov_imm8`
+(decides representability from the IEEE-754 bit pattern: low 48 mantissa bits
+zero + the NOT(b):b*8:c:d exponent shape) + `enc_fmov_imm`, wired into both float-
+constant emitters (`_a64_emit_load_float_const`, `_a64_emit_fconst_into`); a
+representable constant becomes one `fmov` instead of the 3-instruction pool load
+(bin mode; the --asm text path keeps the pool load, equally correct). log_f
+dropped 119 -> 93 instructions (adrp 17 -> 4, ldr 25 -> 12), and it helps every
+float-constant-heavy DSP loop, not just log_f. The fmadd half of the lever was a
+non-starter, also by measurement: float fmadd fusion already exists in the spine
+(bpp_codegen.bsm, `(left)+(a*b) -> fmadd`) and fires where the shape allows
+(log_f's one fmadd, sf_channel_process's four); log_f's atanh series is
+add-then-div, not mul-add, so there is nothing more to fuse — that's the math,
+not a codegen gap.
+
+Verified the full way: byte-stable bootstrap (gen2==gen3, the expected 1-cycle
+oscillation since the compiler emits float constants of its own), native
+219/0/12, C-emit 176/0/55, sound_fusion export md5 unchanged
+(`f61fac72be5077a6e9ef9cae21dde2a1`) — a strong correctness proof, since the DSP
+render leans on hundreds of float constants now emitted via fmov and a single
+wrong immediate would change the bytes. The `bug --disasm` decoder was BLIND to
+the new instruction (showed it as `.word`, the same class of false signal the
+NEON-blind disassembler once gave) — so it was taught to decode FMOV (scalar,
+immediate) too (`src/bug_disasm.bsm`), confirmed against `otool -tv` as the
+authoritative cross-check.
