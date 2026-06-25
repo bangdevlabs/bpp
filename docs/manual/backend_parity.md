@@ -36,6 +36,25 @@ always confirm a codegen change with the Docker self-host (`gen1 == gen2`).
 | Constant promotion (Stage 2a) | ✅ x19..x28 | ✅ rbx/r12..r15 | parity (`emit_mov_phys`) |
 | Wider B3 budget — caller-saved promotion in leaf fns | ✅ x9..x12 (10→14) | ❌ (keeps 5) | **a64 only** |
 | Induction-variable pointer walk (`base[i]` → walking reg) | ✅ | ❌ `iv_supported`=0 (no post-index) | **a64 only** |
+| RegAlloc v2 (liveness → linear-scan; shares one reg across non-overlapping live ranges + sees through inlined call sites) | ✅ int + float | ❌ stub (`_x64_regalloc_apply` = `return 0`) | int: **a64 only** (implementable); float: **architectural** (no callee-saved XMM band to allocate into) |
+| `fmov d, #imm` for AArch64-encodable float constants (1 insn) | ✅ | n/a | a64 closing its OWN 3-insn `adrp+add+ldr` cost for encodable consts; x64 already loads ANY float const in one `movsd [rip]`, so x64 is *ahead* on non-encodable constants |
+
+## Bottom line for a port
+
+For the question "how far behind is x64 when we port?": measured on `log_f`
+(a float-heavy transcendental) the x64 codegen is **~2.7× larger** than a64
+(~1008 vs ~368 bytes). That whole gap is the **float family** — float-CIP,
+float-B3, `fmadd` — and it is **architectural, not debt**: SysV makes every
+XMM caller-saved, so the d8..d15 promotion the a64 float wins depend on has no
+x64 target. It will not close, and re-attempting it is the one thing this doc
+exists to stop. For **integer / control-flow / SIMD / structural** code x64 is
+at or near parity (inline, B3, const-promotion, multi-return, autovec, dynlink
+all real); the only genuine x64 debt is **integer-CIP** (deferred, low-value —
+SysV's shallow GP freelist caps it) and the **integer** half of RegAlloc v2
+(implementable). Practical reading: porting the audio/DSP engine to x64 will run
+**correctly** but meaningfully slower per float sample — and since a64 has
+~290× realtime headroom on the DAW render, even ~2.7× slower leaves comfortable
+realtime margin. The slowdown is inherent to x86-64, not a backlog to burn down.
 
 ## Architectural gaps (permanent — do NOT "fix")
 
@@ -85,25 +104,14 @@ To implement:
    regions) is more work for diminishing return — **low priority**: the SysV
    register pressure caps the win.
 
-### Constant promotion (Stage 2a)
+### Constant promotion (Stage 2a) — ✅ SHIPPED on x64 (no longer deferred)
 
-a64 promotes hot loop-invariant constants into spare callee-saved registers;
-x64 does not. **Spine is complete and backend-agnostic** — the loop-weighted
-constant table (`cg_const_val/wt/reg`), the prologue materialisation (step
-12b in `emit_func`), and all three use-sites read the table on any backend.
-The ONLY a64-specific piece is `_a64_b3_select_const()`, chained into
-`_a64_b3_select_prim`. x64's `_x64_b3_select_prim` simply doesn't call a
-const-select, so `cg_const_reg` stays `-1` and every use-site/materialise is
-a no-op.
-
-To implement: add `_x64_b3_select_const()` (mirror the a64 one — rank
-`cg_const_wt`, assign x64's free callee-saved regs r12..r15/rbx not taken by
-local B3, push them onto `x64_promoted_regs` so the prologue saves them, set
-`cg_const_reg`) and append it to `_x64_b3_select_prim`. The accumulator
-use-site (`cg_emit_lit`) and the prologue materialise then light up
-automatically. Higher value than x64 integer-CIP because it works on the
-accumulator path (no freelist pressure) and SysV has enough callee-saved GP
-registers.
+Closed since this section was written: `_x64_b3_select_prim()` now chains
+`_x64_b3_select_const()` (verified — `x64_primitives.bsm`), so x64 promotes hot
+loop-invariant constants into spare callee-saved GP registers exactly like a64.
+This is the parity row in the matrix above (`emit_mov_phys`); the old
+"to implement" steps are kept out of the doc per the closing rule below. Left
+here only as a marker that it was once deferred and is now done.
 
 ## When to update this doc
 
