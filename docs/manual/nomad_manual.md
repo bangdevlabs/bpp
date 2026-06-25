@@ -1,5 +1,13 @@
 # The B++ Nomad Manual — Portability Doctrine
 
+> **Spine/backend doc trio** — three sibling docs, kept separate on purpose
+> (different jobs, different change rates — don't merge them). **You are reading
+> the *doctrine*** (how to reach a new target — principles, stable). The others:
+> [backend_parity.md](backend_parity.md) — the *scoreboard* (exactly where a64
+> and x64 diverge **today**; updated on every codegen change);
+> [spine_analysis.md](spine_analysis.md) — the *design rationale* (is the spine a
+> C--, should it evolve, + b++'s typing model).
+
 How B++ travels. This is the playbook for reaching a new target — a new chip, OS,
 binary format, or GPU/audio backend — without the cost curve exploding, and the
 field-tested techniques learned building B++ itself. It is the *target-agnostic*
@@ -45,7 +53,10 @@ LOC). The "zero change in user code" is the feature, not a side effect.
 ## 2. Push the decision early — the spine
 
 The earlier in the pipeline a decision is made, the fewer backends carry its
-weight.
+weight. (For the *design analysis* of this spine — what the 30-primitive
+contract is, whether it is a real C--, and whether it should grow an
+optimizing IR — see [spine_analysis.md](spine_analysis.md); this section is the
+*porting rule*, that one is the *rationale*.)
 
 ```
 Source → Lexer → Parser → AST → Dispatch/Validate → Codegen → Binary

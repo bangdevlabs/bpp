@@ -1,5 +1,15 @@
 # Spine vs. C-- — is the b++ codegen spine a "portable assembly"?
 
+> **Spine/backend doc trio** — three sibling docs, kept separate on purpose
+> (different jobs, different change rates — don't merge them). **You are reading
+> the *design rationale*** (what the spine is, whether it should become a real
+> C--, and b++'s typing model — reflective, rarely changes). The others:
+> [nomad_manual.md](nomad_manual.md) — the *doctrine* (how to reach a new
+> target); [backend_parity.md](backend_parity.md) — the *scoreboard* (where a64
+> and x64 diverge today, updated every codegen change). The typing appendix at
+> the end is really a language-design topic riding along here; if a dedicated
+> language-design doc is ever started, it belongs there.
+
 **What this is.** A design analysis triggered by a question: in the Simon
 Peyton Jones interview (*Co-Creator of Haskell*, youtu.be/xcB_LF3cdqw) he
 describes **C-- / Cmm** — the portable assembly language GHC uses to lower

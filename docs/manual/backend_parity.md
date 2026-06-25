@@ -1,5 +1,14 @@
 # Backend parity — aarch64 vs x86_64
 
+> **Spine/backend doc trio** — three sibling docs, kept separate on purpose
+> (different jobs, different change rates — don't merge them). **You are reading
+> the *scoreboard*** (exactly where a64 and x64 diverge **today** — the one that
+> changes on every codegen commit; see "When to update this doc" at the bottom).
+> The others: [nomad_manual.md](nomad_manual.md) — the *doctrine* (how to reach a
+> new target, the principles this matrix is an instance of);
+> [spine_analysis.md](spine_analysis.md) — the *design rationale* (is the spine a
+> C--, should it evolve, + b++'s typing model).
+
 B++ is backend-agnostic by construction: the spine (`bpp_codegen.bsm`) owns
 the portable codegen logic and defers instruction emission to a chip's
 `ChipPrimitives` table (a64 = `aarch64/`, x64 = `x86_64/`). This document is
