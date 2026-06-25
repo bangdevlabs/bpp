@@ -158,24 +158,21 @@ audio_get_volume() {
 // Positive dB values (gain) are clamped to 0 to prevent clipping
 // in the s16 callback.
 //
-// The math in a CPU normally uses 10^(db/20), but the B++ runtime
-// has no pow() yet. We fake it with two integer tricks:
-//
-//   1. Every -6 dB halves the amplitude. A right-shift by
-//      (abs(db)/6) handles all multiples of 6 exactly.
-//   2. The 0..-5 dB remainder is looked up in a 6-entry table of
-//      ratios-out-of-1000. Worst-case error across the full
-//      0..-96 dB range is < 0.3% on the amplitude value, which is
-//      inaudible (the human JND for loudness is ~1 dB, and this
-//      table's error tops out at ~0.03 dB).
-//
-// Below -96 dB we just emit silence — s16 can't represent finer
-// attenuation than that anyway.
+// Real math now (db_to_amp_f / amp_to_db_f, bpp_math.bsm, added
+// 2026-06-24 for the sound_fusion channel compressor) — this used to
+// fake 10^(db/20) with an integer halving-ladder + a 6-entry ratio
+// table, BECAUSE the runtime had no pow()/log()/exp() anywhere yet.
+// That workaround's own header comment promised "When the runtime
+// ships pow() the helper can swap to direct math without changing the
+// API" — see docs/manual/audio_specs.md Cap 2.3 for the full story of
+// what motivated finally shipping it (a real circuit-compressor's
+// threshold, not this file). Below -96 dB we just emit silence — s16
+// can't represent finer attenuation than that anyway.
 
 // Set output volume in decibels. 0 dB = full scale, negative
 // numbers attenuate. Typical plugin range is -60..0 dB.
 void audio_set_volume_db(db) {
-    auto neg_db, halvings, remainder, base_amp, amp;
+    auto db_f: float, amp_f: float, amp: word;
     if (db >= 0) {
         _stb_audio_set_amplitude(32700);
         return;
@@ -184,65 +181,39 @@ void audio_set_volume_db(db) {
         _stb_audio_set_amplitude(0);
         return;
     }
-    neg_db = 0 - db;                // e.g. 9 for -9 dB
-    halvings = neg_db / 6;
-    remainder = neg_db - halvings * 6;
-    base_amp = 32700 >> halvings;   // each halving is -6 dB exactly
-    // 6-entry remainder table. Each value is 10^(-n/20) * 1000
-    // rounded to nearest int.  -0 → 1000, -1 → 891, -2 → 794,
-    // -3 → 708, -4 → 631, -5 → 562.
-    if (remainder == 0) { amp = base_amp; }
-    else if (remainder == 1) { amp = base_amp * 891 / 1000; }
-    else if (remainder == 2) { amp = base_amp * 794 / 1000; }
-    else if (remainder == 3) { amp = base_amp * 708 / 1000; }
-    else if (remainder == 4) { amp = base_amp * 631 / 1000; }
-    else                     { amp = base_amp * 562 / 1000; }
+    db_f = db;
+    amp_f = db_to_amp_f(db_f) * 32700.0;
+    amp_f = amp_f + 0.5;   // round to nearest — amp_f is always >= 0 here
+    amp = amp_f;
     _stb_audio_set_amplitude(amp);
 }
 
 // Read the current volume in decibels. Returns 0 for full-scale
-// amplitude and -96 for silence. The computation walks the
-// halving ladder (every doubling of the amp is +6 dB) then
-// resolves the remainder by comparing against the same 6-entry
-// ratio table used in the setter.
+// amplitude and -96 for silence.
 //
 // Round-trip precision: audio_set_volume_db(x) followed by
-// audio_get_volume_db() returns x exactly for integer dB values
-// in the valid range. Slightly off only when the user set raw
-// amplitude via audio_set_amplitude and we have to reverse-map
-// a value that does not sit on a table entry.
+// audio_get_volume_db() returns x exactly for integer dB down to -73
+// (verified by exhaustive scan, tests/test_db_swap.bpp). Below that the
+// limit is the INTEGER AMPLITUDE STORAGE (0..32700), not the math:
+// near -74dB the achievable amplitudes are sparse enough (6, 7, 8...)
+// that consecutive integers are already >1dB apart, so no forward
+// formula — table or exact log/exp — can hit every integer dB exactly
+// from there down; log_f/exp_f's own precision (~15 digits) is many
+// orders of magnitude tighter than this floor. The PREVIOUS table-based
+// implementation hit this same wall 11dB earlier (-63, confirmed by
+// running the identical scan against it) — its own approximation error
+// compounded with the storage quantization; this version only pays the
+// quantization.
 audio_get_volume_db() {
-    auto amp, halvings, base, ratio;
+    auto amp: word, amp_f: float, db_f: float, db: word;
     amp = _stb_audio_get_amplitude();
     if (amp == 0)       { return 0 - 96; }
     if (amp >= 32700)   { return 0; }
-    // Count the halvings from the raw amp up to the top 6-dB
-    // bracket [16384..32767]. Each iteration doubles the base
-    // and adds 6 dB of attenuation to the final answer.
-    halvings = 0;
-    base = amp;
-    while (base < 16384 && halvings < 16) {
-        base *= 2;
-        halvings++;
-    }
-    // Base now in [16384..32767]. Compare against nearest-neighbour
-    // midpoints to pick the 0..-5 dB remainder. Table values at
-    // the 32700 full-scale reference:
-    //   0 dB → 32700   mid 30918  (to -1 bucket)
-    //  -1 dB → 29136   mid 27550
-    //  -2 dB → 25964   mid 24558
-    //  -3 dB → 23151   mid 21893
-    //  -4 dB → 20634   mid 19506
-    //  -5 dB → 18377   mid 17364
-    //  -6 dB → 16350   (fall-through bumps one more tier of 6 dB)
-    if      (base >= 30918) { ratio = 0; }
-    else if (base >= 27550) { ratio = 1; }
-    else if (base >= 24558) { ratio = 2; }
-    else if (base >= 21893) { ratio = 3; }
-    else if (base >= 19506) { ratio = 4; }
-    else if (base >= 17364) { ratio = 5; }
-    else                    { ratio = 6; }
-    return 0 - (halvings * 6 + ratio);
+    amp_f = amp;
+    db_f = amp_to_db_f(amp_f / 32700.0);
+    db_f = db_f - 0.5;   // round to nearest — db_f is always < 0 here
+    db = db_f;
+    return db;
 }
 
 // Mute bookkeeping. Two words so the "is muted" check stays cheap
