@@ -1,7 +1,7 @@
 # Plan — the Inliner Arc (codegen Frontier 1)
 
-**Goal:** close the **×3.7 inliner gap** the tiny_lofi DAW exposed (16.6 ms
-`tl_render` vs 4.5 ms hand-inlined vs 2.2 ms clang -O2; see benchmarks.md). Real
+**Goal:** close the **×3.7 inliner gap** the sound_fusion DAW exposed (16.6 ms
+`sf_render` vs 4.5 ms hand-inlined vs 2.2 ms clang -O2; see benchmarks.md). Real
 call-heavy programs pay a per-call tax that the tight microbenchmark kernels hid.
 Frontier 2 (RegAlloc v2, the residual ×2) follows this arc.
 
@@ -16,7 +16,7 @@ body (6093), control flow (node-count 99), >3 params. A **cost-model inliner
 
 Our DAW hot path is blocked everywhere: `flt_onepole_tick` (float),
 `moog_taps` (float + multi-return), `moog_slope` (float + switch + call),
-`tl_channel_process` (float + if + call), `arr_struct_at` (if + 2 returns).
+`sf_channel_process` (float + if + call), `arr_struct_at` (if + 2 returns).
 
 ## Lesson from the first attempt (2026-06-18) — gate before you relax
 
@@ -54,7 +54,7 @@ every downstream `/tmp` compiler. Recover with `git show HEAD:bpp > bpp` via a
 FRESH inode, and build from the stable installed `/usr/local/bin/bpp`, never the
 just-overwritten `./bpp`.)
 
-## Stages (each gate: bootstrap → INSTALL → 192/0/12 + 155/0/49-on-the-installed-binary + `bpp --c` smoke + tl_bench + binary-size + audio md5)
+## Stages (each gate: bootstrap → INSTALL → 192/0/12 + 155/0/49-on-the-installed-binary + `bpp --c` smoke + sf_bench + binary-size + audio md5)
 
 > **Status: Inc 1 SHIPPED (re-landed + fixed, 2026-06-18).** Two earlier attempts
 > reverted (bloat; then a `--c` self-miscompile). The third landed: same size-gated
@@ -76,9 +76,9 @@ just-overwritten `./bpp`.)
 > is safe. **Binary flat (998514, identical to Inc 1 — no bloat), as predicted for
 > pure foundation.** gen2==gen3 byte-stable + `--c` smoke clean (incl. the compiler
 > self-emit that crashed Inc 1) + 193/0/12 + 156/0/49 on the installed binary.
-> tl_bench ~15.4 ms (no regression; small win). Audio byte-identical to the trusted
+> sf_bench ~15.4 ms (no regression; small win). Audio byte-identical to the trusted
 > Inc 1 binary (corrected baseline `7ee452e7eb9237debafa7302b177d66c` — the old
-> `8b8742ca…` predated a `tiny_lofi.bpp` edit and was stale).
+> `8b8742ca…` predated a `sound_fusion.bpp` edit and was stale).
 
 Two gating mechanisms, used where each fits: a **size gate** (a thin body that's
 size-neutral to inline can go everywhere) and a **hotness gate** (a bigger or
@@ -92,7 +92,7 @@ the first bigger/widely-used target needs it.
   (10) so ONLY thin single-instruction wrappers qualify. **The fix that made it
   real:** name comparison in the analysis pass must use `_inline_name_eq` (over
   `vbuf`), NOT `cg_str_eq` (over the codegen-time `cg_sbuf`, which is 0 in `--c`).
-  read_u16/write_u16 now inline (tl_render 6 bl/iter → 3); **binary flat** (998386
+  read_u16/write_u16 now inline (sf_render 6 bl/iter → 3); **binary flat** (998386
   → 998514, +128 B, no bloat). Audio byte-identical; native 192/0/12 + C-emit
   155/0/49 **on the installed binary** + `bpp --c` smoke + byte-stable bootstrap.
 
@@ -121,7 +121,7 @@ the first bigger/widely-used target needs it.
     backend-agnostic** — `_inline_pre_reg_walk_body` runs for both a64 and x64,
     so no gap/stub. Nothing is tier 3 yet → inert: gen2==gen3 byte-stable,
     `--c` clean (incl. self-emit), 193/0/12 + 156/0/49 on the installed binary,
-    tl_bench flat (16.9 ms). Binary 998514.
+    sf_bench flat (16.9 ms). Binary 998514.
 
   - **Inc 3b — guard-clause acceptance, `arr_struct_at` as first consumer. ✅ SHIPPED.**
     `classify_inlineable` recognises the guard-clause shape
@@ -132,8 +132,8 @@ the first bigger/widely-used target needs it.
     the existing tier-2/3 binding path (Inc 2) emits it — **no new early-return
     splice machinery** (the new ternary/ret wrapper nodes need no `itype`; the
     ternary emit derives its type from the branches). `arr_struct_at` inlines
-    only inside loops (`tl_render` per-clip lookup, `bl` count 3→2) and stays a
-    normal call at its ~80 cold sites. **Result: tl_bench 16.9→15.3 ms (~10%, the
+    only inside loops (`sf_render` per-clip lookup, `bl` count 3→2) and stays a
+    normal call at its ~80 cold sites. **Result: sf_bench 16.9→15.3 ms (~10%, the
     arc's first real win); cost +1.65% compiler binary, self-compile flat
     (0.24s).** Verified: gen2==gen3 + 193/0/12 + 156/0/49 on the installed binary
     + `--c` clean (incl. self-emit) + audio md5 `7ee452e7…`. The mutate-in-place
@@ -162,7 +162,7 @@ the first bigger/widely-used target needs it.
      slots in the outer frame, and have the splice consume the pre-stamped clone.
   2. **The filter chain is multi-gate-coupled — T_CALL alone won't move it.**
      `flt_onepole_tick` (float), `moog_taps` (multi-return), `moog_slope` (switch),
-     `tl_channel_process` (float + if) are each blocked by a DIFFERENT gate too.
+     `sf_channel_process` (float + if) are each blocked by a DIFFERENT gate too.
      Collapsing the chain needs float-leaf inlining + Inc 5 (multi-return) + more
      control-flow + the nested-inline architecture, together — not T_CALL in
      isolation.
@@ -170,10 +170,10 @@ the first bigger/widely-used target needs it.
   **Measured 2026-06-19 (throwaway env-gated probe `BPP_INLINE_PROBE`, reverted).**
   Counted functions blocked PURELY by the T_CALL gate whose calls are all to
   inlinable callees — the exact ceiling of a tier-1/T_CALL relaxation:
-  - **tl_bench compile: 3 candidates** (`randi`, `tl_clip_count`, `tl_clip_at`) —
-    ALL cold. `tl_render` calls `arr_struct_at` / `arr_struct_count` *directly*
+  - **sf_bench compile: 3 candidates** (`randi`, `sf_clip_count`, `sf_clip_at`) —
+    ALL cold. `sf_render` calls `arr_struct_at` / `arr_struct_count` *directly*
     (already inlined by Inc 3b), not via the wrappers → **T_CALL relaxation gives
-    ZERO tl_bench win.** And the chain functions never even reach the T_CALL gate
+    ZERO sf_bench win.** And the chain functions never even reach the T_CALL gate
     (rejected earlier at float/multi-return/switch), so "1" alone wouldn't help
     the DAW either.
   - **self-compile: 33 candidates** (`diag_file_*`, `mod_bnd_*`, `fn_type_*`,
@@ -193,13 +193,13 @@ the first bigger/widely-used target needs it.
   conversion happens at the typed-slot assignment, matching a real call). Collapses
   `moog_taps`'s 4 `bl` → 0 via the EXISTING Inc 2 binding path at one level
   (moog_taps is standalone — multi-return), so NO nesting architecture needed.
-  **Result: tl_bench 15.3 → 13.1 ms (~14%; cumulative 16.9→13.1 = ~22%).**
+  **Result: sf_bench 15.3 → 13.1 ms (~14%; cumulative 16.9→13.1 = ~22%).**
   Compiler binary flat (no hot float leaves in the compiler), audio byte-identical
   (`7ee452e7…`), gen2==gen3, 193/0/12 + 156/0/49, `--c` clean. T_CALL/nesting
   (the "1" architecture) remains the LAST piece, after Inc 5 + control-flow.
 
 - **Inc 5 — multi-value-return splice. ✅ SHIPPED 2026-06-22, mechanism only —
-  zero measured tl_bench win, as predicted by item 2 above.** Lifted the
+  zero measured sf_bench win, as predicted by item 2 above.** Lifted the
   blanket `fn_ret_arity > 1` reject in `classify_inlineable`
   (`bpp_dispatch.bsm:6226`) to a narrow shape check (trailing multi-return
   T_RET, arity matching the signature, forced tier 2); fixed the T_RET-multi
@@ -240,11 +240,11 @@ the first bigger/widely-used target needs it.
   shipped) is irrelevant to THIS gate — it inspects what the callee's body
   *says*, not what it *compiles to*. Confirmed by disasm (`moog_slope` still
   shows a real `bl` + bank-pop sequence at the `moog_taps` call site) and by
-  re-measuring tl_bench: 15.39 ms min-of-5, statistically unchanged from the
+  re-measuring sf_bench: 15.39 ms min-of-5, statistically unchanged from the
   15.29 ms pre-Inc-5 baseline. This is exactly item 2's prediction above,
   now confirmed by measurement rather than assumed: the filter chain is
   multi-gate-coupled, and Inc 5 alone — while a correct, necessary, tested
-  piece of the puzzle — was never going to move tl_bench by itself. The
+  piece of the puzzle — was never going to move sf_bench by itself. The
   remaining piece is the nested-inline architecture itemized in (1) above:
   clone each inlinable callee body, stamp fresh callsite ids on the clone,
   register the clone's slots in the OUTER frame, and let the splice consume
@@ -352,37 +352,37 @@ the first bigger/widely-used target needs it.
     Verified: `bug --disasm` on `moog_slope`/`moog_tick` shows **zero
     `bl`** at the `moog_taps` call site in both — full inlining, finally.
     Audio export md5 unchanged. 200/0/12 native, 160/0/52 C-emit,
-    bootstrap byte-stable. **tl_bench: NO measurable movement** (~15.3-
+    bootstrap byte-stable. **sf_bench: NO measurable movement** (~15.3-
     15.5 ms min-of-5, same noise band as before Commit C) — eliminating
     this one `bl` per channel per sample was not a measurable fraction
-    of `tl_render`'s real cost. This is itself the answer to Part 2's
+    of `sf_render`'s real cost. This is itself the answer to Part 2's
     decision rule below: `ours` did NOT converge toward `flat`, so the
     remaining gap is NOT primarily inliner-shaped at this point — see
     Part 2's first branch.
 
-**Target:** ~16.6 → ~4.5 ms (the hand-inlined `tl_bench_flat` number, as it
+**Target:** ~16.6 → ~4.5 ms (the hand-inlined `sf_bench_flat` number, as it
 stood pre-rotary); Inc 3b took the first step (16.9 → 15.3), float-leaf the
 second (15.3 → 13.1 ms, *before* the rotary insert existed). The rotary
 (slice 5, 2026-06-22) then added its own per-sample `bl` back, and re-syncing
-`tl_bench`/`tl_bench_flat` to the real post-rotary, post-stereo project
+`sf_bench`/`sf_bench_flat` to the real post-rotary, post-stereo project
 re-based the table at **15.29 ms (ours) / 5.06 ms (flat) / 3.26 ms (oracle)**
 — Inc 5 shipped the multi-return mechanism against THIS baseline and
 measured no movement (15.29 → ~15.4 ms, noise). Inc 6 (Commits A-C) then
 shipped the nested-inline architecture AND got `moog_taps` to fully
 collapse into `moog_tick`/`moog_slope` (zero `bl`, confirmed by disasm) —
 and STILL measured no movement (~15.3-15.5 ms min-of-5). Two increments in
-a row closing real, verified inliner gaps with zero `tl_bench` effect is
+a row closing real, verified inliner gaps with zero `sf_bench` effect is
 itself the signal: the remaining `ours`-vs-`flat` gap is concentrated
 somewhere call-overhead elimination doesn't reach — most likely
 `moog_slope`'s own `switch` dispatch, `rotary_tick`'s if/else, or
-`tl_channel_process`'s surrounding loop structure, none of which the
+`sf_channel_process`'s surrounding loop structure, none of which the
 inliner can touch without first extending past the existing control-flow
 gate (a materially bigger, separately-scoped project, not a natural next
 increment of this one). Per the plan's own decision rule: **re-disassemble
-`tl_bench`'s actual hot loop before opening anything else** — find out
+`sf_bench`'s actual hot loop before opening anything else** — find out
 empirically where the remaining cycles go rather than assuming it's "more
 inlining" just because that's the tool already in hand. The flat/oracle
-gap (~1.5-1.6x) is unchanged by any of this (neither `tl_bench_flat` nor
+gap (~1.5-1.6x) is unchanged by any of this (neither `sf_bench_flat` nor
 the oracle calls `moog_taps`) and remains Frontier 2's territory (RegAlloc
 v2 / liveness, roadmap F.2, `docs/plans/compiler_boost_roadmap.md`) —
 unopened, ungated change from before.
@@ -390,7 +390,7 @@ unopened, ungated change from before.
 ## Discipline
 
 Same as the codegen journey: one increment per commit; **the compiler is the
-test harness** — `tl_bench` (perf) + `tiny_lofi --render` md5 (correctness) +
+test harness** — `sf_bench` (perf) + `sound_fusion --render` md5 (correctness) +
 the two suites + byte-stable bootstrap, every step. Use `the_bug` (`--disasm` /
 `--break`, see `docs/manual/debug_with_bug.md`) when a step regresses
 byte-stability. Measure, don't believe.
@@ -407,7 +407,7 @@ leaves or comparison operators. Four commits, in order:
    struct-field load/store's `base + literal` address into the
    instruction's own offset, and skip copying an already-promoted base
    into the accumulator when the address can read/write through it
-   directly. `tl_bench` 15.4 → 13.76 ms.
+   directly. `sf_bench` 15.4 → 13.76 ms.
 2. `2ad0685` — extend F.2.c's float compute-in-place
    (`cg_float_tree_need`/`cg_emit_float_into`) to `T_MEMLD` (struct-field)
    leaves, mirroring the proven integer-CIP precedent. `13.76 → 13.08 ms`.
@@ -439,7 +439,7 @@ above.
    the dominant remaining lever.
 
 **`rotary_tick`'s own disassembly: 35 → 5 `fmov` (86% reduction).
-`tl_bench`: 15.4 → 12.07 ms min-of-5 (~22% across the four float-CIP
+`sf_bench`: 15.4 → 12.07 ms min-of-5 (~22% across the four float-CIP
 commits).** No further float-CIP leaf gap is known; the struct-field/
 comparison/literal trio is, as far as re-disassembly shows, complete.
 
@@ -451,7 +451,7 @@ comparison/literal trio is, as far as re-disassembly shows, complete.
    eligibility, a new shared `cg_float_cmp_operands_into` helper, a new
    `emit_cmp_flt_branch` primitive mirroring `emit_cmp_branch_rr`).
    `rotary_tick`: 6 of the remaining `fcmp`/`cset`/`cbz` triplets fused to
-   `fcmp`/`b.cc` (175 → 169 instructions). **`tl_bench`: 12.07 → 12.11 ms
+   `fcmp`/`b.cc` (175 → 169 instructions). **`sf_bench`: 12.07 → 12.11 ms
    — no measurable movement, reported honestly.** A `cset` feeding an
    immediately-following `cbz` sits off the critical dependency path on
    an out-of-order core (the branch predictor speculates past it
@@ -477,7 +477,7 @@ hadn't: lcg 0.99x, xform 1.08x, biquad 1.01x, all within the documented
 parity band).
 
 6. `832e75b` — typed push/pop for call arguments. Re-disassembling
-   `tl_channel_process` (one call deep from `tl_render`, not
+   `sf_channel_process` (one call deep from `sf_render`, not
    `rotary_tick` this time) found a different, much bigger-in-scope
    pattern: every call argument was pushed through the stack as raw
    integer bits (a float bit-reinterpreted via `fmov` first), popped
@@ -514,18 +514,18 @@ parity band).
    call site already passes explicitly-typed literals matching the
    intended param. `cg_ext_par_is_float` is now unused, removed.
 
-   `tl_channel_process`: the `fmov` bounce around its `rotary_tick` call
-   is gone, confirmed via disasm. **`tl_bench`: 12.07 → 11.39 ms (~5.6%)**
+   `sf_channel_process`: the `fmov` bounce around its `rotary_tick` call
+   is gone, confirmed via disasm. **`sf_bench`: 12.07 → 11.39 ms (~5.6%)**
    — unlike branch-fusion, this removes work that WAS on the critical
    path (the extra `fmov`s feed directly into the call). 206/0/12 native
    (every GPU/window test green again), 166/0/52 C-emit, audio md5
    unchanged, bench_codegen vs gcc -O2 unchanged.
 
-**Running total at this point: `tl_bench` 15.4 → 11.39 ms (~26%).**
+**Running total at this point: `sf_bench` 15.4 → 11.39 ms (~26%).**
 
 7. `1d68b21` — fixed a separate, genuinely pre-existing bug found while
    chasing the next lever via fresh re-disassembly of `moog_tick` (one
-   level of nested inlining deeper than `rotary_tick`/`tl_channel_process`
+   level of nested inlining deeper than `rotary_tick`/`sf_channel_process`
    — the user explicitly asked to fix it once found, even though it
    predates today: "mesmo sendo pre-existente vamos consertar").
    `ast_clone_subst`'s `T_ASSIGN` case never got the same per-element
@@ -542,8 +542,8 @@ parity band).
    had been rendering complete silence (peak 0/32767) for as long as
    `moog_tick` existed, since nothing in the test suite exercises this
    nested shape. Fixed by mirroring `T_RET`'s own fix exactly. After:
-   peak 17561/32767, audible. `tl_bench`/audio md5 unaffected (`moog_tick`
-   itself isn't on tiny_lofi's render path — `moog_slope` is — so the bug
+   peak 17561/32767, audible. `sf_bench`/audio md5 unaffected (`moog_tick`
+   itself isn't on sound_fusion's render path — `moog_slope` is — so the bug
    was dormant for the DAW specifically).
 
 8. `99e504e` — the lever the re-disassembly was actually chasing: with
@@ -565,10 +565,10 @@ parity band).
    or a FURTHER nested splice sees `TY_UNK` and the new type-match check
    always treats it as a mismatch. `moog_tick`: 119 → 86 instructions
    (zero stack spills around any of the four poles, confirmed via
-   disasm). **`tl_bench`: 11.39 → 10.16 ms (~10.6%) — the single biggest
+   disasm). **`sf_bench`: 11.39 → 10.16 ms (~10.6%) — the single biggest
    commit of the whole investigation.**
 
-**Running total at this point: `tl_bench` 15.4 → 10.16 ms (~34%).**
+**Running total at this point: `sf_bench` 15.4 → 10.16 ms (~34%).**
 
 9. `8bbb905` — closed the doc's own predicted "needs control-flow +
    nested-inline" gap for the remaining chain link. Re-disassembling
@@ -600,12 +600,12 @@ parity band).
    the same id sequence the prelude's per-statement loop started).
 
    Verified via `bug --disasm` on the REAL target, not just the new
-   synthetic test: `tl_channel_process`'s only remaining `bl` is
+   synthetic test: `sf_channel_process`'s only remaining `bl` is
    `rotary_tick` (an unrelated plugin) — `moon_process → moog_slope →
    moog_taps → flt_onepole_tick` is now fully spliced, zero `bl`,
    cold and hot call sites alike.
 
-   **`tl_bench`: controlled same-session A/B (git stash, rebuild,
+   **`sf_bench`: controlled same-session A/B (git stash, rebuild,
    measure both back to back) — 10906µs → 10774µs min-of-10, a real but
    modest ~1.2%.** Smaller than the `bl`-count collapse alone would
    suggest — the same lesson as the branch-fusion commit above: call/
@@ -615,9 +615,132 @@ parity band).
    because the number demanded it.
 
 **Running total across the whole "redisassemble instead of guess" arc:
-`tl_bench` 15.4 → ~10.77 ms (~30%, noise band ±~1-2% at this point — see
+`sf_bench` 15.4 → ~10.77 ms (~30%, noise band ±~1-2% at this point — see
 commit 9's controlled A/B for the tightest recent measurement).** No
 further named lever remains; the next one needs another fresh
 re-disassembly. Per the user's own explicit direction (2026-06-23):
 **RegAlloc v2 (real liveness-based register allocation) opens next, as
 its own dedicated arc — not another inliner increment.**
+
+## A second `bl` returns — the next named lever, found 2026-06-24
+
+RegAlloc v2 (above) shipped and closed in the same session it opened
+(see its own arc). The same day, the channel-strip work (sound_fusion
+→ zener_comp, the TG12345-style compressor) reintroduced exactly the
+shape this arc's own opening paragraph described: `sf_channel_process`
+disassembles with `rotary_tick` AND `zener_process` as its only two
+remaining `bl`s. Traced precisely (not guessed): `comp_process` calls
+`amp_to_db_f`/`db_to_amp_f` (real `bl`s), which themselves call
+`log_f`/`exp_f` (real `bl`s) — a clean two-level chain of un-inlined
+calls, the same `moon_process → moog_slope → moog_taps →
+flt_onepole_tick` shape this arc already closed once.
+
+The wall is NOT a size overflow — `exp_f` is a true leaf (zero calls in its
+own body) yet still doesn't qualify. `_inline_count_nodes_body`
+(bpp_dispatch.bsm ~line 7339) returns a deliberate sentinel **99** for any
+body containing `T_WHILE`/`T_IF`/`T_SWITCH`/nested `T_BLOCK` — "control-flow
+inlining is out of scope per Q1," by design, not by accident.
+
+## Increment 7 — control-flow leaf bodies, shipped same day, two real bugs found
+
+Actioned the same day it was found, per the user's own explicit push
+("a gente cria os programas pra estressar a infraestrutura... foi assim
+que chegamos aonde chegamos em 3 meses"). `_inline_count_nodes` (and its
+five siblings — `_inline_has_disqualifying_tcall`, `_inline_param_refs`,
+`_inline_memst_count`, `_inline_indirect_call_count_node`,
+`_inline_has_inst_builtin`, `_inline_find_nested_calls`) gained explicit
+`T_IF`/`T_WHILE`/`T_BLOCK` recursion instead of the blanket 99 sentinel.
+`ast_clone_subst` and `cg_emit_stmt` already handled both node types
+correctly (proved by the outlining arc + this splice's own per-statement
+loop) — the ONLY missing piece, in principle, was these counters refusing
+to look inside.
+
+In principle. Re-disassembling the SELF-HOSTED COMPILER (not a synthetic
+test) surfaced two real, dangerous, previously-latent bugs the moment
+control-flow bodies actually became eligible at this codebase's real
+scale:
+
+1. **Infinite recursion via a cyclic nested-inline graph.**
+   `_inline_register_callsite_slots` <-> `_inline_register_nested`
+   recurse into every nested inlinable call's OWN nested calls, with a
+   comment that explicitly assumed an ACYCLIC call graph ("bounded by
+   the actual, acyclic call graph, no artificial depth cap needed") —
+   true while only pure single/multi-statement leaves could ever
+   qualify (no two of those in this codebase happened to call each
+   other), false the instant a loop-bodied PAIR does. The self-hosted
+   compiler hung rebuilding ITSELF (gen2 → gen3) — not on a contrived
+   test, on its own 20K-line source. Fixed with `_inline_registering`,
+   an in-progress set checked before each recursive descent — a nested
+   call back to a function already mid-registration breaks the cycle
+   (that one occurrence's OWN nested calls don't get walked again; the
+   call site itself still gets a valid id and splices normally — the
+   same "falls through to a real `bl`, safe but not maximally optimal"
+   degradation already documented on `.e`'s reset elsewhere).
+
+2. **Early returns inside a spliced if/while corrupt control flow.**
+   `cg_emit_stmt`'s `T_RET` handler is unconditional — "evaluate return
+   expression... jump to the epilogue" — with no notion of "currently
+   splicing an inlined body." A trailing return is fine (the splice
+   pulls its EXPRESSION out directly, never walks it through
+   `cg_emit_stmt`); a return buried inside a non-trailing if/while
+   (`is_alpha`/`is_digit`-shaped: `if (cond) { return X; } ... return
+   Y;`, used by the LEXER on every character) is not — once spliced,
+   that `ret` jumps to the WRONG function's epilogue entirely. This
+   one didn't hang at compile time; it produced a gen2 binary that hung
+   on EVEN a trivial 4-line "hello world" input, because lexing anything
+   calls `is_alpha` immediately. Found by bisecting with a minimal
+   standalone repro (NOT by staring at the 20K-line compiler) once the
+   self-hosted hang pointed at "something this fundamental." Fixed with
+   `_inline_body_has_nested_ret`, an explicit recursive check added to
+   every `T_IF`/`T_WHILE`/`T_BLOCK` case in `_inline_count_nodes` —
+   disqualify, don't try to teach the splice to rewrite early returns
+   into structured control flow (a real future increment, not a
+   one-line fix).
+
+   Verified by hand: `repro1.bpp` (continue inside an inlined loop,
+   nested inside the CALLER's own loop, to make sure break/continue
+   target resolution survives splicing too) settles to the
+   hand-computed value exactly. Break/continue were never the bug —
+   only the unconditional early-return-as-real-jump was.
+
+   A THIRD, quieter gap surfaced by the same stress test: a local
+   declared INSIDE a loop body (not at the function's own top level —
+   the autovec SIMD-synthesis targets' `auto c: Cell;` inside their own
+   `for`, `tests/test_autovec_compose.bpp`) was never collected for
+   alpha-renaming, so its references fell through as an unresolved bare
+   name (E264, "extrn has no backing definition"). Fixed the same way —
+   `_inline_collect_locals`/`_inline_register_callee_locals` gained the
+   identical `T_IF`/`T_WHILE`/`T_BLOCK` recursion.
+
+   **The capability genuinely works now** — dozens of small control-flow
+   leaves throughout the compiler's own source (`is_int_type`, `clamp`,
+   `arr_pop`, `floor_f`, `sqrt`, `struct_field_name`, `cg_b3_eligible`,
+   and many more) now actually splice at their real call sites, verified
+   via the same re-disassembly discipline this whole arc runs on.
+
+   **`exp_f`/`log_f` specifically still don't make the cut — measured,
+   not guessed:** `exp_f`'s body costs **78** nodes (cap is 50 — its
+   3-while range-reduce-then-series shape is genuinely bigger than any
+   existing single-return candidate, not a bug); `log_f` costs 99 — its
+   own `if (x <= 0.0) { return 0.0; }` domain guard is EXACTLY the
+   early-return shape increment 7 disqualifies, correctly. `amp_to_db_f`
+   (cost 12) and `db_to_amp_f` (cost 5) are individually tiny and
+   control-flow-clean, but each calls a callee that doesn't qualify
+   (`log_f`, `exp_f`), so Inc 6's composability rule correctly declines
+   to wave them through — a call to a non-inlinable callee still
+   disqualifies, exactly as it always has. `sf_channel_process`'s `bl`
+   count is unchanged at 2 (`rotary_tick`, `zener_process`) — the
+   capability shipped; this ONE named example just doesn't clear the
+   existing bars. Raising `INLINE_BODY_NODE_CAP` specifically to admit
+   `exp_f` was considered and deliberately NOT done — one measured
+   candidate is not the two-consumer bar this codebase's own promotion
+   discipline asks for (Tonify Rule 20's spirit applied to a compiler
+   constant, not just a stb module), and a global cap raise widens
+   every OTHER existing candidate's blast radius for a problem only one
+   function has. Revisit with its own measurement if a second
+   real candidate needs the room.
+
+Bootstrap byte-stable (gen2==gen3, confirmed AFTER both bug fixes — the
+hang and the corruption were both pre-fix-only), suite 219/0/12, C-emit
+176/0/55, all regalloc/autovec gates green, real games + sound_fusion +
+zener_comp compile clean, sound_fusion's audio md5 unchanged.

@@ -5943,6 +5943,50 @@ void annotate_temps() {
 // safety net for control-flow nodes (T_IF / T_WHILE / T_SWITCH /
 // T_BLOCK) that S4 explicitly rejects per Q1 caveat — getting one
 // of those back from the count immediately disqualifies the body.
+// Does this statement array contain a T_RET ANYWHERE, at any nesting
+// depth (2026-06-24 — the bug this guards: `is_alpha`/`is_digit`-style
+// "if (cond) { return X; } ... return Y;" leaves use EARLY returns
+// inside their if-bodies, not just a single trailing one. cg_emit_stmt's
+// T_RET handler is unconditional — "evaluate return expression... jump
+// to the epilogue" — it has no notion of "currently splicing an inlined
+// body" and will jump to the OUTER, ENCLOSING function's real epilogue,
+// terminating the wrong function and corrupting control flow. Confirmed
+// the hard way: the self-hosted compiler hung on EVEN a trivial 4-line
+// program once is_alpha (used by the lexer on every character) got
+// inlined with this exact shape — control flow landed somewhere
+// garbage almost immediately. A trailing T_RET is fine — that ONE
+// statement is never walked by cg_emit_stmt's per-statement splice loop;
+// cg_emit_inline_multi pulls its EXPRESSION out and evaluates that
+// directly, no real `ret` involved. Any OTHER T_RET, at any depth
+// inside an if/while/block, is NOT fine — disqualify the whole body
+// rather than try to teach the splice to rewrite early returns into
+// structured control flow (a real future increment, not a one-line fix:
+// it would need to turn "return X" into "result = X; goto/flag done"
+// threaded through every enclosing if/while, restructuring the cloned
+// tree, not just walking it).
+static _inline_body_has_nested_ret(body_arr, body_cnt) {
+    auto i, s: Node;
+    for (i = 0; i < body_cnt; i++) {
+        s = body_arr[i];
+        if (s != 0) {
+            if (s.ntype == T_RET) { return 1; }
+            if (s.ntype == T_IF) {
+                if (_inline_body_has_nested_ret(s.b, s.c)) { return 1; }
+                if (s.e > 0) {
+                    if (_inline_body_has_nested_ret(s.d, s.e)) { return 1; }
+                }
+            }
+            if (s.ntype == T_WHILE) {
+                if (_inline_body_has_nested_ret(s.b, s.c)) { return 1; }
+            }
+            if (s.ntype == T_BLOCK) {
+                if (_inline_body_has_nested_ret(s.b, s.c)) { return 1; }
+            }
+        }
+    }
+    return 0;
+}
+
 static _inline_count_nodes(nd) {
     auto n: Node, t, sum, arr, cnt, i;
     if (nd == 0) { return 0; }
@@ -6028,6 +6072,71 @@ static _inline_count_nodes(nd) {
         }
     }
     T_DECL     { return 1; }
+    // Control-flow leaf bodies (2026-06-24, the exp_f/log_f frontier
+    // named in docs/plans/inliner_arc.md's "second bl" addendum). T_IF
+    // and T_WHILE no longer unconditionally fall to the catch-all
+    // sentinel below — ast_clone_subst and cg_emit_stmt already handle
+    // both correctly for STRAIGHT-LINE bodies (proved by the smart-
+    // dispatch outlining arc + this splice's own per-statement
+    // cg_emit_stmt loop). What is NOT handled, and is explicitly
+    // disqualified via _inline_body_has_nested_ret above: an EARLY
+    // return buried inside the if/while body (is_alpha/is_digit's
+    // "if (cond) { return X; }" shape) — cg_emit_stmt's T_RET handler
+    // unconditionally jumps to the CURRENT function's epilogue, which
+    // is the wrong target entirely once this body is spliced into some
+    // other caller. Only a SINGLE TRAILING return (the body's last
+    // top-level statement, never walked by the per-statement splice
+    // loop — cg_emit_inline_multi pulls its expression out directly) is
+    // safe; that invariant already held for every pre-2026-06-24
+    // candidate, this just makes it an explicit, checked gate now that
+    // control flow can hide a return somewhere a human skimming the
+    // body might miss. Recurses via _inline_count_nodes_body (already
+    // does its own 99-propagation per statement) and propagates 99
+    // explicitly rather than summing it in, so a nested disqualifying
+    // shape still disqualifies the whole body. T_SWITCH stays on the
+    // catch-all below — out of scope until a real candidate needs it
+    // (Tonify Rule 28: don't build it before something measured needs
+    // it; _inline_normalize_switch_ret already handles the one switch
+    // shape that DOES need to inline today by rewriting it away before
+    // this counter ever sees a T_SWITCH node).
+    T_IF {
+        auto if_a, if_b, if_e;
+        if (_inline_body_has_nested_ret(n.b, n.c)) { return 99; }
+        if (n.e > 0) {
+            if (_inline_body_has_nested_ret(n.d, n.e)) { return 99; }
+        }
+        if_a = _inline_count_nodes(n.a);
+        if (if_a >= 99) { return 99; }
+        if_b = _inline_count_nodes_body(n.b, n.c);
+        if (if_b >= 99) { return 99; }
+        sum += if_a + if_b;
+        if (n.e > 0) {
+            if_e = _inline_count_nodes_body(n.d, n.e);
+            if (if_e >= 99) { return 99; }
+            sum += if_e;
+        }
+    }
+    T_WHILE {
+        auto wh_a, wh_b, wh_e;
+        if (_inline_body_has_nested_ret(n.b, n.c)) { return 99; }
+        wh_a = _inline_count_nodes(n.a);
+        if (wh_a >= 99) { return 99; }
+        wh_b = _inline_count_nodes_body(n.b, n.c);
+        if (wh_b >= 99) { return 99; }
+        sum += wh_a + wh_b;
+        if (n.e != 0) {
+            wh_e = _inline_count_nodes(n.e);
+            if (wh_e >= 99) { return 99; }
+            sum += wh_e;
+        }
+    }
+    T_BLOCK {
+        auto blk_b;
+        if (_inline_body_has_nested_ret(n.b, n.c)) { return 99; }
+        blk_b = _inline_count_nodes_body(n.b, n.c);
+        if (blk_b >= 99) { return 99; }
+        sum += blk_b;
+    }
     else { return 99; }
     }
     return sum;
@@ -6106,6 +6215,30 @@ static _inline_has_inst_builtin(nd) {
     T_ASSIGN  { return _inline_has_inst_builtin(n.a) || _inline_has_inst_builtin(n.b); }
     T_MEMST   { return _inline_has_inst_builtin(n.a) || _inline_has_inst_builtin(n.b); }
     T_RET     { return _inline_has_inst_builtin(n.a); }
+    // Control-flow leaf bodies (2026-06-24) — same extension as
+    // _inline_count_nodes, see its own comment for why this is safe.
+    T_IF {
+        if (_inline_has_inst_builtin(n.a)) { return 1; }
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { if (_inline_has_inst_builtin(arr[i])) { return 1; } }
+        if (n.e > 0) {
+            arr = n.d; cnt = n.e;
+            for (i = 0; i < cnt; i++) { if (_inline_has_inst_builtin(arr[i])) { return 1; } }
+        }
+        return 0;
+    }
+    T_WHILE {
+        if (_inline_has_inst_builtin(n.a)) { return 1; }
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { if (_inline_has_inst_builtin(arr[i])) { return 1; } }
+        if (n.e != 0) { return _inline_has_inst_builtin(n.e); }
+        return 0;
+    }
+    T_BLOCK {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { if (_inline_has_inst_builtin(arr[i])) { return 1; } }
+        return 0;
+    }
     else { return 0; }
     }
     return 0;
@@ -6209,6 +6342,38 @@ static _inline_has_disqualifying_tcall(nd) {
         return _inline_has_disqualifying_tcall(n.a);
     }
     T_DECL     { return 0; }
+    // Control-flow leaf bodies (2026-06-24) — same extension as
+    // _inline_count_nodes, see its own comment for why this is safe.
+    T_IF {
+        if (_inline_has_disqualifying_tcall(n.a)) { return 1; }
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) {
+            if (_inline_has_disqualifying_tcall(arr[i])) { return 1; }
+        }
+        if (n.e > 0) {
+            arr = n.d; cnt = n.e;
+            for (i = 0; i < cnt; i++) {
+                if (_inline_has_disqualifying_tcall(arr[i])) { return 1; }
+            }
+        }
+        return 0;
+    }
+    T_WHILE {
+        if (_inline_has_disqualifying_tcall(n.a)) { return 1; }
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) {
+            if (_inline_has_disqualifying_tcall(arr[i])) { return 1; }
+        }
+        if (n.e != 0) { return _inline_has_disqualifying_tcall(n.e); }
+        return 0;
+    }
+    T_BLOCK {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) {
+            if (_inline_has_disqualifying_tcall(arr[i])) { return 1; }
+        }
+        return 0;
+    }
     else { return 0; }
     }
     return 0;
@@ -6247,6 +6412,27 @@ static _inline_param_refs(nd, name_p) {
         }
     }
     T_DECL     { return 0; }
+    // Control-flow leaf bodies (2026-06-24) — same extension as
+    // _inline_count_nodes, see its own comment for why this is safe.
+    T_IF {
+        sum = _inline_param_refs(n.a, name_p);
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { sum += _inline_param_refs(arr[i], name_p); }
+        if (n.e > 0) {
+            arr = n.d; cnt = n.e;
+            for (i = 0; i < cnt; i++) { sum += _inline_param_refs(arr[i], name_p); }
+        }
+    }
+    T_WHILE {
+        sum = _inline_param_refs(n.a, name_p);
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { sum += _inline_param_refs(arr[i], name_p); }
+        if (n.e != 0) { sum += _inline_param_refs(n.e, name_p); }
+    }
+    T_BLOCK {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { sum += _inline_param_refs(arr[i], name_p); }
+    }
     else { return 0; }
     }
     return sum;
@@ -6300,6 +6486,27 @@ static _inline_memst_count(nd) {
     }
     T_ASSIGN   { sum = _inline_memst_count(n.a) + _inline_memst_count(n.b); }
     T_RET      { sum = _inline_memst_count(n.a); }
+    // Control-flow leaf bodies (2026-06-24) — same extension as
+    // _inline_count_nodes, see its own comment for why this is safe.
+    T_IF {
+        sum = _inline_memst_count(n.a);
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { sum += _inline_memst_count(arr[i]); }
+        if (n.e > 0) {
+            arr = n.d; cnt = n.e;
+            for (i = 0; i < cnt; i++) { sum += _inline_memst_count(arr[i]); }
+        }
+    }
+    T_WHILE {
+        sum = _inline_memst_count(n.a);
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { sum += _inline_memst_count(arr[i]); }
+        if (n.e != 0) { sum += _inline_memst_count(n.e); }
+    }
+    T_BLOCK {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { sum += _inline_memst_count(arr[i]); }
+    }
     else { return 0; }
     }
     return sum;
@@ -6345,6 +6552,27 @@ static _inline_indirect_call_count_node(nd) {
     T_ASSIGN   { sum = _inline_indirect_call_count_node(n.a) + _inline_indirect_call_count_node(n.b); }
     T_MEMST    { sum = _inline_indirect_call_count_node(n.a) + _inline_indirect_call_count_node(n.b); }
     T_RET      { sum = _inline_indirect_call_count_node(n.a); }
+    // Control-flow leaf bodies (2026-06-24) — same extension as
+    // _inline_count_nodes, see its own comment for why this is safe.
+    T_IF {
+        sum = _inline_indirect_call_count_node(n.a);
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { sum += _inline_indirect_call_count_node(arr[i]); }
+        if (n.e > 0) {
+            arr = n.d; cnt = n.e;
+            for (i = 0; i < cnt; i++) { sum += _inline_indirect_call_count_node(arr[i]); }
+        }
+    }
+    T_WHILE {
+        sum = _inline_indirect_call_count_node(n.a);
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { sum += _inline_indirect_call_count_node(arr[i]); }
+        if (n.e != 0) { sum += _inline_indirect_call_count_node(n.e); }
+    }
+    T_BLOCK {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { sum += _inline_indirect_call_count_node(arr[i]); }
+    }
     else { return 0; }
     }
     return sum;
@@ -6525,9 +6753,31 @@ global _inline_callsite_id;
 // moog_tick and moog_slope both calling moog_taps) can never collide.
 global _inline_nested_ids;
 
+// Cycle guard for the nested-registration recursion below (2026-06-24).
+// `_inline_register_callsite_slots` <-> `_inline_register_nested` assumed
+// an acyclic call graph among inlinable functions — true by construction
+// while only pure single/multi-statement leaves could ever qualify (no
+// two of those in this codebase happened to call each other), false the
+// instant a loop-bodied PAIR does (found by the compiler hanging on its
+// own source once exp_f/log_f-shaped bodies became eligible — two
+// mutually-recursive control-flow leaves elsewhere in this codebase hit
+// the gap directly). Index = fidx; 1 while that function's OWN
+// registration is in progress on the current recursive descent. A
+// nested call back to an fidx already on this "in progress" set is a
+// genuine cycle, not "called from two different places" (which is fine,
+// unguarded, and common — e.g. moog_taps from both moog_tick and
+// moog_slope) — skip recursing into THAT occurrence's own nested calls
+// one more level (the id is still allocated and the call site still
+// gets spliced normally; only ITS nested calls fall through to a real
+// `bl`, the same safe-but-not-maximally-optimal degradation already
+// documented on `.e`'s reset in ast_clone_subst) instead of recursing
+// forever.
+static auto _inline_registering;
+
 void _inline_reset_callsite_id() {
     _inline_callsite_id = 0;
     _inline_nested_ids = arr_new();
+    _inline_registering = arr_new();
 }
 
 // Construct a mangled packed name `_inl<id>_<orig>` by appending
@@ -6586,13 +6836,26 @@ _inline_pack_mangled_name(id, orig_p) {
 //
 // T_DECL.a is either a single packed name (when .b == 1) or a
 // word-array of packed names (when .b > 1, for `auto x, y, z;`).
-_inline_register_callee_locals(body_arr, body_cnt, id) {
+// Walks `scan_arr`/`scan_cnt` for T_DECL — recursing into T_IF/T_WHILE/
+// T_BLOCK so a local declared INSIDE a loop/if (the autovec SIMD-
+// synthesis targets' per-element `auto c: Cell;` inside their own
+// for-loop — tests/test_autovec_compose.bpp) gets registered too, same
+// reason and same shape as _inline_collect_locals_walk's own extension.
+// `top_body_arr`/`top_body_cnt` stay fixed at the ORIGINAL, outermost
+// call's body the whole way down — the per-declarator reference count
+// must scan the WHOLE function body (including sibling loops/branches a
+// nested declaration's references might also appear in via further
+// nesting), not just the scan level the declaration itself was found
+// at; _inline_param_refs already recurses into control flow on its own
+// (see its own 2026-06-24 extension), so passing it the unchanged
+// top-level array is correct regardless of how deep `scan_arr` is.
+static _inline_register_callee_locals_walk(scan_arr, scan_cnt, id, top_body_arr, top_body_cnt) {
     auto i, j, vi, k, ref_count;
     auto n: Node;
     auto mangled, orig_name;
     i = 0;
-    while (i < body_cnt) {
-        n = body_arr[i];
+    while (i < scan_cnt) {
+        n = scan_arr[i];
         if (n != 0) {
             if (n.ntype == T_DECL) {
                 j = 0;
@@ -6623,17 +6886,30 @@ _inline_register_callee_locals(body_arr, body_cnt, id) {
                     // the statement-typed body shape post-P1.
                     ref_count = 0;
                     k = 0;
-                    while (k < body_cnt) {
-                        ref_count += _inline_param_refs(body_arr[k], orig_name);
+                    while (k < top_body_cnt) {
+                        ref_count += _inline_param_refs(top_body_arr[k], orig_name);
                         k++;
                     }
                     arr_set(cg_var_refs, vi, ref_count);
                     j++;
                 }
+            } else if (n.ntype == T_IF) {
+                _inline_register_callee_locals_walk(n.b, n.c, id, top_body_arr, top_body_cnt);
+                if (n.e > 0) {
+                    _inline_register_callee_locals_walk(n.d, n.e, id, top_body_arr, top_body_cnt);
+                }
+            } else if (n.ntype == T_WHILE) {
+                _inline_register_callee_locals_walk(n.b, n.c, id, top_body_arr, top_body_cnt);
+            } else if (n.ntype == T_BLOCK) {
+                _inline_register_callee_locals_walk(n.b, n.c, id, top_body_arr, top_body_cnt);
             }
         }
         i++;
     }
+}
+
+_inline_register_callee_locals(body_arr, body_cnt, id) {
+    _inline_register_callee_locals_walk(body_arr, body_cnt, id, body_arr, body_cnt);
 }
 
 // Register the slot block for one callsite: assigns the next monotonic
@@ -6647,7 +6923,11 @@ _inline_register_callee_locals(body_arr, body_cnt, id) {
 // Inc 6 nested case, which deliberately never stamps the SHARED body).
 _inline_register_callsite_slots(fidx) {
     auto fn_rec, body_arr, body_cnt, params, pcnt, i, vi, k, ref_count;
-    auto orig_p, mangled, id;
+    auto orig_p, mangled, id, already_registering;
+    while (arr_len(_inline_registering) <= fidx) {
+        _inline_registering = arr_push(_inline_registering, 0);
+    }
+    already_registering = arr_get(_inline_registering, fidx);
     _inline_callsite_id++;
     id = _inline_callsite_id;
     fn_rec = funcs[fidx];
@@ -6689,7 +6969,18 @@ _inline_register_callsite_slots(fidx) {
     // this function (and therefore pre-reg) returns. See
     // _inline_register_nested's own comment for why this must happen
     // here and not later, at splice/emission time.
-    _inline_register_nested(id, body_arr, body_cnt);
+    //
+    // Cycle guard (see _inline_registering's own comment): only descend
+    // if fidx is not ALREADY being registered higher up this same
+    // recursive call — this callsite's own slots (above) are always
+    // registered regardless, so the splice itself is unaffected either
+    // way; only a redundant, infinite re-walk of an already-in-progress
+    // function's nested calls is skipped.
+    if (already_registering == 0) {
+        arr_set(_inline_registering, fidx, 1);
+        _inline_register_nested(id, body_arr, body_cnt);
+        arr_set(_inline_registering, fidx, 0);
+    }
     return id;
 }
 
@@ -6761,6 +7052,38 @@ _inline_find_nested_calls(nd, out_arr) {
         } else {
             out_arr = _inline_find_nested_calls(n.a, out_arr);
         }
+    }
+    // Control-flow leaf bodies (2026-06-24) — same extension as
+    // _inline_count_nodes. Without this, a nested call hiding inside a
+    // spliced loop (log_f's `m / exp_f(y)` inside its own Newton
+    // for-loop) would never get its callsite id stamped — NOT a
+    // correctness bug (ast_clone_subst resets a fresh clone's `.e` to 0,
+    // so the un-stamped call just falls through to a real `bl`, exactly
+    // as documented above), but it leaves one more `bl` on the table
+    // than necessary. Closing it here too so log_f's OWN inlining of
+    // exp_f survives one level further out.
+    T_IF {
+        out_arr = _inline_find_nested_calls(n.a, out_arr);
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) { out_arr = _inline_find_nested_calls(arr[i], out_arr); i++; }
+        if (n.e > 0) {
+            arr = n.d; cnt = n.e;
+            i = 0;
+            while (i < cnt) { out_arr = _inline_find_nested_calls(arr[i], out_arr); i++; }
+        }
+    }
+    T_WHILE {
+        out_arr = _inline_find_nested_calls(n.a, out_arr);
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) { out_arr = _inline_find_nested_calls(arr[i], out_arr); i++; }
+        if (n.e != 0) { out_arr = _inline_find_nested_calls(n.e, out_arr); }
+    }
+    T_BLOCK {
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) { out_arr = _inline_find_nested_calls(arr[i], out_arr); i++; }
     }
     else { }
     }
@@ -6967,11 +7290,25 @@ void _inline_pre_reg_walk_body(arr, cnt) {
 // callee body into `out_buf`. Writes one packed-name pointer
 // per word slot. Returns the count of names written. Used at
 // splice time to assemble the rename map.
-_inline_collect_locals(body_arr, body_cnt, out_buf) {
-    auto i, j, count;
+// Control-flow leaf bodies (2026-06-24) can declare a local INSIDE the
+// if/while body, not just at the function's own top level — the
+// autovec SIMD-synthesis targets (tests/test_autovec_compose.bpp's
+// p1_mul/p1_add/...) declare their per-element `auto c: Cell;` exactly
+// this way, inside the for-loop. Without this recursion, such a local
+// never gets collected — never gets a mangled `_inl<id>_c` slot — so
+// every reference to it inside the cloned loop body falls through
+// ast_clone_subst's T_VAR case as an un-renamed, unresolved bare name,
+// which the rest of the pipeline then treats as an undeclared extern
+// (E264). _inline_count_nodes already disqualifies any body containing
+// an early RETURN inside a loop (the corrupted-control-flow class of
+// bug); a plain local DECLARATION inside a loop has no such hazard —
+// ast_clone_subst's own T_DECL case is already a content-preserving
+// no-op clone (`.a` copied by the blanket field copy), so the only
+// thing missing was collection, not cloning.
+static _inline_collect_locals_walk(body_arr, body_cnt, out_buf, count) {
+    auto i, j;
     auto n: Node;
     i = 0;
-    count = 0;
     while (i < body_cnt) {
         n = body_arr[i];
         if (n != 0) {
@@ -6982,11 +7319,24 @@ _inline_collect_locals(body_arr, body_cnt, out_buf) {
                     count++;
                     j++;
                 }
+            } else if (n.ntype == T_IF) {
+                count = _inline_collect_locals_walk(n.b, n.c, out_buf, count);
+                if (n.e > 0) {
+                    count = _inline_collect_locals_walk(n.d, n.e, out_buf, count);
+                }
+            } else if (n.ntype == T_WHILE) {
+                count = _inline_collect_locals_walk(n.b, n.c, out_buf, count);
+            } else if (n.ntype == T_BLOCK) {
+                count = _inline_collect_locals_walk(n.b, n.c, out_buf, count);
             }
         }
         i++;
     }
     return count;
+}
+
+_inline_collect_locals(body_arr, body_cnt, out_buf) {
+    return _inline_collect_locals_walk(body_arr, body_cnt, out_buf, 0);
 }
 
 // Body-node hard cap (Q4 of S4 sidequest doc). Independent from
@@ -7332,10 +7682,19 @@ void classify_inlineable() {
         for (j = 0; j < pcnt; j++) {
             if (is_float_type(get_fn_par_type(i, j))) { has_float_param = 1; }
         }
-        // Body node count (Q4 hard cap) — also rejects bodies
-        // containing T_IF/T_WHILE/T_SWITCH/nested T_BLOCK
-        // because `_inline_count_nodes` returns 99 for them
-        // (control-flow inlining is out of scope per Q1).
+        // Body node count (Q4 hard cap). Until 2026-06-24 this also
+        // blanket-rejected any body containing T_IF/T_WHILE/nested
+        // T_BLOCK ("control-flow inlining is out of scope per Q1") —
+        // _inline_count_nodes now recurses into both (ast_clone_subst
+        // and cg_emit_stmt already handled them correctly; only the
+        // counter was refusing to look), so a loop- or guard-clause-
+        // shaped LEAF (no disqualifying calls, single trailing return —
+        // exp_f/log_f, bpp_math.bsm) can pass this gate on real cost,
+        // same as any other shape. T_SWITCH is still out of scope
+        // (_inline_count_nodes's catch-all) until a real candidate needs
+        // it — _inline_normalize_switch_ret already rewrites the one
+        // switch shape that DOES need to inline today away before this
+        // counter ever sees a T_SWITCH node.
         body_cost = _inline_count_nodes_body(body_arr, body_cnt);
         // Inc 6: multi-return bodies get the separate, scoped cap (see
         // its own comment) — single-return bodies are unaffected, exact
