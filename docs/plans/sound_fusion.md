@@ -215,11 +215,17 @@ take). Cut splits a clip into two; copy/paste duplicates a clip's
      pass ("os botões de volume do canal e do mixer tbm não funcionam").
    - **Still open:** drawing clip CONTENT (waveform/notes) inside the block
      — noted under slice 6c below, not built.
-4. **Insert (single)** — ✅ engine-level DONE: every `Track` already carries
-   one hardcoded Moog-filter slot (`tk.flt_on` / `tk.flt`,
-   `sf_channel_process` calls `moon_process`) and `sf_track_set` already takes
-   cutoff/reso/slope. **Open:** the channel-strip UI doesn't expose
-   cutoff/resonance controls yet (`sf_gui.bsm`'s mixer strip is fader-only).
+4. **Insert (single)** — ✅ DONE (engine + UI). Engine: every `Track` carries the
+   Moog slot and `sf_channel_process` runs it. **UI ✅ SHIPPED 2026-06-25** (was
+   the "ghost effect" the user reported — DSP wired, no control to engage it):
+   per-lane FLT/CMP/ROT toggles + a selected-channel insert rack (pan, filter
+   cutoff/reso/slope, comp ratio/release/threshold, rotary speed) in the lower
+   mixer area, all reading/writing the channel's cached params. Plus the rest of
+   the basic-DAW belt the same session: per-channel **mute/solo** (M/S buttons,
+   read by `sf_render`'s mix loop), **pan** control, **spacebar** play/stop, and a
+   **loop region** (drag the ruler to set, click to seek, LOOP button toggles the
+   wrap). Compressor threshold exposed (`sf_track_set_comp_threshold`) — without
+   it the fixed -6 dB default left the comp inaudible; default lowered to -18 dB.
 5. **Insert CHAIN + the `stbrotary` graduation — ✅ SHIPPED 2026-06-22.**
    `sf_channel.bsm`'s own header comment had already flagged this: "adding a
    second insert plugin later means giving the channel a small chain instead
@@ -316,9 +322,30 @@ take). Cut splits a clip into two; copy/paste duplicates a clip's
      import/record time (cheap, one pass, stored alongside the `Clip`) rather
      than recomputing it from raw samples every redraw; a MIDI/note-block
      needs the NoteEvent sequence 6b's design implies to exist first.
-7. **Realtime playback** — the `@safe` callback streams the live mix; scrubbing
-   and play-while-edit. The big architectural jump (offline-render-then-play →
-   true realtime); do this last, once everything above already works offline.
+7. **Realtime playback — ✅ SHIPPED 2026-06-25 (producer-side block render).**
+   `sf_render` split into `sf_render_block(out, start, n, master)` (no reset,
+   block-relative output) + a thin `sf_render` = `reset + render_block(0, total)`
+   (byte-identical offline export). The GUI's `_g_pump_audio` now renders one live
+   block per frame straight from the model and pushes it to the device ring — the
+   mini_synth/stbmixer producer pattern on the MAIN thread, NOT inside the `@safe`
+   callback (true callback synthesis would be a further, separately-scoped jump for
+   lower latency). Edits made while playing (toggle, slider, mute/solo, clip drag)
+   are heard within one ring's worth of latency. Block continuity proven headless
+   (chunked render == monolithic, 0/176400 samples differing with all three
+   stateful inserts engaged). A block-granularity live profile (one `beat_now_us`
+   pair per block, never per-sample, never in the callback) reports the realtime
+   factor in the transport. Edit-to-ear latency ≈ the ring depth (4096 frames ≈ 93
+   ms today) — tunable lower if a snappier feel is wanted.
+
+   **Open follow-on — drive the UAD Apollo directly** (user-flagged 2026-06-25,
+   scoped after the compiler work). Today playback goes through CoreAudio
+   **AudioQueue** on the **default output device** — i.e. the OS system mixer. To
+   drive the Apollo Solo "directly": target its specific CoreAudio device (not
+   "default"), optionally exclusive/**hog mode** + a small buffer for low latency,
+   and likely migrate AudioQueue → an AUHAL/HAL output unit. macOS userspace can't
+   bypass CoreAudio entirely, and the UAD DSP (Console/UAD plugins) is reachable
+   only via UAD's own SDK, not as a plain CoreAudio device. A
+   `stb/_stb_audio_macos.bsm` enhancement.
 8. **The channel-strip arc — TG12345-inspired dynamics — ✅ compressor
    SHIPPED 2026-06-24, EQ not yet built.** Renamed tiny_lofi → sound_fusion
    the same day (memory: `project_sound_fusion_tg12345_research.md` has the
@@ -357,6 +384,21 @@ take). Cut splits a clip into two; copy/paste duplicates a clip's
      the standard simplified topology DSP textbooks teach for exactly
      this reason. Revisit if a dB-domain need (accurate metering, a
      dB-gain EQ control) actually shows up.
+   - **Compressor hot-path deflated — ✅ 2026-06-25.** Live + offline profiling
+     (the realtime stress test) found the compressor dominated the filter/rotary
+     by ~60× (62118 µs/3s-render vs ~1050/1329) because `comp_process` does two
+     transcendentals per sample and `log_f` solved ln by Newton-on-exp, inlining
+     `exp_f`'s whole series once per iteration. Three DSP fixes, output-preserving
+     to ~4-decimal: (A) a LINEAR `env <= knee_low_amp` precheck skips the
+     per-sample `amp_to_db_f` below the knee (the common case); (B) `log_f` Newton
+     8→4; (C) replaced Newton-on-exp with a direct **atanh series**
+     `ln(m)=2(s+s³/3+…)`, no `exp` at all. Compressor cost: **62118 → 11717 µs
+     always-compressing (5.3×), → 691 µs below the knee (90×)**; `test_log_f`/
+     `test_exp_f`/`test_stbdynamics` all pass, export md5 unchanged. Methodology
+     note (the user's): deflate the DSP's own waste BEFORE optimizing codegen, or
+     the measurement that aims the compiler work is inflated. The remaining
+     `log_f` codegen lever (float spill / fmadd, the Stage-F frontier) is the next
+     compiler increment, now with a real deflated workload to motivate it.
    - **EQ — not yet built.** Two bands per the handbook (Bass: shelving,
      stepped 2/4/6/8/10dB boost/cut, switchable ~90/150Hz corner; Presence:
      peaking bell, 8 switchable frequencies 500Hz–10kHz, the 10kHz option

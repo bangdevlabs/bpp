@@ -66,17 +66,33 @@ void sf_remove_clip(i) {
 // interchange-format boundary, the same place every other s16-on-disk
 // conversion in the repo happens (mini_synth's recording loop is the
 // other worked example).
-void sf_render(out_buf, total_frames, master: float) {
-    auto t, tr, ci, nclips, cl: Clip;
+// Render `n` frames of the arrangement starting at absolute timeline frame
+// `start_frame` into `out_buf` (block-relative: out_buf[0] is start_frame).
+// Does NOT reset the channel inserts — their state (filter memory, compressor
+// envelope, rotary LFO phase) MUST carry across consecutive blocks for the
+// realtime playback path to sound continuous. The caller resets once at
+// transport start (sf_render does it for the full offline render; the GUI's
+// Play does it for live playback). Reading the clip store, mute/solo, and the
+// channel params fresh each call is exactly what makes live edits audible
+// mid-playback.
+void sf_render_block(out_buf, start_frame, n, master: float) {
+    auto i, t, tr, ci, nclips, cl: Clip, any_solo;
     auto (master_l, master_r, ts, sf, chl, chr): float;
     auto (rel, raw): word;
 
-    sf_channel_reset_filters();
-    nclips = arr_struct_count(_sf_clips);
+    nclips   = arr_struct_count(_sf_clips);
+    any_solo = sf_any_solo();
 
-    for (t = 0; t < total_frames; t++) {
+    for (i = 0; i < n; i++) {
+        t = start_frame + i;
         master_l = 0.0; master_r = 0.0;
         for (tr = 0; tr < SF_NTRACKS; tr++) {
+            // Mute/solo: skip a muted channel, and — when any channel is
+            // soloed — skip every channel that is not itself soloed. Skipping
+            // entirely (rather than multiplying by 0) means the channel's
+            // insert state simply doesn't advance, which is correct and cheaper.
+            if (sf_channel_muted(tr) != 0) { continue; }
+            if (any_solo != 0 && sf_channel_solo(tr) == 0) { continue; }
             ts = 0.0;
             // Sum this channel's clips that are active at frame t.
             for (ci = 0; ci < nclips; ci++) {
@@ -101,7 +117,16 @@ void sf_render(out_buf, total_frames, master: float) {
         if (master_l < 0.0 - 1.0)  { master_l = 0.0 - 1.0; }
         if (master_r >  1.0)       { master_r =  1.0; }
         if (master_r < 0.0 - 1.0)  { master_r = 0.0 - 1.0; }
-        pokefloat_h(out_buf + t * 8 + 0, master_l);    // L
-        pokefloat_h(out_buf + t * 8 + 4, master_r);    // R
+        pokefloat_h(out_buf + i * 8 + 0, master_l);    // L (block-relative)
+        pokefloat_h(out_buf + i * 8 + 4, master_r);    // R
     }
+}
+
+// Full offline render (Export / headless / the audio-correctness md5 baseline):
+// reset the inserts, then render the whole arrangement from frame 0. A thin
+// wrapper over sf_render_block so the offline and realtime paths share one mix
+// loop — and byte-identical to the pre-refactor behaviour (reset + render 0..N).
+void sf_render(out_buf, total_frames, master: float) {
+    sf_channel_reset_filters();
+    sf_render_block(out_buf, 0, total_frames, master);
 }

@@ -33,7 +33,18 @@
 // cos/sin every sample — pan is constant per track, so the trig belongs at
 // set-time, not in the hot loop. New fields are appended so the typed
 // accessors below keep their offsets.
-struct Track { vol: float, flt_on, flt, pan: float, stereo, gain_l: float, gain_r: float, rot_on, rot, comp_on, comp }
+// The trailing six fields CACHE each insert's user-facing parameters on the
+// channel itself (cutoff/reso/slope for the Moog, mode/release for the
+// compressor, mode for the rotary). The plugin instances hold their own
+// coefficients but expose no getter, so the channel keeps the source-of-truth
+// values the GUI reads back to draw a slider and writes when the user drags it
+// — the same "cache the value at set-time" shape gain_l/gain_r already use.
+// `comp_thr` caches the compressor threshold in dB (the practical "drive into
+// the compressor" control — without it the default -6 dBFS leaves the comp
+// nearly silent on a typical signal). `muted`/`solo` are the mixer's per-channel
+// flags, read by sf_render's mix loop: a muted channel is skipped, and when ANY
+// channel is soloed only soloed channels play.
+struct Track { vol: float, flt_on, flt, pan: float, stereo, gain_l: float, gain_r: float, rot_on, rot, comp_on, comp, cutoff: float, reso: float, slope, comp_mode, comp_rel, rot_mode, comp_thr: float, muted, solo }
 
 static auto _sf_tracks;     // malloc(SF_NTRACKS * sizeof(Track))
 
@@ -64,6 +75,26 @@ void sf_channel_init() {
         tk.rot_on = 0;
         tk.rot    = rotary_new(44100.0);
         tk.stereo = 0;     // mono source (panned into the stereo field)
+        // Cached insert parameters with musical defaults, applied the first
+        // time the user engages each insert from the GUI. These never touch
+        // the render until the matching `_on` flag is set, so the all-inserts-
+        // off baseline stays byte-identical.
+        // The mode/release values are written as their literal enum values
+        // (named in the comment) because the defining cartridges expose them as
+        // plain `const`, which does not reach a `load`ed module like this one
+        // — the same cross-module rule sf_lib.bsm documents for SF_NTRACKS.
+        tk.cutoff    = 1200.0;   // Moog corner, Hz
+        tk.reso      = 0.3;      // gentle resonance
+        tk.slope     = 4;        // -24 dB/oct (full 4-pole ladder)
+        tk.comp_mode = 0;        // COMP_COMPRESS (2:1, the gentle mode)
+        tk.comp_rel  = 1;        // COMP_REL_250 (250 ms release)
+        tk.rot_mode  = 1;        // ROTARY_CHORALE (slow rotation when engaged)
+        // -18 dBFS so engaging the compressor on a typical channel signal
+        // (~-6 dBFS here) produces audible gain reduction immediately, rather
+        // than the near-silent default the stbdynamics -6 dB threshold gives.
+        tk.comp_thr  = 0.0 - 18.0;
+        tk.muted     = 0;
+        tk.solo      = 0;
         _sf_apply_pan(tk, 0.0);   // centre
     }
 }
@@ -77,6 +108,25 @@ void sf_track_set(tr, vol: float, flt_on, cutoff: float, reso: float, slope, pan
     tk.vol    = vol;
     _sf_apply_pan(tk, pan);
     tk.flt_on = flt_on;
+    tk.cutoff = cutoff;
+    tk.reso   = reso;
+    tk.slope  = slope;
+    if (flt_on != 0) { moon_set(tk.flt, cutoff, reso, slope); }
+}
+
+// Configure ONLY the filter insert (engage/bypass + cutoff/reso/slope),
+// leaving volume and pan untouched — the GUI's per-channel filter controls
+// want to change just the filter without re-supplying vol/pan, the same focused
+// shape sf_track_set_volume / sf_track_set_compressor / sf_track_set_rotary
+// already follow. The cached cutoff/reso/slope keep the GUI's slider readout in
+// sync with what the plugin is actually running.
+void sf_track_set_filter(tr, flt_on, cutoff: float, reso: float, slope) {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    tk.flt_on = flt_on;
+    tk.cutoff = cutoff;
+    tk.reso   = reso;
+    tk.slope  = slope;
     if (flt_on != 0) { moon_set(tk.flt, cutoff, reso, slope); }
 }
 
@@ -105,11 +155,48 @@ void sf_track_set_volume(tr, vol: float) {
 void sf_track_set_compressor(tr, comp_on, mode, release_idx) {
     auto tk: Track;
     tk = _sf_tracks + tr * sizeof(Track);
-    tk.comp_on = comp_on;
+    tk.comp_on   = comp_on;
+    tk.comp_mode = mode;
+    tk.comp_rel  = release_idx;
     if (comp_on != 0) {
         zener_set_mode(tk.comp, mode);
         zener_set_release(tk.comp, release_idx);
+        zener_set_threshold_db(tk.comp, tk.comp_thr);   // apply the cached threshold
     }
+}
+
+// Set ONLY the compressor threshold in dB — the GUI's threshold slider drags
+// this every frame without re-supplying mode/release. Applied to the live
+// plugin only while the insert is engaged, the same on-flag guard the mode/
+// release setter uses.
+void sf_track_set_comp_threshold(tr, threshold_db: float) {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    tk.comp_thr = threshold_db;
+    if (tk.comp_on != 0) { zener_set_threshold_db(tk.comp, threshold_db); }
+}
+
+// Mute / solo a channel — written by the mixer's M/S buttons, read by
+// sf_render's mix loop (a muted channel is skipped; any soloed channel makes
+// every non-soloed channel silent). Pure flags here; the render owns the policy.
+void sf_track_set_mute(tr, m) {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    tk.muted = m;
+}
+void sf_track_set_solo(tr, s) {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    tk.solo = s;
+}
+
+// Set ONLY the pan position [-1, 1], recomputing the constant-power gains —
+// the GUI's pan control writes this without disturbing volume or the inserts,
+// the focused-setter shape sf_track_set_volume already follows.
+void sf_track_set_pan(tr, pan: float) {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    _sf_apply_pan(tk, pan);
 }
 
 // Configure one channel's rotary insert. `mode` is ROTARY_OFF /
@@ -120,7 +207,8 @@ void sf_track_set_compressor(tr, comp_on, mode, release_idx) {
 void sf_track_set_rotary(tr, rot_on, mode) {
     auto tk: Track;
     tk = _sf_tracks + tr * sizeof(Track);
-    tk.rot_on = rot_on;
+    tk.rot_on   = rot_on;
+    tk.rot_mode = mode;
     if (rot_on != 0) { rotary_set_mode(tk.rot, mode); }
 }
 
@@ -156,6 +244,74 @@ sf_channel_rot_on(tr) {
     auto tk: Track;
     tk = _sf_tracks + tr * sizeof(Track);
     return tk.rot_on;
+}
+
+// Insert parameter read accessors — the GUI draws each insert's current
+// setting (slider position, mode label) from these and writes a changed value
+// back through the matching setter above. Reading the cached value rather than
+// the plugin's internal coefficients keeps the GUI on the channel's public
+// surface, never reaching into a plugin instance.
+sf_channel_flt_cutoff(tr) -> float {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    return tk.cutoff;
+}
+sf_channel_flt_reso(tr) -> float {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    return tk.reso;
+}
+sf_channel_flt_slope(tr) {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    return tk.slope;
+}
+sf_channel_comp_mode(tr) {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    return tk.comp_mode;
+}
+sf_channel_comp_rel(tr) {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    return tk.comp_rel;
+}
+sf_channel_rot_mode(tr) {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    return tk.rot_mode;
+}
+sf_channel_comp_thr(tr) -> float {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    return tk.comp_thr;
+}
+sf_channel_muted(tr) {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    return tk.muted;
+}
+sf_channel_solo(tr) {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    return tk.solo;
+}
+sf_channel_pan(tr) -> float {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    return tk.pan;
+}
+
+// 1 if ANY channel is soloed — the render asks this once per pass to decide
+// whether solo gating is in effect (when nothing is soloed, every unmuted
+// channel plays normally).
+sf_any_solo() {
+    auto tr, tk: Track;
+    for (tr = 0; tr < SF_NTRACKS; tr++) {
+        tk = _sf_tracks + tr * sizeof(Track);
+        if (tk.solo != 0) { return 1; }
+    }
+    return 0;
 }
 
 // Run one dry sample through channel `tr` and return its STEREO (L, R)

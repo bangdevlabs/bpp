@@ -14691,3 +14691,92 @@ DSP-chain function in the project gets the swap it qualifies for, and a
 latent leaf-detection bug that predated this whole session by an unknown
 margin is fixed for every future function shaped like `val_check_node`, not
 just the one that happened to expose it today.
+
+## 2026-06-25 — sound_fusion channel strip from ghost to playable: insert UI, mute/solo/pan, transport, realtime playback, and a compressor that was inflating its own cost 5-90x
+
+The user compiled sound_fusion and reported the filter and compressor were "ghost
+effects" — the DSP was fully wired in sf_channel.bsm (filter/comp/rotary, each
+`_on`-gated in sf_channel_process) but the GUI had no control to engage, bypass,
+or edit them; the old "FLT" badge only DISPLAYED the filter state, could never
+change it. This was slice 4's own open item ("the channel-strip UI doesn't expose
+cutoff/resonance controls yet"). Closed it and several adjacent basic-DAW gaps in
+one session, app-code only (no compiler files), audio export md5 unchanged
+(`f61fac72be5077a6e9ef9cae21dde2a1`) throughout, ground-truth-verified against the
+installed binary first (every Inc 7/8 + RegAlloc-v2 claim from the prior session
+confirmed real by re-measuring, per the user's "the prior model said it did things
+it didn't" warning).
+
+The channel work: sf_channel.bsm caches each insert's parameters on the Track
+(cutoff/reso/slope, comp mode/release/threshold, rotary mode) plus muted/solo,
+with focused setters (sf_track_set_filter/_comp_threshold/_mute/_solo/_pan) and
+getters — the GUI reads back the cached value to draw a slider and writes the
+changed one, never reaching into a plugin instance. Effect enum constants are
+written as literals with naming comments because they are plain `const` in the
+cartridges, which do not reach a `load`ed module (the same cross-module rule
+sf_lib.bsm documents for SF_NTRACKS). sf_timeline.bsm's render skips muted
+channels and, when any channel is soloed, every non-soloed one (solo gating
+resolved once per render). sf_gui.bsm grew per-lane FLT/CMP/ROT toggles + M/S
+buttons, a selected-channel insert rack (pan + the filter/comp/rotary params) in
+the empty lower mixer area, spacebar play/stop, and a loop region (drag the ruler
+to set, click to seek, a LOOP button toggles wrapping, _g_pump_audio wraps b->a).
+
+Realtime playback (slice 7) landed the same session: sf_render split into
+sf_render_block(out, start, n, master) (no reset, block-relative output) and a
+thin sf_render = reset + render_block(0, total) that is byte-identical to the old
+offline path. _g_pump_audio now renders one live block per pass straight from the
+model and pushes it to the device ring — the mini_synth/stbmixer producer pattern
+on the main thread, NOT inside the @safe callback. So edits (toggle, slider,
+mute/solo, even a clip drag) are now heard while playing. A headless proof that
+block-by-block rendering with carried insert state equals one monolithic render
+initially FAILED (~57% of samples differing) and was bisected to the rotary —
+which turned out to be a TEST artifact (rotary_reset zeroes only the LFO phase,
+not the glide `cur`, so the two comparison renders started from different states;
+filter/comp passed because their resets zero everything). With the rotary warmed
+to a settled glide first, the corrected test passed 0/176400 — block continuity is
+real, and production uses one continuous stream so the artifact never applies.
+
+Live profile, the user's own correct constraint ("the live profile must not hurt
+realtime audio; if it does, measure another way"): a per-sample @profile in the
+audio hot path WOULD hurt, so it was deliberately avoided. Instead, BLOCK-
+granularity timing — one beat_now_us pair around sf_render_block per ~2048-frame
+block, main-thread, never touching the per-sample loop or the @safe callback,
+~nanoseconds of overhead — accumulates render-µs and frames over ~1s of audio and
+reports the realtime factor (audio-seconds rendered per CPU-second) live in the
+transport. >> 1 means ample headroom; it drops as inserts engage, making their
+cost visible without perturbing the audio.
+
+Then the methodology the user insisted on, and it paid off hugely: "improve the
+compressor, re-measure, THEN improve the compiler — if the tool is spilling
+unnecessarily our measurement is inflated." An offline per-insert decomposition
+(zero realtime cost) found the compressor dominated the filter/rotary by ~60x
+(62118 µs per 3s render vs ~1050/1329), because comp_process does two
+transcendentals per sample and log_f solved ln via Newton-on-exp, inlining
+exp_f's whole 12-term series once per Newton iteration. Three DSP fixes: (A)
+comp_process gates the per-sample amp_to_db_f behind a LINEAR `env <= knee_low_amp`
+precheck (output-identical, skips the log below the knee — the common case); (B)
+log_f Newton 8->4; then (C, the big one) replaced Newton-on-exp entirely with a
+direct atanh series, ln(m)=2(s+s^3/3+...) with s=(m-1)/(m+1), 6 terms, no exp at
+all. Result: the compressor went 62118 -> 11717 µs always-compressing (5.3x) and
+-> 691 µs below the knee (90x), accuracy preserved (4-decimal, test_log_f /
+test_exp_f / test_stbdynamics all pass), export md5 unchanged. log_f's disasm
+shrank 173 -> 119 instructions, spill 54 -> 33 memory ops. A non-unrolled loop's
+iteration count is a RUNTIME cost the static disassembly does not show — the 8->4
+change halved runtime with an identical instruction count, a useful reminder that
+disasm and wall-clock answer different questions.
+
+The compiler optimization (the inviting float-RegAlloc / float-CIP lever on
+log_f's remaining 25-ldr spill, the named Stage-F frontier) is deliberately NOT
+done yet: with the compressor now 5-90x cheaper, its absolute payoff shrank, and
+the user chose to checkpoint the verified DSP work before paying a codegen
+bootstrap cycle. It remains the next compiler increment, now with a real,
+deflated workload to motivate it.
+
+Noted for later (the user flagged it, scoped after the compiler work): sound_fusion
+plays through CoreAudio AudioQueue on the DEFAULT output device — i.e. through the
+OS system mixer — which the user (rightly) wants to bypass to drive their UAD
+Apollo Solo directly. On macOS userspace cannot bypass CoreAudio, but "as direct
+as it gets" is targeting the Apollo's specific CoreAudio device (not "default"),
+optionally exclusive/hog mode + a small buffer for low latency, and likely moving
+from the high-level AudioQueue to an AUHAL/HAL output unit. The UAD DSP itself
+(Console/UAD plugins) is reachable only through UAD's own SDK, not as a plain
+CoreAudio device. A stbaudio / _stb_audio_macos enhancement, future work.

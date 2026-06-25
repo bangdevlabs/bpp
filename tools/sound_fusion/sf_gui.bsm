@@ -22,6 +22,12 @@ const LANE_H   = 64;                 // 8 lanes * 64 = 512
 const SF_X0    = 150;                // timeline left  (= HEAD_W)
 const SF_X1    = 764;                // timeline right (= GUI_W - MIX_W)
 const PXPS     = 150;                // pixels per second on the timeline
+// Realtime playback renders the mix one block at a time straight from the live
+// model, so an edit (toggle/slider/mute) is heard within one ring's worth of
+// latency instead of only on the next Play. SF_BLK caps how many frames a
+// single pump pass renders into the scratch buffer (a few ms at 44.1 kHz);
+// the ring depth (audio_open below) is the real edit-to-ear latency.
+const SF_BLK   = 2048;               // frames per realtime render block
 
 // ── Transport / playback state ─────────────────────────────────────
 // Master volume is held as integer permille (e.g. 850 = 0.85): un-annotated
@@ -39,11 +45,42 @@ static auto _g_sel_clip;             // selected clip index, or -1
 static auto _g_drag_clip;            // clip index being dragged, or -1
 static auto _g_drag_dx;              // px offset: mouse_x() - the clip's left edge at pickup
 
+// ── Channel-strip insert state (slice 4 — the per-channel effect controls) ──
+// Which channel's insert rack is shown/edited in the mixer strip's lower panel.
+// Clicking any of a lane's FLT/CMP/ROT toggles selects that channel here, so
+// the rack always edits the channel the user last touched. Defaults to 0 so the
+// panel shows channel 1's inserts the moment the window opens.
+static auto _g_sel_track;
+
 static auto _g_cb_has;               // 1 if the clipboard holds a copied clip
 static auto _g_cb_buf;
 static auto _g_cb_frames;
 static auto _g_cb_len;
 static auto _g_cb_track;
+
+// ── Loop region (a user-set play range on the time ruler) ───────────
+// Drag across the ruler to define [_g_loop_a, _g_loop_b) in frames; the LOOP
+// transport button enables/disables wrapping. While looping, playback wraps
+// from _g_loop_b back to _g_loop_a. `_g_ruler_press` holds the frame a ruler
+// press started at (or -1 when no press is in progress) so a plain click can be
+// told apart from a drag: a click seeks, a drag sets the loop.
+static auto _g_loop_on;
+static auto _g_loop_a;
+static auto _g_loop_b;
+static auto _g_ruler_press;
+static auto _g_ruler_px;
+
+// ── Live realtime-render profile (BLOCK granularity — safe) ─────────
+// Timing the render at the BLOCK level (one clock pair per ~2048-frame block)
+// adds ~nanoseconds of main-thread work and never touches the per-sample DSP
+// loop or the @safe audio callback, so it cannot perturb realtime audio — the
+// per-sample @profile that WOULD perturb it is deliberately avoided. We sum
+// render-µs and frames over ~1 s of audio, then report the realtime factor
+// (audio-seconds rendered per CPU-second): >> 1 means ample headroom; watching
+// it drop as inserts engage shows their live cost.
+static auto _g_rt_us;        // accumulated render microseconds in the window
+static auto _g_rt_frames;    // accumulated frames rendered in the window
+static auto _g_rt_factor;    // last computed realtime factor (for display)
 
 static _rgb(r, g, b) { return rgba(r, g, b, 255); }
 
@@ -72,6 +109,51 @@ static _button(x, y, w, h, label, tint) {
     return hot && mouse_pressed(MOUSE_LEFT);
 }
 
+// A small insert on/bypass toggle (the FLT / CMP / ROT chips in a lane header).
+// Lit when engaged, dim when bypassed, brightening on hover; returns 1 on click.
+// The same hit-test-and-draw-in-one-place shape as _button, sized for the
+// three-across row a 150px-wide lane header has room for.
+static _insert_toggle(x, y, w, h, label, on) {
+    auto mx, my, hot, face;
+    mx = mouse_x(); my = mouse_y();
+    hot = _in_rect(mx, my, x, y, w, h);
+    // Engaged = bright accent; bypassed = dim grey; hover lifts either one.
+    if (on != 0) { face = hot ? _rgb(120, 200, 255) : _rgb(70, 120, 175); }
+    else         { face = hot ? _rgb(74, 78, 98)    : _rgb(46, 48, 62); }
+    draw_rect(x, y, w, h, face);
+    draw_text(label, x + 4, y + 3, 8, on != 0 ? _rgb(235, 240, 250) : _rgb(120, 124, 140));
+    return hot && mouse_pressed(MOUSE_LEFT);
+}
+
+// A mute / solo button — lit in its own accent colour when active (the DAW
+// convention: amber for mute, yellow for solo), dim grey when off. Returns 1 on
+// click. Kept separate from _insert_toggle so the two reads apart at a glance.
+static _ms_button(x, y, w, h, label, on, on_color) {
+    auto mx, my, hot, face;
+    mx = mouse_x(); my = mouse_y();
+    hot = _in_rect(mx, my, x, y, w, h);
+    if (on != 0) { face = on_color; }
+    else         { face = hot ? _rgb(74, 78, 98) : _rgb(46, 48, 62); }
+    draw_rect(x, y, w, h, face);
+    draw_text(label, x + 6, y + 3, 8, on != 0 ? _rgb(24, 24, 28) : _rgb(150, 154, 170));
+    return hot && mouse_pressed(MOUSE_LEFT);
+}
+
+// A clickable "label: value" row for a discrete (stepped) insert parameter —
+// slope, compressor mode/release, rotary mode. Clicking anywhere in the row
+// advances to the next value (the caller cycles and writes it back), the same
+// "few switches, each definitive" surface the TG12345's own channel strip used
+// rather than a continuous control. Returns 1 on click.
+static _cycle_row(x, y, w, label, valstr) {
+    auto mx, my, hot;
+    mx = mouse_x(); my = mouse_y();
+    hot = _in_rect(mx, my, x, y, w, 14);
+    draw_rect(x, y, w, 14, hot ? _rgb(50, 54, 70) : _rgb(38, 40, 54));
+    draw_text(label, x + 4, y + 3, 8, _rgb(150, 154, 174));
+    draw_text(valstr, x + w - 56, y + 3, 8, _rgb(220, 224, 238));
+    return hot && mouse_pressed(MOUSE_LEFT);
+}
+
 // A distinct block color per channel, so lanes read apart at a glance.
 static _clip_color(ch) {
     switch (ch) {
@@ -86,43 +168,93 @@ static _clip_color(ch) {
     }
 }
 
+// Frame position under a timeline x pixel, clamped to the project range.
+static _g_frame_at_x(px) {
+    auto f;
+    f = (px - SF_X0) * 44100 / PXPS;
+    if (f < 0)              { f = 0; }
+    if (f > _g_play_frames) { f = _g_play_frames; }
+    return f;
+}
+
+// Start playback from the current cursor (rewinding to 0 if it sits at the
+// end). Realtime: instead of pre-rendering the whole project, just reset the
+// inserts for a clean start and let _g_pump_audio render blocks live from the
+// model — so edits made WHILE playing are heard. Shared by the PLAY button and
+// the spacebar (see _g_toggle_play).
+static void _g_play() {
+    if (_g_play_pos >= _g_play_frames) { _g_play_pos = 0; }
+    sf_channel_reset_filters();
+    _g_playing = 1;
+}
+
+// Stop and rewind to the start — the STOP button's action.
+static void _g_stop() {
+    _g_playing  = 0;
+    _g_play_pos = 0;
+}
+
+// Spacebar transport: stop if playing, otherwise play from the cursor. Unlike
+// STOP this leaves the cursor where it is when pausing, so a second press
+// resumes from the same spot — the standard spacebar feel.
+static void _g_toggle_play() {
+    if (_g_playing != 0) { _g_playing = 0; } else { _g_play(); }
+}
+
 // ── Transport bar ──────────────────────────────────────────────────
 static void _g_draw_transport() {
     draw_rect(0, 0, GUI_W, TRANSP_H, _rgb(30, 30, 42));
     draw_text("sound_fusion", 12, 6, 8, _rgb(120, 180, 255));
     draw_text("8/16-bit DAW", 12, 24, 8, _rgb(95, 95, 120));
 
+    // Play re-renders from the current model on every press — slice 3's
+    // drag/copy/paste edit the model live, so an edit would otherwise never be
+    // heard (the buffer was only rendered once at window-open). Cheap at this
+    // project size; see _g_play. SPACE drives the same action (_g_toggle_play).
     if (_button(110, 12, 64, 22, _g_playing ? "PLAYING" : "PLAY", _rgb(54, 120, 70))) {
-        if (_g_play_pos >= _g_play_frames) { _g_play_pos = 0; }
-        // Re-render from the current model on every Play press — slice 3's
-        // drag/copy/paste edit the model live, and the playback buffer was
-        // otherwise only ever rendered once at window-open, so an edit
-        // would silently never be heard (Export already re-rendered fresh
-        // every time; Play didn't). Cheap at this project size (low
-        // milliseconds), so doing it unconditionally is simpler than
-        // tracking a "model is dirty" flag.
-        sf_render(_g_play_buf, _g_play_frames, _g_master_f());
-        _g_playing = 1;
+        _g_play();
     }
     if (_button(180, 12, 56, 22, "STOP", _rgb(120, 60, 60))) {
-        _g_playing = 0; _g_play_pos = 0;
+        _g_stop();
     }
-    if (_button(242, 12, 70, 22, "EXPORT", _rgb(54, 60, 96))) {
+    // LOOP toggles whether playback wraps within the user-dragged ruler region.
+    // It lights when active; with no region dragged yet it is inert (the wrap
+    // check below guards on a valid a<b range).
+    if (_button(242, 12, 56, 22, "LOOP", _g_loop_on ? _rgb(150, 110, 54) : _rgb(60, 60, 80))) {
+        _g_loop_on = _g_loop_on != 0 ? 0 : 1;
+    }
+    if (_button(304, 12, 70, 22, "EXPORT", _rgb(54, 60, 96))) {
         sf_export("sound_fusion_test.wav", _g_play_frames, _g_master_f());
         _g_status = "exported sound_fusion_test.wav";
     }
 
     // Playhead time readout (whole seconds).
-    draw_text("t=", 340, 18, 8, _rgb(120, 120, 140));
-    draw_number(360, 18, 8, _rgb(210, 210, 220), _g_play_pos / 44100);
-    draw_text("s", 392, 18, 8, _rgb(120, 120, 140));
-    if (_g_status != 0) { draw_text(_g_status, 430, 18, 8, _rgb(120, 190, 130)); }
+    draw_text("t=", 402, 18, 8, _rgb(120, 120, 140));
+    draw_number(422, 18, 8, _rgb(210, 210, 220), _g_play_pos / 44100);
+    draw_text("s", 454, 18, 8, _rgb(120, 120, 140));
+    if (_g_status != 0) { draw_text(_g_status, 492, 18, 8, _rgb(120, 190, 130)); }
+
+    // Live realtime headroom (block-granularity profile) — render speed as a
+    // multiple of playback. Green = ample headroom; amber if it drops toward
+    // realtime as inserts engage. Updates ~once per second of audio.
+    draw_text("rt", 672, 6, 8, _rgb(110, 150, 200));
+    draw_number(672, 22, 8, _g_rt_factor < 50 ? _rgb(235, 180, 90) : _rgb(120, 200, 130), _g_rt_factor);
+    draw_text("x", 708, 22, 8, _rgb(110, 150, 200));
 }
 
 // ── Time ruler ─────────────────────────────────────────────────────
 static void _g_draw_ruler() {
-    auto s, x, mx, my, new_pos;
+    auto s, x, mx, my, dx, fa, fb, xa, xb;
     draw_rect(SF_X0, TRANSP_H, SF_X1 - SF_X0, RULER_H, _rgb(30, 30, 42));
+
+    // The loop region, drawn as a band on the ruler — bright when looping is
+    // active, dim when the region exists but LOOP is off. Drawn under the ticks.
+    if (_g_loop_b > _g_loop_a) {
+        xa = SF_X0 + _g_loop_a * PXPS / 44100;
+        xb = SF_X0 + _g_loop_b * PXPS / 44100;
+        draw_rect(xa, TRANSP_H, xb - xa, RULER_H, _g_loop_on ? _rgb(120, 90, 40) : _rgb(58, 54, 64));
+    }
+
     // One mark per second across the visible range.
     for (s = 0; s <= 4; s++) {
         x = SF_X0 + s * PXPS;
@@ -131,14 +263,33 @@ static void _g_draw_ruler() {
         draw_number(x + 3, TRANSP_H + 6, 8, _rgb(140, 140, 160), s);
     }
 
-    // Click-to-seek: clicking the ruler moves the playhead there directly,
-    // the same gesture every DAW's time ruler supports.
+    // The ruler does double duty: a plain click seeks the playhead, a drag
+    // marks the loop region. They are told apart by how far the mouse moved
+    // between press and release (a few pixels of slack). A press records its
+    // start frame in _g_ruler_press; the drag updates the region live; release
+    // either seeks (no movement) or finalizes the region (movement).
     mx = mouse_x(); my = mouse_y();
     if (mouse_pressed(MOUSE_LEFT) && _in_rect(mx, my, SF_X0, TRANSP_H, SF_X1 - SF_X0, RULER_H)) {
-        new_pos = (mx - SF_X0) * 44100 / PXPS;
-        if (new_pos < 0) { new_pos = 0; }
-        if (new_pos > _g_play_frames) { new_pos = _g_play_frames; }
-        _g_play_pos = new_pos;
+        _g_ruler_press = _g_frame_at_x(mx);
+        _g_ruler_px    = mx;
+    }
+    if (_g_ruler_press >= 0) {
+        dx = mx - _g_ruler_px;
+        if (dx < 0) { dx = 0 - dx; }
+        if (mouse_down(MOUSE_LEFT)) {
+            // Past the click slack → a loop drag: order the two ends and engage.
+            if (dx > 4) {
+                fa = _g_frame_at_x(mx);
+                fb = _g_ruler_press;
+                if (fa < fb) { _g_loop_a = fa; _g_loop_b = fb; }
+                else         { _g_loop_a = fb; _g_loop_b = fa; }
+                _g_loop_on = 1;
+            }
+        } else {
+            // Released with no real movement → treat as a seek.
+            if (dx <= 4) { _g_play_pos = _g_ruler_press; }
+            _g_ruler_press = -1;
+        }
     }
 }
 
@@ -166,9 +317,26 @@ static void _g_draw_lanes() {
         draw_rect(HEAD_W - 1, y, 1, LANE_H, _rgb(18, 18, 26));
         draw_text("CH", 10, y + 8, 8, _rgb(150, 150, 170));
         draw_number(34, y + 8, 8, _rgb(210, 210, 220), tr + 1);
-        if (sf_channel_flt_on(tr) != 0) {
-            draw_rect(64, y + 7, 30, 11, _rgb(70, 90, 140));
-            draw_text("FLT", 67, y + 8, 8, _rgb(220, 220, 240));
+        // Three insert toggles — filter / compressor / rotary. Clicking one
+        // engages or bypasses that insert (reading the channel's own cached
+        // parameters so the setting survives a bypass) and selects this channel
+        // for the insert rack below the mixer. These replace the old read-only
+        // "FLT" badge, which displayed the filter state but could never change
+        // it — the ghost the user reported ("says it exists, can't apply it").
+        if (_insert_toggle(58, y + 5, 27, 13, "FLT", sf_channel_flt_on(tr))) {
+            sf_track_set_filter(tr, sf_channel_flt_on(tr) != 0 ? 0 : 1,
+                sf_channel_flt_cutoff(tr), sf_channel_flt_reso(tr), sf_channel_flt_slope(tr));
+            _g_sel_track = tr;
+        }
+        if (_insert_toggle(88, y + 5, 27, 13, "CMP", sf_channel_comp_on(tr))) {
+            sf_track_set_compressor(tr, sf_channel_comp_on(tr) != 0 ? 0 : 1,
+                sf_channel_comp_mode(tr), sf_channel_comp_rel(tr));
+            _g_sel_track = tr;
+        }
+        if (_insert_toggle(118, y + 5, 27, 13, "ROT", sf_channel_rot_on(tr))) {
+            sf_track_set_rotary(tr, sf_channel_rot_on(tr) != 0 ? 0 : 1,
+                sf_channel_rot_mode(tr));
+            _g_sel_track = tr;
         }
         // Volume bar — drag anywhere along it (a couple px of vertical
         // slack beyond the 8px-tall bar makes it easier to grab) to set
@@ -184,6 +352,14 @@ static void _g_draw_lanes() {
         vw = v * 120.0;                       // float -> int width (fcvtzs)
         draw_rect(10, y + 30, 120, 8, _rgb(44, 44, 58));
         draw_rect(10, y + 30, vw, 8, _rgb(90, 170, 255));
+
+        // Mute / solo — read by sf_render's mix loop on the next Play.
+        if (_ms_button(10, y + 44, 22, 14, "M", sf_channel_muted(tr), _rgb(220, 90, 70))) {
+            sf_track_set_mute(tr, sf_channel_muted(tr) != 0 ? 0 : 1);
+        }
+        if (_ms_button(36, y + 44, 22, 14, "S", sf_channel_solo(tr), _rgb(230, 200, 80))) {
+            sf_track_set_solo(tr, sf_channel_solo(tr) != 0 ? 0 : 1);
+        }
 
         // Clips on this lane.
         for (ci = 0; ci < nclips; ci++) {
@@ -301,6 +477,169 @@ static void _g_draw_mixer() {
     draw_rect(x, TRANSP_H + 258, mw, 14, _rgb(90, 200, 130));
 }
 
+// ── Selected-channel insert rack (the lower mixer panel) ────────────
+// Draws the three inserts' editable parameters for the channel a lane toggle
+// selected. Continuous params (filter cutoff / resonance) are drag-bars like
+// the faders; stepped params (slope, compressor mode / release, rotary mode)
+// are click-to-cycle rows — the TG12345's "few switches, each definitive"
+// surface. Every edit writes straight back through the channel setters, so the
+// change is heard on the next Play (which re-renders the project from the
+// model). The rack only EDITS parameters; engaging/bypassing an insert is the
+// lane header's FLT/CMP/ROT toggle.
+static void _g_draw_inserts() {
+    auto tr, px, pw, y, mx, my;
+    auto cutoff: float, reso: float, pan: float, thr: float;
+    auto slope, cmode, crel, rmode, on;
+    auto nv: float, bw: word, vi: word, vstr;
+    tr = _g_sel_track;
+    if (tr < 0 || tr >= 8) { return; }
+    mx = mouse_x(); my = mouse_y();
+    px = SF_X1 + 12;
+    pw = MIX_W - 24;                      // 172 px wide rack
+
+    y = TRANSP_H + 286;                   // below the master bar
+    draw_text("CH", px, y, 8, _rgb(150, 154, 174));
+    draw_number(px + 22, y, 8, _rgb(220, 224, 238), tr + 1);
+    draw_text("INSERTS", px + 46, y, 8, _rgb(110, 150, 200));
+    y += 18;
+
+    // ── PAN (centre-detented, -1 hard left .. +1 hard right) ──
+    pan = sf_channel_pan(tr);
+    if (mouse_down(MOUSE_LEFT) && _in_rect(mx, my, px, y, pw, 12)) {
+        nv = mx - px;
+        nv = nv / 172.0;
+        if (nv < 0.0) { nv = 0.0; }
+        if (nv > 1.0) { nv = 1.0; }
+        pan = nv * 2.0 - 1.0;
+        sf_track_set_pan(tr, pan);
+    }
+    nv = (pan + 1.0) * 0.5;               // -1..1 -> 0..1 handle position
+    bw = nv * 172.0;
+    draw_rect(px, y, pw, 12, _rgb(30, 32, 44));
+    draw_rect(px + 85, y, 2, 12, _rgb(70, 74, 92));        // centre detent
+    if (bw < 3) { bw = 3; }
+    draw_rect(px + bw - 3, y, 5, 12, _rgb(120, 170, 210)); // handle
+    draw_text("pan", px + 3, y + 2, 8, _rgb(195, 199, 214));
+    if (pan < 0.0 - 0.05)  { draw_text("L", px + pw - 14, y + 2, 8, _rgb(225, 228, 240)); }
+    else { if (pan > 0.05) { draw_text("R", px + pw - 14, y + 2, 8, _rgb(225, 228, 240)); }
+           else            { draw_text("C", px + pw - 14, y + 2, 8, _rgb(225, 228, 240)); } }
+    y += 16;
+
+    // ── FILTER (Moog ladder) ──
+    on = sf_channel_flt_on(tr);
+    draw_text("FILTER", px, y, 8, on != 0 ? _rgb(120, 200, 255) : _rgb(92, 96, 114));
+    y += 14;
+    // Cutoff drag-bar, 80..8000 Hz (linear for now; a log curve is a later
+    // refinement once the feel is dialled in).
+    cutoff = sf_channel_flt_cutoff(tr);
+    if (mouse_down(MOUSE_LEFT) && _in_rect(mx, my, px, y, pw, 12)) {
+        nv = mx - px;
+        nv = nv / 172.0;
+        if (nv < 0.0) { nv = 0.0; }
+        if (nv > 1.0) { nv = 1.0; }
+        cutoff = 80.0 + nv * 7920.0;
+        sf_track_set_filter(tr, on, cutoff, sf_channel_flt_reso(tr), sf_channel_flt_slope(tr));
+    }
+    nv = (cutoff - 80.0) / 7920.0;
+    bw = nv * 172.0;
+    draw_rect(px, y, pw, 12, _rgb(30, 32, 44));
+    draw_rect(px, y, bw, 12, _rgb(70, 120, 175));
+    draw_text("cut", px + 3, y + 2, 8, _rgb(195, 199, 214));
+    vi = cutoff;                          // float -> int Hz (fcvtzs)
+    draw_number(px + pw - 42, y + 2, 8, _rgb(225, 228, 240), vi);
+    y += 16;
+    // Resonance drag-bar, 0..0.9.
+    reso = sf_channel_flt_reso(tr);
+    if (mouse_down(MOUSE_LEFT) && _in_rect(mx, my, px, y, pw, 12)) {
+        nv = mx - px;
+        nv = nv / 172.0;
+        if (nv < 0.0) { nv = 0.0; }
+        if (nv > 1.0) { nv = 1.0; }
+        reso = nv * 0.9;
+        sf_track_set_filter(tr, on, sf_channel_flt_cutoff(tr), reso, sf_channel_flt_slope(tr));
+    }
+    nv = reso / 0.9;
+    bw = nv * 172.0;
+    draw_rect(px, y, pw, 12, _rgb(30, 32, 44));
+    draw_rect(px, y, bw, 12, _rgb(70, 120, 175));
+    draw_text("res", px + 3, y + 2, 8, _rgb(195, 199, 214));
+    vi = reso * 100.0;                    // 0..90 percent
+    draw_number(px + pw - 42, y + 2, 8, _rgb(225, 228, 240), vi);
+    y += 16;
+    // Slope stepper, 1..4 poles (-6..-24 dB/oct).
+    slope = sf_channel_flt_slope(tr);
+    switch (slope) {
+        1    { vstr = "1 -6dB"; }
+        2    { vstr = "2 -12dB"; }
+        3    { vstr = "3 -18dB"; }
+        else { vstr = "4 -24dB"; }
+    }
+    if (_cycle_row(px, y, pw, "slope", vstr)) {
+        slope = slope >= 4 ? 1 : slope + 1;
+        sf_track_set_filter(tr, on, sf_channel_flt_cutoff(tr), sf_channel_flt_reso(tr), slope);
+    }
+    y += 18;
+
+    // ── COMP (zener_comp / TG12345 dynamics) ──
+    draw_text("COMP", px, y, 8, sf_channel_comp_on(tr) != 0 ? _rgb(120, 200, 255) : _rgb(92, 96, 114));
+    y += 14;
+    cmode = sf_channel_comp_mode(tr);
+    crel  = sf_channel_comp_rel(tr);
+    if (_cycle_row(px, y, pw, "ratio", cmode == 0 ? "2:1" : "LIMIT")) {
+        cmode = cmode == 0 ? 1 : 0;
+        sf_track_set_compressor(tr, sf_channel_comp_on(tr), cmode, crel);
+    }
+    y += 16;
+    switch (crel) {
+        0    { vstr = "100ms"; }
+        1    { vstr = "250ms"; }
+        2    { vstr = "500ms"; }
+        3    { vstr = "1000ms"; }
+        4    { vstr = "2000ms"; }
+        else { vstr = "5000ms"; }
+    }
+    if (_cycle_row(px, y, pw, "release", vstr)) {
+        crel = crel >= 5 ? 0 : crel + 1;
+        sf_track_set_compressor(tr, sf_channel_comp_on(tr), cmode, crel);
+    }
+    y += 16;
+    // Threshold drag-bar, -40 dB (left) .. 0 dBFS (right). A lower threshold
+    // makes the compressor grab the signal sooner, so its gain reduction is
+    // actually audible — without this control the fixed -6 dB default leaves
+    // the comp doing almost nothing on a typical channel level.
+    thr = sf_channel_comp_thr(tr);
+    if (mouse_down(MOUSE_LEFT) && _in_rect(mx, my, px, y, pw, 12)) {
+        nv = mx - px;
+        nv = nv / 172.0;
+        if (nv < 0.0) { nv = 0.0; }
+        if (nv > 1.0) { nv = 1.0; }
+        thr = 0.0 - (1.0 - nv) * 40.0;
+        sf_track_set_comp_threshold(tr, thr);
+    }
+    nv = (thr + 40.0) / 40.0;
+    bw = nv * 172.0;
+    draw_rect(px, y, pw, 12, _rgb(30, 32, 44));
+    draw_rect(px, y, bw, 12, _rgb(70, 120, 175));
+    draw_text("thr", px + 3, y + 2, 8, _rgb(195, 199, 214));
+    vi = thr;                             // float -> int dB (negative)
+    draw_number(px + pw - 42, y + 2, 8, _rgb(225, 228, 240), vi);
+    y += 18;
+
+    // ── ROTARY (Leslie) ──
+    draw_text("ROTARY", px, y, 8, sf_channel_rot_on(tr) != 0 ? _rgb(120, 200, 255) : _rgb(92, 96, 114));
+    y += 14;
+    rmode = sf_channel_rot_mode(tr);
+    switch (rmode) {
+        0    { vstr = "OFF"; }
+        1    { vstr = "CHORALE"; }
+        else { vstr = "TREMOLO"; }
+    }
+    if (_cycle_row(px, y, pw, "speed", vstr)) {
+        rmode = rmode >= 2 ? 0 : rmode + 1;
+        sf_track_set_rotary(tr, sf_channel_rot_on(tr), rmode);
+    }
+}
+
 // ── Copy / paste / delete ────────────────────────────────────────────
 // Ctrl+C copies the selected clip's (buf, frames, len, track) into a
 // one-slot clipboard — the clip data is SHARED (same buf pointer), not
@@ -362,14 +701,42 @@ static void _g_draw_playhead() {
 // throttles to playback rate (it only accepts up to the ring's free space),
 // so the frame cursor advances at ~real time and the playhead follows it.
 static void _g_pump_audio() {
-    auto space, remain, chunk, pushed;
+    auto space, remain, chunk, pushed, endf;
     if (_g_playing == 0) { return; }
-    remain = _g_play_frames - _g_play_pos;
-    if (remain <= 0) { _g_playing = 0; return; }
+    // When looping over a valid region the play boundary is the loop end, and
+    // reaching it wraps back to the loop start instead of stopping. The chunk
+    // below is clamped to this boundary, so the wrap is sample-accurate.
+    if (_g_loop_on != 0 && _g_loop_b > _g_loop_a) {
+        if (_g_play_pos >= _g_loop_b) { _g_play_pos = _g_loop_a; }
+        endf = _g_loop_b;
+    } else {
+        endf = _g_play_frames;
+    }
+    remain = endf - _g_play_pos;
+    if (remain <= 0) {
+        if (_g_loop_on != 0 && _g_loop_b > _g_loop_a) { _g_play_pos = _g_loop_a; return; }
+        _g_playing = 0; return;
+    }
     space = audio_ring_space();
     chunk = space < remain ? space : remain;
+    if (chunk > SF_BLK) { chunk = SF_BLK; }   // cap to the scratch block size
     if (chunk > 0) {
-        pushed = audio_push_frames(_g_play_buf + _g_play_pos * 8, chunk);
+        // Render this block LIVE from the current model (inserts, mute/solo,
+        // clip edits all read fresh), then hand it to the device ring. This is
+        // the realtime path — no pre-rendered project buffer. The clock pair
+        // around it is the only profiling cost (block granularity, see above).
+        auto t0;
+        t0 = beat_now_us();
+        sf_render_block(_g_play_buf, _g_play_pos, chunk, _g_master_f());
+        _g_rt_us     += beat_now_us() - t0;
+        _g_rt_frames += chunk;
+        // Recompute the realtime factor once per ~1 s of rendered audio.
+        if (_g_rt_frames >= 44100 && _g_rt_us > 0) {
+            _g_rt_factor = _g_rt_frames * 1000000 / 44100 / _g_rt_us;
+            _g_rt_us     = 0;
+            _g_rt_frames = 0;
+        }
+        pushed = audio_push_frames(_g_play_buf, chunk);
         _g_play_pos += pushed;
     }
 }
@@ -384,12 +751,19 @@ void sf_gui_run(total_frames, master: float) {
     pm             = master * 1000.0;          // float -> int permille
     _g_master_pm   = pm;
     _g_status      = 0;
-    _g_play_buf    = malloc(total_frames * 8);   // stereo float32, the device wire
-    sf_render(_g_play_buf, total_frames, master);
+    _g_play_buf    = malloc(SF_BLK * 8);   // realtime render scratch (one block, stereo float32)
 
     _g_sel_clip  = -1;
     _g_drag_clip = -1;
     _g_cb_has    = 0;
+    _g_sel_track = 0;            // show channel 1's insert rack on open
+    _g_loop_on     = 0;
+    _g_loop_a      = 0;
+    _g_loop_b      = 0;
+    _g_ruler_press = -1;         // no ruler press in progress
+    _g_rt_us       = 0;
+    _g_rt_frames   = 0;
+    _g_rt_factor   = 0;          // realtime headroom readout (filled after ~1 s play)
 
     window_init_full(GUI_W, GUI_H, "sound_fusion");
     audio_open(4096);
@@ -397,6 +771,9 @@ void sf_gui_run(total_frames, master: float) {
     while (window_should_close() == 0) {
         window_frame_step();
         if (key_pressed(KEY_ESC)) { break; }
+        // Spacebar is the transport toggle (play from the cursor / pause) — the
+        // muscle-memory gesture every DAW binds to space.
+        if (key_pressed(KEY_SPACE)) { _g_toggle_play(); }
 
         _g_pump_audio();
         _g_handle_clip_keys();
@@ -405,6 +782,7 @@ void sf_gui_run(total_frames, master: float) {
         _g_draw_ruler();
         _g_draw_lanes();
         _g_draw_mixer();
+        _g_draw_inserts();          // selected channel's insert rack (lower mixer)
         _g_draw_playhead();
         _g_draw_transport();        // last: its buttons sit above everything
         draw_end();
