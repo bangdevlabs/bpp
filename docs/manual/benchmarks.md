@@ -672,6 +672,35 @@ fixed. `sf_bench` — the benchmark that actually matters, the real
 call-heavy float32 DAW render — is unchanged-to-slightly-better despite
 a full day of compiler-internals work landing underneath it.
 
+## 2026-06-25 — full catalog re-run after the `fmov #imm` float-constant codegen change
+
+Re-ran the whole catalog after the a64 codegen change that emits AArch64-encodable
+float constants (1.0/2.0/0.5/3.0/…) as a single `fmov d, #imm` instead of a
+3-instruction adrp+add+ldr pool load (see the journal entry / commit `6e2f9be`).
+This is the standing discipline — re-run the WHOLE catalog after any compiler-
+internals change, not just the motivating one — exactly what caught the Inc 7
+`xform` 2× regression last time. **Readings were taken during concurrent
+interactive use of the machine, so they are noisier than usual and treated as
+directional; the gates (PASS/FAIL) and the audio md5 are the noise-robust signals.**
+
+| Benchmark | Historical (2026-06-24) | Today | Verdict |
+|---|---|---|---|
+| `bench_compile.sh` bootstrap | 0.29-0.31s | 0.29s (min) | unchanged |
+| `bench_codegen` biquad / lcg / xform / manylive vs gcc -O2 | 1.075 / 1.042 / 1.141 / 1.443× | 0.85 / 0.85 / 1.02 / 1.24× | within noise — the "better than parity" on the INTEGER kernels (lcg/manylive, untouched by a float-only change) flags the noise floor, not a real gain |
+| `sf_bench` (stereo, ours) | 9.82 ms / ~298× | 10.18 ms / 294× | unchanged (its hot chain isn't simple-float-constant-bound) |
+| `bench_autovec_gate.sh` / `bench_mixed_auto.sh` | PASS | PASS | — |
+| `bench_compose` / `bench_simd_raw` / `bench_outline` / `bench_stbflow` / `bench_ecs_iter` | (per history) | all run clean, in band | no regression |
+| audio md5 | `f61fac72…` | `f61fac72…` | unchanged |
+
+**The one durable, disasm-verified effect** (not a wall-clock catalog row, because
+the standard benchmarks don't lean on simple-float-constant loops): `log_f`
+dropped 119 → 93 instructions (adrp 17→4, ldr 25→12) by collapsing its
+range-reduce/series constants to `fmov`. The win lands wherever a hot loop reloads
+encodable float constants — the compressor's transcendentals, future DSP — not the
+existing kernels. Byte-stable bootstrap, native 219/0/12, C-emit 176/0/55. **No
+regression anywhere — the re-run's purpose was regression-catching, and there was
+none.**
+
 ## Adding a benchmark
 
 A new runtime benchmark self-times with the bpp_bench helpers and prints a
