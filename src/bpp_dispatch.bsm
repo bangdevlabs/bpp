@@ -6079,6 +6079,101 @@ static _inline_body_has_nested_ret(body_arr, body_cnt) {
     return 0;
 }
 
+// Does `nd` contain an integer literal that needs MORE THAN ONE ARM64
+// mov-immediate instruction (more than one nonzero 16-bit chunk —
+// anything beyond a single movz, i.e. a movz+movk chain) anywhere in
+// its subtree? Generic expression walker, reused by the loop-body
+// variant below.
+//
+// Why this matters (found 2026-06-24, measured via bench_codegen.bpp's
+// `transform`, the xform kernel — real ~2x regression, not a guess):
+// "Stage 2a" hot-constant promotion (cg_const_val/cg_const_wt in
+// bpp_codegen.bsm) runs ONCE per function, on the CALLER's own body,
+// BEFORE any inline splice happens — it hoists a loop's expensive
+// constants to dedicated registers, materialised once after the
+// PROLOGUE. A constant arriving later, via a spliced callee's body, was
+// never seen by that pass and never gets hoisted: it gets rematerialised
+// via its full movz+movk chain on EVERY loop iteration instead of once.
+// `transform`'s two 64-bit LCG constants (each a 4-instruction
+// movz+movk×3 chain) cost ~8 extra instructions per element — over
+// 65536 elements × 320 outer reps, that is the entire ~2x. Disqualifying
+// here is the scoped fix; re-running hot-constant promotion on a
+// spliced subtree is a structural undertaking on the same scale as
+// RegAlloc v2's "sees through inlined calls" arc, not a one-line fix.
+// Float literals are NOT affected (always memory-loaded via a single
+// `ldr` from the literal pool, hoisting is a non-issue either way) —
+// this check is integer-literal-specific on purpose.
+static _inline_has_wide_lit(nd) {
+    auto n: Node, t, arr, cnt, i, val, chunks;
+    if (nd == 0) { return 0; }
+    n = nd;
+    t = n.ntype;
+    if (t == T_LIT) {
+        // is_int_lit_node filters float ('.') and string ('"') literals
+        // — calling parse_int_lit_value on a float literal's text would
+        // silently skip the '.' and misread it as some large integer,
+        // which would WRONGLY disqualify exp_f/log_f's own loops (full
+        // of float constants like 0.6931471805599453) — exactly the
+        // candidates Inc 7/8 just made inlineable. Float literals are
+        // always memory-loaded via a single `ldr` from the literal
+        // pool regardless of hoisting, so they never had this problem.
+        if (is_int_lit_node(n) == 0) { return 0; }
+        val = parse_int_lit_value(n.a);
+        if (val < 0) { val = 0 - val; }
+        chunks = 0;
+        if (val & 0xffff) { chunks++; }
+        if ((val >> 16) & 0xffff) { chunks++; }
+        if ((val >> 32) & 0xffff) { chunks++; }
+        if ((val >> 48) & 0xffff) { chunks++; }
+        return chunks > 1;
+    }
+    switch (t) {
+    T_BINOP   { return _inline_has_wide_lit(n.b) || _inline_has_wide_lit(n.c); }
+    T_UNARY   { return _inline_has_wide_lit(n.b); }
+    T_MEMLD   { return _inline_has_wide_lit(n.a); }
+    T_ADDR    { return _inline_has_wide_lit(n.a); }
+    T_TERNARY { return _inline_has_wide_lit(n.a) || _inline_has_wide_lit(n.b) || _inline_has_wide_lit(n.c); }
+    T_CALL {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { if (_inline_has_wide_lit(arr[i])) { return 1; } }
+        return 0;
+    }
+    T_ASSIGN  { return _inline_has_wide_lit(n.a) || _inline_has_wide_lit(n.b); }
+    T_MEMST   { return _inline_has_wide_lit(n.a) || _inline_has_wide_lit(n.b); }
+    T_RET {
+        if (n.c > 1) {
+            arr = n.b; cnt = n.c;
+            for (i = 0; i < cnt; i++) { if (_inline_has_wide_lit(arr[i])) { return 1; } }
+            return 0;
+        }
+        return _inline_has_wide_lit(n.a);
+    }
+    T_IF {
+        if (_inline_has_wide_lit(n.a)) { return 1; }
+        if (_inline_has_wide_lit_body(n.b, n.c)) { return 1; }
+        if (n.e > 0) { if (_inline_has_wide_lit_body(n.d, n.e)) { return 1; } }
+        return 0;
+    }
+    T_WHILE {
+        if (_inline_has_wide_lit(n.a)) { return 1; }
+        if (_inline_has_wide_lit_body(n.b, n.c)) { return 1; }
+        if (n.e != 0) { return _inline_has_wide_lit(n.e); }
+        return 0;
+    }
+    T_BLOCK   { return _inline_has_wide_lit_body(n.b, n.c); }
+    else { return 0; }
+    }
+    return 0;
+}
+
+static _inline_has_wide_lit_body(body_arr, body_cnt) {
+    auto i;
+    for (i = 0; i < body_cnt; i++) {
+        if (_inline_has_wide_lit(body_arr[i])) { return 1; }
+    }
+    return 0;
+}
+
 static _inline_count_nodes(nd) {
     auto n: Node, t, sum, arr, cnt, i;
     if (nd == 0) { return 0; }
@@ -6211,6 +6306,14 @@ static _inline_count_nodes(nd) {
     T_WHILE {
         auto wh_a, wh_b, wh_e;
         if (_inline_body_has_nested_ret(n.b, n.c)) { return 99; }
+        // 2026-06-24: a wide integer constant (movz+movk chain) inside
+        // a loop body loses hot-constant hoisting once spliced — see
+        // _inline_has_wide_lit's own comment for the measured ~2x
+        // regression (examples/bench_codegen.bpp's `transform`/xform)
+        // this disqualifies.
+        if (_inline_has_wide_lit(n.a)) { return 99; }
+        if (_inline_has_wide_lit_body(n.b, n.c)) { return 99; }
+        if (n.e != 0) { if (_inline_has_wide_lit(n.e)) { return 99; } }
         wh_a = _inline_count_nodes(n.a);
         if (wh_a >= 99) { return 99; }
         wh_b = _inline_count_nodes_body(n.b, n.c);

@@ -839,3 +839,68 @@ sound_fusion + zener_comp compile clean, audio md5 unchanged, the
 pre-existing moog-filter-chain inlining (tiers 1-3) verified unchanged
 by spot-checking `sf_channel_process`'s own `bl` count (still exactly 2:
 `rotary_tick`, `zener_process` — unaffected by tier 4's introduction).
+
+## A real ~2x regression, found re-running the benchmark catalog, same day
+
+Per the user's own next request — "vamos ler benchmark.md... e rodar todos os
+testes de novo pra ter um parametro" — re-ran `examples/bench_codegen.bpp`
+against the day's final binary. `xform` (the integer-throughput kernel)
+measured **~13.6-15.5ms, min-of-5**, against a historical/parity record of
+~6.6-7.8ms — not noise (consistent across 5 runs, ~2x). Bisected with disposable
+`git worktree`s at each of the day's 7 commits (the binaries are git-committed,
+so no rebuild needed per commit — just `git checkout <sha> -- bpp` and run):
+clean through `dc1e6c1`/`346efa1`, regressed starting exactly at `d9c25e6`
+(Inc 7, control-flow leaf bodies).
+
+**Root cause.** `transform` (`examples/bench_codegen.bpp`'s xform kernel) is
+`static void`, body is a single `for` loop with no return — exactly the
+VOID-inlineable (VI-2) shape, and exactly the shape Inc 7 newly allowed past
+the old blanket T_WHILE rejection. Once eligible, VI-2 splices it
+UNCONDITIONALLY at its one call site (inside `main`'s own `for (r=0;
+r<TREP; r++)` loop). The disassembly showed why this hurts: `transform`'s
+two 64-bit LCG-style constants (`6364136223846793005`,
+`1442695040888963407`) were being REMATERIALISED via their full 4-instruction
+`movz`+`movk`×3 chain on EVERY one of the inner loop's 65536 iterations,
+320 times over — `examples/bench_codegen.bpp`'s own header comment on
+`transform` even names this exact hazard ("the two loop-invariant 64-bit
+constants... rematerialised as pure per-element overhead").
+
+Why: "Stage 2a" hot-constant promotion (`cg_const_val`/`cg_const_wt` in
+`bpp_codegen.bsm`) is a per-function pass that walks the CALLER's own body
+ONCE, before codegen, hoisting loop-weighted constants to dedicated
+registers materialised after the prologue. It runs BEFORE any inline splice
+happens, so it is completely blind to constants arriving later via a
+spliced callee's body — they get emitted on the default "rematerialise
+every reference" path instead. The same general shape as RegAlloc v2's
+"mangled slot invisible to linear-scan" bug from an earlier session
+(`benchmarks.md`'s Stage-E-float entry): an analysis pass that runs on the
+caller before splicing can't see what the splice adds.
+
+**Fix shipped, not a structural rewrite.** Re-running hot-constant
+promotion on a spliced subtree (the "real" fix) is a project on RegAlloc
+v2's own "sees through inlined calls" scale — not today's scope. Instead,
+disqualified the narrow, precisely-measured shape: `_inline_has_wide_lit`
+(new) recursively checks a loop body for an integer literal needing more
+than one ARM64 `mov`-immediate instruction (more than one nonzero 16-bit
+chunk) — wired into `_inline_count_nodes`'s `T_WHILE` case, returning the
+disqualifying 99 sentinel exactly like the early-return check does. Float
+literals are explicitly exempt (filtered via the existing `is_int_lit_node`
+helper) — they are always memory-loaded via a single `ldr` from the
+literal pool regardless of hoisting, so `exp_f`/`log_f`'s own loops (full
+of float constants like `0.6931471805599453`) are correctly unaffected.
+Verified explicitly: `comp_process`'s `bl` count stayed at 1 (the
+`db_to_amp_f`/`exp_f` inlining from Inc 8 survived this fix untouched).
+
+**Lesson for whoever extends this arc next**: every time a new shape of
+body becomes inline-eligible, re-run the FULL benchmark catalog
+(`benchmarks.md`), not just the one named example that motivated the
+change — `transform` was never the target of Inc 7/8's work, it just
+happened to be sitting in the standard benchmark file with the exact
+shape that exposes a gap the target functions don't have. A synthetic
+correctness test would never have caught this; only a real timing
+regression did.
+
+Re-verified after the fix: `xform` back to ~6.8-7.1ms (min-of-5, matching
+history), bootstrap byte-stable, suite 219/0/12, C-emit 176/0/55, all
+gates green, audio md5 unchanged, `comp_process`'s 1-`bl` count (Inc 8's
+win) confirmed intact.
