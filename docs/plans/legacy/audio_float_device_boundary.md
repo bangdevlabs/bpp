@@ -37,7 +37,7 @@ Checked against the actual platform docs and the actual code, not memory:
   actual DAC format. That round trip buys nothing; it spends a quantization
   step Core Audio's own canonical path does not have.
 - **iOS uses Int16** — for a reason that does not transfer: battery/CPU cost
-  on ARM silicon without a fast FPU. `mini_synth` / `tiny_lofi` target
+  on ARM silicon without a fast FPU. `mini_synth` / `sound_fusion` target
   desktop macOS, where that tradeoff is moot.
 - **WASAPI's shared-mode engine always mixes in float32** internally
   (`IAudioClient::GetMixFormat` reports the engine's native format) —

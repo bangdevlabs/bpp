@@ -6,7 +6,7 @@ by first mapping the audio DSP + instrument layer against its **named** consumer
 so cartridge decomposition is principled (Rule 33 tiers, Rule 20 two-consumer)
 instead of guessed. Grounded in real + planned products: `mini_synth` (keyboard
 synth, exists), **`kong_beat` (an 8/16-bit drum machine, planned)**, `moon_filter`
-(Moog plugin, exists), the Leslie/rotary effect (wanted now), `tiny_lofi` (the DAW
+(Moog plugin, exists), the Leslie/rotary effect (wanted now), `sound_fusion` (the DAW
 host), and future synths/effects.
 
 ## What exists today (measured 2026-06-19)
@@ -27,13 +27,13 @@ host), and future synths/effects.
 | | **envelope (ADSR)** | — | `kong_beat` (every drum hit), `mini_synth` (de-click), future synths ← NEW |
 | | **LFO** | — | Leslie (rotation), `mini_synth` (vibrato/tremolo/PWM), `kong_beat` (swing, tom pitch-mod), filter sweeps ← NEW |
 | | filter | `stbfilter` | ✓ |
-| | pan | mixer + `tl_channel` (inline) | ✓ (stays small) |
+| | pan | mixer + `sf_channel` (inline) | ✓ (stays small) |
 | **2 — effect** | Moog plugin | `moon_filter` | ✓ |
-| | **rotary/Leslie** | — | `mini_synth` (now), `tiny_lofi` channel insert (planned) |
+| | **rotary/Leslie** | — | `mini_synth` (now), `sound_fusion` channel insert (planned) |
 | | delay / reverb / drive | — | future |
 | **3 — instrument/tool** | keyboard synth | `mini_synth` | ✓ |
 | | **drum machine** | — | `kong_beat` (planned) |
-| **host** | DAW / mixer | `tiny_lofi` / `stbmixer` | ✓ |
+| **host** | DAW / mixer | `sound_fusion` / `stbmixer` | ✓ |
 
 ## The decision (per Rule 20/33)
 
@@ -53,7 +53,7 @@ two-consumer bar decisively. So:
      mode in `stbmixer` that advances an `stblfo` per sample and modulates pan
      (the unity-centre balance law already turns a pan sweep into the antiphase
      L/R swell = rotary + tremolo in one).
-   - When `tiny_lofi` adopts it as a **channel insert** (the concrete 2nd
+   - When `sound_fusion` adopts it as a **channel insert** (the concrete 2nd
      consumer, like `moon_filter`) → graduate to **`stbrotary`** (Tier 2 effect:
      stblfo + pan + AM + Doppler), consumed by both. That's the honest
      `stbrotary` moment — not before.
@@ -61,7 +61,7 @@ two-consumer bar decisively. So:
    envelope on osc/noise; it also de-clicks `mini_synth` note-off. Two+ named
    consumers → justified; build it as the kong_beat foundation (or just before).
 4. **`stbpan` — do NOT mint.** Pan is a few lines, already inline in the mixer
-   (`mixer_set_voice_pan`) and `tl_channel` (constant-power). No independent
+   (`mixer_set_voice_pan`) and `sf_channel` (constant-power). No independent
    consumer wants pan *alone*. Revisit only if surround/multichannel shows up.
 5. **noise — a small generator** (white/pink), lands with `kong_beat`; likely a
    helper in `stbmixer` (a NOISE voice kind) or a tiny `stbosc`, decided when
@@ -100,12 +100,12 @@ An 8/16-bit drum machine = a **step sequencer** over **synthesised drum voices**
    for when `kong_beat`'s voices are actually built, per the original call
    below; `kong_beat` itself (the step sequencer + drum voices) has not
    started.
-4. Graduate **`stbrotary`** (Tier 2) when `tiny_lofi` takes the rotary as a
+4. Graduate **`stbrotary`** (Tier 2) when `sound_fusion` takes the rotary as a
    channel insert (the 2nd consumer).
 
 ## Cross-references
 - `docs/plans/audio_stereo_dogfood.md` — the stereo/pan work this builds on (S2
   shipped the per-voice pan the rotary modulates).
-- `docs/plans/tiny_lofi.md` — the DAW host (rotary as a future channel insert).
+- `docs/plans/sound_fusion.md` — the DAW host (rotary as a future channel insert).
 - Rule 33 (tier triage), Rule 20/28 (a cartridge earns its keep via real
   consumers), Rule 35 (instruments/games stress the engine → surface the gaps).

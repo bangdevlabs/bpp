@@ -31,7 +31,7 @@ graduation).
   crunches a signal that was already quantized to s16 — crunch-on-crunch.
 - **b++ already has the seam.** `stbfilter` (the Moog ladder) and `stblfo` are
   float-only by design ("Everything runs in float; convert to/from s16 at the audio
-  boundary" — `stbfilter.bsm` header). `tl_timeline.bsm` (tiny_lofi) already uses the
+  boundary" — `stbfilter.bsm` header). `sf_timeline.bsm` (sound_fusion) already uses the
   float convention `sample / 32768.0` in, `* 32767.0` out. `stbmixer` is the one
   cartridge still running the old all-integer engine. Migrating it *unifies* the
   stack instead of introducing a third convention.
@@ -51,9 +51,9 @@ graduation).
 | Sample/Music WAV playback | s16 read, mixed as int | WAV stays s16 **on disk** (interchange format, unaffected) — converted to float once per sample read (`peek_q` + sign-extend + `/32768.0`), mixed in float |
 | Rotary (just shipped) | float LFO tick → `/1024 word` gain → int multiply | float LFO tick → float gain → direct float multiply (drops the `rgl`/`rgr` fixed-point dance) |
 | The wire boundary | `mixer_fill`'s final `poke` writes s16 | **unchanged in kind** — still the s16 conversion point, just sourced from float (`* 32767.0`, clamp, truncate) instead of int. The ring buffer and CoreAudio queue were always s16 and stay s16. |
-| External API (`mixer_set_voice_volume(slot, amp: word 0..32767)`, `audio_set_amplitude`, bus/master percent + dB setters) | s16 raw / percent / dB | **unchanged contract** — callers (`mini_synth`, `rhythm`, `snake`, `tiny_lofi`) need zero edits; the int↔float conversion happens only inside `stbmixer.bsm` at the boundary functions |
+| External API (`mixer_set_voice_volume(slot, amp: word 0..32767)`, `audio_set_amplitude`, bus/master percent + dB setters) | s16 raw / percent / dB | **unchanged contract** — callers (`mini_synth`, `rhythm`, `snake`, `sound_fusion`) need zero edits; the int↔float conversion happens only inside `stbmixer.bsm` at the boundary functions |
 
-The float convention is **-1.0..+1.0 full scale**, matching `tl_timeline.bsm`
+The float convention is **-1.0..+1.0 full scale**, matching `sf_timeline.bsm`
 (`sf / 32768.0` in, `* 32767.0` out) and `stbfilter` — not a new convention.
 
 ## Part C — Staged rollout
@@ -143,5 +143,5 @@ new engine; full suite 195/0/12 throughout every stage.
 - `docs/plans/audio_stereo_dogfood.md` — where the float/int seam first became
   visible (`_mx_voice_pan_l/r` shipped as fixed-point specifically because the mixer
   was int-only at the time).
-- `stb/stbfilter.bsm`, `stb/stblfo.bsm`, `tools/tiny_lofi/tl_timeline.bsm` — the
+- `stb/stbfilter.bsm`, `stb/stblfo.bsm`, `tools/sound_fusion/sf_timeline.bsm` — the
   float convention this migration aligns `stbmixer` with.

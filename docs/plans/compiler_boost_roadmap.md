@@ -331,7 +331,7 @@ remains.
 
 **Fully unblocked 2026-06-23** — both trigger conditions in "When to
 unblock" above are now concretely met, not hypothetical: re-disassembling
-`tl_bench_flat` (the tiny_lofi DSP chain with every function call hand-
+`sf_bench_flat` (the sound_fusion DSP chain with every function call hand-
 eliminated) measured flat/oracle = 1.44× against `gcc -O2` — a real
 arithmetic-bound gap on a real audio workload that persists with zero
 call overhead in the picture, i.e. exactly "stack traffic as a

@@ -34,12 +34,12 @@ numbers, and how the headline metrics have evolved over time.
 |---|---|---|---|
 | `examples/bench_codegen.bpp` | biquad (FP serial), lcg (int serial), xform (int throughput), manylive (many short-lived locals in sequential phases — the RegAlloc v2 / Stage D motivating shape) | `bpp examples/bench_codegen.bpp -o /tmp/bcg && /tmp/bcg` | serial near gcc -O2 parity; throughput as low as possible; manylive is the one kernel B3 cannot reach parity on (see 2026-06-23 entry below) |
 | oracle | the same kernels under gcc -O2 | `bpp --c examples/bench_codegen.bpp > /tmp/b.c && cc -O2 -w -Wno-error=implicit-function-declaration /tmp/b.c -o /tmp/o2 -lobjc -lm && /tmp/o2` | — |
-| `tools/tiny_lofi/tl_bench.bpp` | a REAL assembled program — the tiny_lofi DAW render (3 s project, call-heavy) | `bpp tools/tiny_lofi/tl_bench.bpp -o /tmp/tlb && /tmp/tlb` | realtime factor ≫ 1× |
+| `tools/sound_fusion/sf_bench.bpp` | a REAL assembled program — the sound_fusion DAW render (3 s project, call-heavy) | `bpp tools/sound_fusion/sf_bench.bpp -o /tmp/tlb && /tmp/tlb` | realtime factor ≫ 1× |
 
-### Real-program codegen — the tiny_lofi finding (2026-06-18)
+### Real-program codegen — the sound_fusion finding (2026-06-18)
 
 The microbenchmark parity (biquad 1.02×, lcg 1.02×) is measured on **tight,
-already-flat kernels**. The tiny_lofi DAW render is the first **call-heavy real
+already-flat kernels**. The sound_fusion DAW render is the first **call-heavy real
 program** measured the same way (`bpp --c` → `cc -O2`), and it does **NOT** hold
 parity:
 
@@ -48,17 +48,17 @@ parity:
 | our codegen | 16.9 ms | 177× | — |
 | clang -O2 (same source) | 2.3 ms | ~1300× | **7.3× faster** |
 
-Decomposition (`tl_bench_flat.bpp` = the same render hand-inlined, 0 calls):
+Decomposition (`sf_bench_flat.bpp` = the same render hand-inlined, 0 calls):
 
 | variant | per 3 s render | vs clang |
 |---|---|---|
-| ours, call-heavy (`tl_render`) | 16.6 ms | 7.5× |
+| ours, call-heavy (`sf_render`) | 16.6 ms | 7.5× |
 | ours, hand-inlined (flat) | 4.5 ms | 2.0× |
 | clang -O2 (same source) | 2.2 ms | 1× |
 
 The 7.5× is ~multiplicative: **×3.7 is the inliner** (16.6→4.5, pure call
 overhead — disasm shows 6 `bl`/iter for us vs 1 for clang, the whole
-`tl_channel_process → moon_process → moog_slope → moog_taps → flt_onepole_tick`
+`sf_channel_process → moon_process → moog_slope → moog_taps → flt_onepole_tick`
 chain plus `arr_struct_at`/`read_u16`/`write_u16`), and **×2.0 is flat-loop
 codegen** (4.5→2.2 — register allocation/liveness across a branchy triple-nested
 loop; the tight-kernel biquad parity does NOT cover this shape).
@@ -76,17 +76,17 @@ loop; the tight-kernel biquad parity does NOT cover this shape).
 NOT assembled call-heavy code. The DAW runs comfortably (177× realtime) but the
 real benchmark exposed both frontiers cleanly. Measure beat believe — again.
 
-#### The inliner arc — tiny_lofi as the standing stressor (2026-06-18)
+#### The inliner arc — sound_fusion as the standing stressor (2026-06-18)
 
-`tools/tiny_lofi/tl_bench.bpp` is the canonical **call-heavy** perf gate for the
+`tools/sound_fusion/sf_bench.bpp` is the canonical **call-heavy** perf gate for the
 inliner arc (`docs/plans/inliner_arc.md`). It self-times 400 renders of the 3 s
 DAW project and reports per-3s-render µs. Run all four variants for the gap
 decomposition (min-of-3, same shared laptop, same session):
 
 ```sh
-bpp tools/tiny_lofi/tl_bench.bpp      -o /tmp/tlb       && /tmp/tlb   # ours
-bpp tools/tiny_lofi/tl_bench_flat.bpp -o /tmp/tlbf      && /tmp/tlbf  # hand-inlined target
-bpp --c tools/tiny_lofi/tl_bench.bpp > /tmp/t.c && \
+bpp tools/sound_fusion/sf_bench.bpp      -o /tmp/tlb       && /tmp/tlb   # ours
+bpp tools/sound_fusion/sf_bench_flat.bpp -o /tmp/tlbf      && /tmp/tlbf  # hand-inlined target
+bpp --c tools/sound_fusion/sf_bench.bpp > /tmp/t.c && \
   cc -O2 -w -Wno-error=implicit-function-declaration /tmp/t.c -o /tmp/tlo -lobjc -lm && /tmp/tlo  # oracle
 ```
 
@@ -107,7 +107,7 @@ type float leaves inlinable (relax the float gate + float-typed mangled slots),
 collapsing `moog_taps`'s 4 per-sample `flt_onepole_tick` calls. Compiler binary
 flat for float-leaf (no hot float leaves in the compiler itself); audio
 byte-identical throughout. The remaining filter-chain links
-(`tl_channel_process`/`moon_process`/`moog_slope` calls, `moog_taps`
+(`sf_channel_process`/`moon_process`/`moog_slope` calls, `moog_taps`
 multi-return) need Inc 5 + control-flow + the nested-inline architecture (T_CALL
 was measured a dead end — see inliner_arc.md). (The oracle `cc` line needs
 `-Wno-error=implicit-function-declaration` + `-lobjc` on recent clang.)
@@ -117,8 +117,8 @@ the per-increment progress signal):
 
 | function | bl (Inc 2) | bl (3b) | bl (float-leaf) | note |
 |---|---|---|---|---|
-| `tl_render` | 3 | 2 | 2 | `arr_struct_at` inlined away (3b); reset(once) + `tl_channel_process` remain |
-| `tl_channel_process` | 1 | 1 | 1 | → `moon_process` (needs control-flow + nested-inline) |
+| `sf_render` | 3 | 2 | 2 | `arr_struct_at` inlined away (3b); reset(once) + `sf_channel_process` remain |
+| `sf_channel_process` | 1 | 1 | 1 | → `moon_process` (needs control-flow + nested-inline) |
 | `moon_process` | 1 | 1 | 1 | → `moog_slope` |
 | `moog_slope` | 1 | 1 | 1 | → `moog_taps` (has a switch) |
 | `moog_taps` | 4 | 4 | **0** | 4× `flt_onepole_tick` **inlined (float-leaf)**; itself multi-return → Inc 5 |
@@ -126,8 +126,8 @@ the per-increment progress signal):
 | `arr_struct_at` | 0 | 0 | 0 | guard-clause → ternary, tier-3 hot-only; inlined at hot sites (3b), standalone for ~80 cold callers |
 
 **Audio correctness baseline (current, 2026-06-23):**
-**`f61fac72be5077a6e9ef9cae21dde2a1`**. `tiny_lofi.bpp --render` writes
-`tiny_lofi_test.wav`; this is the md5 every codegen-only commit must
+**`f61fac72be5077a6e9ef9cae21dde2a1`**. `sound_fusion.bpp --render` writes
+`sound_fusion_test.wav`; this is the md5 every codegen-only commit must
 reproduce exactly (a change here means the render changed, not just got
 faster/slower).
 
@@ -137,11 +137,11 @@ reason — none are regressions):
 
 | md5 | Established at | Why it changed from the previous one |
 |---|---|---|
-| `8b8742ca…` | (early) | stale before `7ee452e7…` was even recorded — predated a `tiny_lofi.bpp` content edit |
+| `8b8742ca…` | (early) | stale before `7ee452e7…` was even recorded — predated a `sound_fusion.bpp` content edit |
 | `7ee452e7…` | pre-2026-06-19 | the **mono** baseline |
-| `3e258737…` | `9f925f8` (2026-06-19, stereo S1) | DAW went stereo (`tl_channel_process -> (float,float)`, per-channel pan) |
+| `3e258737…` | `9f925f8` (2026-06-19, stereo S1) | DAW went stereo (`sf_channel_process -> (float,float)`, per-channel pan) |
 | `3caa9325…` | `1d9208f` (2026-06-22, slice 3 close) | the hardcoded demo project's own CONTENT grew across normal feature commits (WAV import slice 6a, slice 3 editing) between `9f925f8` and here — never written down, found only by bisecting with `git worktree` while investigating the gap below |
-| **`f61fac72…`** | **`2ce22b1`** (2026-06-22) | **int→float migration**: `tl_render` moved from writing s16 (`write_u16`) to writing float32 natively (`pokefloat_h`), matching `stbmixer`'s and the CoreAudio device wire's own float32 format end-to-end; the s16-on-disk WAV conversion moved into a separate `tl_export` pass. Confirmed by direct A/B render at `2ce22b1~1` vs `2ce22b1` (same demo content, only the render/export code path differs) — `3caa9325…` → `f61fac72…`, exactly isolating this one change. |
+| **`f61fac72…`** | **`2ce22b1`** (2026-06-22) | **int→float migration**: `sf_render` moved from writing s16 (`write_u16`) to writing float32 natively (`pokefloat_h`), matching `stbmixer`'s and the CoreAudio device wire's own float32 format end-to-end; the s16-on-disk WAV conversion moved into a separate `sf_export` pass. Confirmed by direct A/B render at `2ce22b1~1` vs `2ce22b1` (same demo content, only the render/export code path differs) — `3caa9325…` → `f61fac72…`, exactly isolating this one change. |
 
 **Lesson — when re-verifying an audio md5 "regression," bisect with a
 disposable `git worktree`, don't trust the comment.** This doc had
@@ -154,11 +154,11 @@ each candidate revision is the reliable way to re-derive which commit
 owns which hash; do not assume a md5 mismatch against this doc means a
 real regression without doing that walk first.
 
-**Note — the inliner-arc tl_bench table above is the MONO record** (16.9→13.1
-across the arc). The DAW is now a **stereo** workload (`tl_bench` ~14.6 ms,
+**Note — the inliner-arc sf_bench table above is the MONO record** (16.9→13.1
+across the arc). The DAW is now a **stereo** workload (`sf_bench` ~14.6 ms,
 ~205× realtime — stereo doubles the per-frame channel work + adds the
 multi-return unpack). Don't compare the mono and stereo numbers directly; the
-inliner arc paused at 13.1 ms mono. Stereo also made `tl_channel_process` the
+inliner arc paused at 13.1 ms mono. Stereo also made `sf_channel_process` the
 first real **multi-return product consumer** (the eventual Inc 5 target).
 
 #### 2026-06-23 — full catalog re-run after the "redisassemble instead of
@@ -167,7 +167,7 @@ inliner fixes — `docs/plans/inliner_arc.md`'s addendum has the per-commit
 detail)
 
 Full catalog run end to end (every benchmark in this doc, not just
-`tl_bench`) on the installed binary at commit `c6e19e8`, cross-checked
+`sf_bench`) on the installed binary at commit `c6e19e8`, cross-checked
 against the historical numbers above rather than reported in isolation:
 
 | Benchmark | Historical | Today | Verdict |
@@ -176,9 +176,9 @@ against the historical numbers above rather than reported in isolation:
 | `bench_codegen` lcg vs gcc -O2 | 1.02× (parity) | 0.93× | parity held |
 | `bench_codegen` xform vs gcc -O2 | 1.10× | 1.01× | better |
 | `bench_codegen` biquad vs gcc -O2 | 1.02× (parity) | 0.95× | parity held |
-| `tl_bench` (stereo) | ~14.6 ms / 205× (pre-session baseline) | **10.86 ms / 274×** | **~26% better** — today's cumulative win, not yet a named row above |
-| `tl_bench_flat` (stereo) | n/a (mono record was 4201 µs) | 5298 µs | consistent with stereo roughly doubling the mono flat number |
-| oracle (`gcc -O2` on `tl_bench.bpp`, stereo) | n/a (mono record was 2339 µs) | 3684 µs | consistent, same reasoning |
+| `sf_bench` (stereo) | ~14.6 ms / 205× (pre-session baseline) | **10.86 ms / 274×** | **~26% better** — today's cumulative win, not yet a named row above |
+| `sf_bench_flat` (stereo) | n/a (mono record was 4201 µs) | 5298 µs | consistent with stereo roughly doubling the mono flat number |
+| oracle (`gcc -O2` on `sf_bench.bpp`, stereo) | n/a (mono record was 2339 µs) | 3684 µs | consistent, same reasoning |
 | `bench_compose` | 4× (89.9→19.3 ms, 2026-06-17) | 3× (72.5→19.4 ms) | COMPOSE side flat; SERIAL side moved with machine load, not a code regression |
 | `bench_simd_raw` | ~3× | 3× | unchanged |
 | `bench_autovec_gate.sh` | PASS | PASS | — |
@@ -195,7 +195,7 @@ against the historical numbers above rather than reported in isolation:
 (`f61fac72…`) — unchanged across every commit of the day's session.
 
 **Takeaway:** the whole catalog holds at parity or better against its
-own history; `tl_bench` is the one row with a real, durable improvement
+own history; `sf_bench` is the one row with a real, durable improvement
 worth a permanent entry (added above). Machine noise (not code) explains
 every other delta in either direction — none of the moved numbers
 correspond to a commit that should have touched that benchmark's code
@@ -344,15 +344,15 @@ beats trusting a clean exit code:
    mangled slot B3 promoted in that function.
 
 Net effect on the real DSP chain (`moog_set`, `flt_onepole_g`,
-`flt_onepole_tick`, `_tl_apply_pan`, `tl_track_set`,
-`tl_track_set_volume`, `moon_set`, `lfo_*`, `vec2_*` — confirmed via a
+`flt_onepole_tick`, `_tl_apply_pan`, `sf_track_set`,
+`sf_track_set_volume`, `moon_set`, `lfo_*`, `vec2_*` — confirmed via a
 temporary instrumented build, then removed): the swap fires on every
 float-bearing leaf-ish function in the chain that doesn't itself
 inline another function; `moog_taps`/`moog_tick`/`moog_slope`/
-`tl_channel_process`/`rotary_tick`/`moon_process` (all of which inline
+`sf_channel_process`/`rotary_tick`/`moon_process` (all of which inline
 something internally) correctly fall back to B3 untouched. Audio
 export md5 still unchanged (`f61fac72be5077a6e9ef9cae21dde2a1`);
-tl_bench unaffected (~10.2-10.4ms, same band as before); full native
+sf_bench unaffected (~10.2-10.4ms, same band as before); full native
 (214/0/12) + C-emit (172/0/54) + all 5 regalloc gates green; real
 games (rts2, fps_wolf3d, bang9) and mini_synth all compile clean.
 Compile-time overhead unchanged from the int-only Stage E entry above
@@ -483,7 +483,7 @@ real external workload costs," not a codegen micro-gate.
 
 ## 2026-06-23 (final) — evaluation: what the whole day actually bought
 
-Re-ran `tl_bench` (stereo) and `bench_codegen` (all four kernels) one
+Re-ran `sf_bench` (stereo) and `bench_codegen` (all four kernels) one
 more time, min-of-5, on the now-fully-installed binary (inliner arc +
 RegAlloc v2 Stages A-E, int and float, all live) — to answer the
 question this row exists to answer: **after a full day of work, did
@@ -491,9 +491,9 @@ the needle move on the workload that actually matters (real, call-
 heavy, float32 audio), or only on synthetic kernels?**
 
 ```sh
-bpp tools/tiny_lofi/tl_bench.bpp -o /tmp/tlb && /tmp/tlb            # ours
-bpp tools/tiny_lofi/tl_bench_flat.bpp -o /tmp/tlbf && /tmp/tlbf      # hand-inlined ceiling
-bpp --c tools/tiny_lofi/tl_bench.bpp > /tmp/t.c && \
+bpp tools/sound_fusion/sf_bench.bpp -o /tmp/tlb && /tmp/tlb            # ours
+bpp tools/sound_fusion/sf_bench_flat.bpp -o /tmp/tlbf && /tmp/tlbf      # hand-inlined ceiling
+bpp --c tools/sound_fusion/sf_bench.bpp > /tmp/t.c && \
   cc -O2 -w -Wno-error=implicit-function-declaration /tmp/t.c -o /tmp/tlo -lobjc -lm && /tmp/tlo
 bpp examples/bench_codegen.bpp -o /tmp/bcg && /tmp/bcg
 bpp --c examples/bench_codegen.bpp > /tmp/b.c && \
@@ -502,27 +502,27 @@ bpp --c examples/bench_codegen.bpp > /tmp/b.c && \
 
 | benchmark | min-of-5 | vs gcc -O2 |
 |---|---|---|
-| `tl_bench` (ours, call-heavy) | 10.14 ms (296×) | **2.72×** |
-| `tl_bench_flat` (hand-inlined ceiling) | 5.20 ms (577×) | 1.39× |
-| `tl_bench` oracle (gcc -O2) | 3.73 ms (804×) | 1× |
+| `sf_bench` (ours, call-heavy) | 10.14 ms (296×) | **2.72×** |
+| `sf_bench_flat` (hand-inlined ceiling) | 5.20 ms (577×) | 1.39× |
+| `sf_bench` oracle (gcc -O2) | 3.73 ms (804×) | 1× |
 | `bench_codegen` biquad | 49.70 ms | 1.03× |
 | `bench_codegen` lcg | 20.81 ms | 1.01× |
 | `bench_codegen` xform | 6.93 ms | 1.13× |
 | `bench_codegen` manylive | 144.58 ms | 1.72× |
 
-**The real win: `tl_bench` 14.6 ms → 10.86 ms (inliner arc) → 10.14 ms
+**The real win: `sf_bench` 14.6 ms → 10.86 ms (inliner arc) → 10.14 ms
 (+ RegAlloc v2) = ~30.5% faster than this morning, ~6.7% of that from
 RegAlloc v2 alone.** That's the number that matters — it's measured on
 the assembled, call-heavy, float32 DAW render, not a microbenchmark.
 RegAlloc v2's float extension is what makes this honest: before it,
 "RegAlloc v2 helps the audio chain" was a hope, not a measurement —
-`tl_render`'s own parameters are float and integer Stage E alone
+`sf_render`'s own parameters are float and integer Stage E alone
 cannot touch them. The 6.7% is real but partial, for a reason already
 on record: the chain's hottest links (`moog_taps`, `moog_slope`,
-`tl_channel_process`, `moon_process`, `rotary_tick`) all inline
+`sf_channel_process`, `moon_process`, `rotary_tick`) all inline
 something internally and correctly fall back to B3 (the mangled-slot
 gate) — RegAlloc v2 today only reaches the chain's *leaves*
-(`flt_onepole_g`, `flt_onepole_tick`, `_tl_apply_pan`, `tl_track_set`,
+(`flt_onepole_g`, `flt_onepole_tick`, `_tl_apply_pan`, `sf_track_set`,
 `moon_set`, `lfo_*`), not the composed functions the inliner hasn't
 yet collapsed into them. The two arcs are not done competing for the
 same ground — the inliner arc's own remaining frontier (Inc 5 +
@@ -556,7 +556,7 @@ is identical to B3's own decision by construction.
 sites" arc closes; final re-measurement
 
 The evaluation just above was honest at the time, but its central
-caveat — `moog_taps`/`moog_slope`/`tl_channel_process`/`moon_process`/
+caveat — `moog_taps`/`moog_slope`/`sf_channel_process`/`moon_process`/
 `rotary_tick` "all inline something internally and correctly fall
 back to B3" — is now stale. A same-day follow-on arc taught Stage A's
 own analysis to recursively expand a growing set of real inlined-call
@@ -568,7 +568,7 @@ precise one ("only refuse if a mangled slot genuinely has no interval
 at all"). Confirmed via a temporary debug probe (reverted before
 shipping): `moog_taps`, `moog_tick`, and `moog_slope` — all three
 previously blocked outright — now receive the real swap.
-`tl_channel_process`/`rotary_tick`/`moon_process` still don't (each
+`sf_channel_process`/`rotary_tick`/`moon_process` still don't (each
 hides its nested call inside a trailing return EXPRESSION rather than
 a plain statement's RHS — a shape this arc doesn't recognize yet,
 separately scoped future work).
@@ -578,19 +578,19 @@ on the binary with this arc fully installed:
 
 | benchmark | min-of-5 | vs gcc -O2 |
 |---|---|---|
-| `tl_bench` (ours, call-heavy) | 9.98 ms (300×) | ~2.68× |
+| `sf_bench` (ours, call-heavy) | 9.98 ms (300×) | ~2.68× |
 | `bench_codegen` biquad | 47.43 ms | 0.96× (parity, within noise) |
 | `bench_codegen` lcg | 20.52 ms | 0.96× (parity, within noise) |
 | `bench_codegen` xform | 6.60 ms | 1.10× |
 | `bench_codegen` manylive | 136.23 ms | 1.57× |
 
-**`tl_bench`: 10.14 ms → 9.98 ms, a real but small ~1.6% on top of the
+**`sf_bench`: 10.14 ms → 9.98 ms, a real but small ~1.6% on top of the
 ~30.5% the day's earlier arcs had already banked.** Smaller than
 hoped given three previously-untouched functions in the hot chain
 now genuinely swap — the honest read is that `moog_taps`/`moog_tick`/
 `moog_slope` are each called once per channel per sample (not in a
 tight inner loop of their own), so even a real win inside them is a
-small fraction of `tl_render`'s total cost; the chain's actual
+small fraction of `sf_render`'s total cost; the chain's actual
 remaining bottleneck is elsewhere (most likely the surrounding loop
 structure and the three functions that still don't qualify, which
 collectively do more of the per-sample work). Reported honestly
@@ -614,7 +614,7 @@ previously couldn't see those variables at all) — but on THIS
 specific benchmark, the wall-clock payoff is modest because the
 newly-covered functions aren't where most of the per-sample time
 goes. The capability is real and durable; the next measurable win on
-`tl_bench` specifically needs either the remaining three uncovered
+`sf_bench` specifically needs either the remaining three uncovered
 functions or a different part of the chain entirely — not assumed,
 to be found by re-disassembling, per this whole project's standing
 discipline.

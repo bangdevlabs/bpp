@@ -14142,12 +14142,12 @@ something. Verified clean: `total_pushed=44100` (exact), `cb_count=44`
 (≈43Hz, confirming the buffer-size fix), `consumed≈42000`. Full suite
 197/0/12, `bench_compile.sh` unchanged.
 
-## 2026-06-18 — tiny_lofi is born, the inliner arc opens, and gets reverted twice before it sticks
+## 2026-06-18 — sound_fusion is born, the inliner arc opens, and gets reverted twice before it sticks
 
-The DAW's first slice: `tools/tiny_lofi` split into `tl_channel` (8 mixer
-channels, volume + filter insert + slope), `tl_timeline` (clips over time +
-the frame-outer mix/render), `tl_io` (WAV export), `tl_tools` (non-destructive
-edits — scissors today), and `tl_lib` (the aggregator). `stbfilter.bsm`
+The DAW's first slice: `tools/sound_fusion` split into `sf_channel` (8 mixer
+channels, volume + filter insert + slope), `sf_timeline` (clips over time +
+the frame-outer mix/render), `sf_io` (WAV export), `sf_tools` (non-destructive
+edits — scissors today), and `sf_lib` (the aggregator). `stbfilter.bsm`
 graduated the Moog ladder low-pass to a reusable cartridge, dogfooding
 multi-value return for real: `moog_taps` returns all four pole taps
 (-6/-12/-18/-24 dB/oct) in one call, banking straight into d0..d3 — no struct,
@@ -14157,7 +14157,7 @@ shouldn't. Almost immediately the filter math itself got pulled one layer
 deeper: `stbfilter.bsm` became the CARTRIDGE (the one-pole primitive both the
 Moog ladder and a future EQ shelf compose from) while `tools/moon_filter`
 became the PLUGIN — a named effect with its own `moon_new/set/process/reset/
-free` lifecycle wrapping the cartridge. `tiny_lofi` now hangs `moon_filter` on
+free` lifecycle wrapping the cartridge. `sound_fusion` now hangs `moon_filter` on
 every channel instead of calling the Moog directly, setting up the
 mini-Cubase direction: a channel hosts plugins, the engine underneath is
 `stbmixer`.
@@ -14170,12 +14170,12 @@ the GUI work.
 
 Then the project asked "can we measure the audio-codegen claim, or only
 assert it?" — and the honest answer reopened a frontier the earlier
-register-allocation work hadn't found: `tl_bench` (render the 3s project in a
+register-allocation work hadn't found: `sf_bench` (render the 3s project in a
 tight loop) measured 16.9ms against clang -O2's 2.3ms on the SAME source —
 7.3x, not the 1.02x "gcc -O2 parity" the biquad kernel had already proven.
-Disasm showed why: our `tl_render` makes 6 `bl` calls per sample (`arr_struct_at`,
+Disasm showed why: our `sf_render` makes 6 `bl` calls per sample (`arr_struct_at`,
 two `read_u16`/`write_u16`, the whole filter chain), clang's makes one, total.
-A hand-inlined sibling (`tl_bench_flat`, zero calls in the hot loop) decomposed
+A hand-inlined sibling (`sf_bench_flat`, zero calls in the hot loop) decomposed
 the 7.3x cleanly: ~x3.7 is the inliner gap (call overhead), ~x2.0 is flat-loop
 codegen quality on a branchy triple-nested loop — two separate frontiers,
 named in priority order in `benchmarks.md`.
@@ -14221,12 +14221,12 @@ callsite inside a loop) — inert on its own, no function marked tier-3 yet.
 **Increment 3b** wired the first real consumer: a guard-clause body
 (`if (C) { return A; } return B;`) normalizes in place to a ternary
 (`return C ? A : B;`), tagged hot-only, which makes `arr_struct_at` inline
-inside `tl_render`'s per-clip loop while staying a normal call at its ~80
-cold call sites elsewhere. First real measured win of the arc: tl_bench
+inside `sf_render`'s per-clip loop while staying a normal call at its ~80
+cold call sites elsewhere. First real measured win of the arc: sf_bench
 16.9 → 15.3ms (~10%), compiler binary +1.65% (contained to in-loop sites,
 not all-sites like the reverted attempt).
 
-## 2026-06-19 — `bpp --tags`, the float-leaf lever, and tiny_lofi goes stereo
+## 2026-06-19 — `bpp --tags`, the float-leaf lever, and sound_fusion goes stereo
 
 Opened a design plan for `bpp --tags` (compiler-emitted ctags/etags symbol
 index — pseudo-LSP), sparked by the realization that the load-bearing piece
@@ -14239,17 +14239,17 @@ architectural gap (the callsite-id scheme stamps an id on the caller's OWN
 call node; a nested inlinable call's id would belong to the wrong frame —
 unsafe until a flattening mechanism exists), and the filter chain is
 multi-gate-coupled (`flt_onepole_tick` is float, `moog_taps` is multi-return,
-`moog_slope` is a switch, `tl_channel_process` is float+if — each blocked by
+`moog_slope` is a switch, `sf_channel_process` is float+if — each blocked by
 a DIFFERENT gate, so relaxing T_CALL alone moves nothing). A throwaway
 env-gated probe confirmed it empirically: of the functions blocked purely by
-the T_CALL gate, every single one in `tl_bench` was cold — T_CALL relaxation
+the T_CALL gate, every single one in `sf_bench` was cold — T_CALL relaxation
 would have bought zero DAW win. The real lever, measured instead of assumed:
 **float-leaf inlining**. `flt_onepole_tick` (a matched-float leaf called 4x/
 sample by `moog_taps`) became inlinable with three spine edits (allow float
 return+params in `classify_inlineable`, force float-param functions to the
 binding tier so a float arg never takes the type-unsafe fast-substitute
 path, force-bind float params in the multi-statement splice) — `moog_taps`'s
-4 `bl` calls collapsed to 0, tl_bench 15.3 → 13.1ms (~14%, ~22% cumulative
+4 `bl` calls collapsed to 0, sf_bench 15.3 → 13.1ms (~14%, ~22% cumulative
 from session start).
 
 A dogfood audit asked a sharper question than "what's next": does the audio
@@ -14267,9 +14267,9 @@ banks; b++ can bank 5-8 float returns in registers where C++'s SysV/AAPCS64
 caps out at 2-4 — `moog_step(in, s1..s4) -> (out, s1'..s4')`, 5 floats, is
 exactly the Moog bass shape.
 
-Shipped same day: `tl_channel_process(tr, dry) -> (float, float)` (insert +
+Shipped same day: `sf_channel_process(tr, dry) -> (float, float)` (insert +
 fader, then constant-power pan into L/R — pan gains precomputed once at
-set-time, not per-sample), `tl_render` summing into a real stereo buffer
+set-time, not per-sample), `sf_render` summing into a real stereo buffer
 (killing the old fake-mono write), and `stbmixer`'s own S2 core — per-voice
 pan gains, dual-channel mix, the mono-collapse averaging gone for good (a
 stereo sample WAV now actually plays in stereo). Mono stayed first-class
@@ -14302,12 +14302,12 @@ holds flat ~68MB/25s, down from multiple GB.
 
 Graduated the Leslie rotary out of `stbmixer`'s single global instance into
 `stb/stbrotary.bsm` — the exact "2nd consumer" trigger the architecture plan
-had named in advance (tiny_lofi taking it as a channel insert). `stbmixer`'s
+had named in advance (sound_fusion taking it as a channel insert). `stbmixer`'s
 public API stayed byte-for-byte unchanged (now wraps one `Rotary` instance
-instead of four bare globals). `tl_channel`'s `Track` gained a second,
+instead of four bare globals). `sf_channel`'s `Track` gained a second,
 NAMED insert slot (Moog pre-pan, then Rotary post-pan — a fixed two-slot
 chain, not a speculative N-deep polymorphic one, since there are exactly two
-concrete plugin kinds today). Then **WAV import** (slice 6a): `tl_import_wav`
+concrete plugin kinds today). Then **WAV import** (slice 6a): `sf_import_wav`
 down-mixes stbsound's always-stereo decode to the engine's existing mono
 convention, verified against adversarial synthetic WAVs (opposite-sign L/R
 downmixes to exactly 0; equal L/R downmixes losslessly). The demo project now
@@ -14328,18 +14328,18 @@ own import graph, so this needed a full bootstrap cycle, not just a tool
 rebuild.
 
 Then the user actually pressed Play and got ear-hurting noise. Root cause: a
-THIRD hand-rolled `audio_push_frames` caller (`tl_gui_run`) the original
-float-migration grep sweep had never matched, because `tiny_lofi` didn't
-exist yet when that sweep ran — `tl_render` was still writing s16 bytes into
+THIRD hand-rolled `audio_push_frames` caller (`sf_gui_run`) the original
+float-migration grep sweep had never matched, because `sound_fusion` didn't
+exist yet when that sweep ran — `sf_render` was still writing s16 bytes into
 a buffer the device wire had read as float32 since 2026-06-21's migration.
 Same "horrible modem noise" mechanism as that day's other two instances.
-Fixed by making `tl_render` itself float32-native and moving the s16-on-disk
-conversion into a dedicated `tl_export` pass — verified with a sample-by-
+Fixed by making `sf_render` itself float32-native and moving the s16-on-disk
+conversion into a dedicated `sf_export` pass — verified with a sample-by-
 sample diff (264,600 samples, max difference 1 LSB, pure float32 rounding)
 proving the export path was mathematically equivalent the whole time. The
-SAME bug shape bit `tl_bench` next (its own buffer allocation still used the
-old s16 stride, segfaulting once `tl_render`'s real stride changed under it)
-— fixed, then `tl_bench_flat` was found to have silently drifted out of sync
+SAME bug shape bit `sf_bench` next (its own buffer allocation still used the
+old s16 stride, segfaulting once `sf_render`'s real stride changed under it)
+— fixed, then `sf_bench_flat` was found to have silently drifted out of sync
 with the real engine across two whole feature commits (never updated for
 stereo, never engaged the rotary it was supposed to be modeling) — resynced,
 re-decomposed the gap: x3.0 inliner + x1.55 flat-loop codegen, the inliner
@@ -14369,7 +14369,7 @@ ever set it again. A separate cost-model bug (struct-field addressing
 over-counted as 3 instructions instead of the 1 it actually folds to on both
 chips) got `moog_taps` under the inlining cap, and a scoped multi-return-only
 cap closed the last gap: **moog_taps fully inlines, zero `bl` into
-`flt_onepole_tick`, confirmed via disasm** — and tl_bench showed NO
+`flt_onepole_tick`, confirmed via disasm** — and sf_bench showed NO
 measurable movement at all. That null result was itself the answer the
 plan's own decision rule was waiting for: two increments in a row eliminating
 real, confirmed call overhead with zero measured effect means the
@@ -14379,18 +14379,18 @@ assumption.
 
 ## 2026-06-23 — closing the inliner arc, then RegAlloc v2 from zero to Stage E in one day
 
-Re-disassembling `tl_bench`'s hot loop (the Increment 6 closing instruction)
+Re-disassembling `sf_bench`'s hot loop (the Increment 6 closing instruction)
 found the actual remaining cost wasn't calls at all: struct-field load
 addressing was going through the generic expression path (a separate mov+add
 to compute base+offset, THEN a load from offset 0) when ARM64's `LDR`/x86_64's
 ModRM+disp already take that offset directly in one instruction. A run of
 five tightly-scoped perf commits closed this and its siblings in sequence,
-each measured independently: folding the offset into the load (tl_bench
+each measured independently: folding the offset into the load (sf_bench
 15.4→14.14ms), addressing through an already-promoted base with no copy at
 all (→13.79ms — and a real ordering bug caught here, where setting the new
 "const-offset" globals BEFORE recursing into a nested struct-field base let
 the nested call's own cleanup clobber them; `test_modulab_character` caught
-the live value corruption), extending the same fold to stores (no tl_bench
+the live value corruption), extending the same fold to stores (no sf_bench
 movement — this benchmark is load-dominated, but a correct general
 completion, not a speculative one), extending float compute-in-place to
 struct-field leaves (→13.08ms — the float CIP gate had a T_VAR leaf case but
@@ -14401,7 +14401,7 @@ single biggest lever of the whole investigation: `cg_float_tree_need` had no
 `T_LIT` case either, so ANY expression with a float literal operand
 (`r.cur + 0.0001`, the canonical DSP increment/threshold shape) bailed out of
 compute-in-place — fixing it dropped `rotary_tick`'s fmov count from 35 to 5
-(86%) and tl_bench from 13.05 to 12.07ms, the single biggest commit of the
+(86%) and sf_bench from 13.05 to 12.07ms, the single biggest commit of the
 whole four-part investigation. Float branch fusion (fcmp+b.cc instead of
 fcmp+cset+cbz) shipped next, real and disasm-confirmed, with an HONEST null
 result on wall-clock — a cset/cbz pair off the critical dependency path
@@ -14416,7 +14416,7 @@ normalizer, and a second fix let a nested call buried inside a TRAILING
 RETURN's own expression (`moon_process`'s entire body is `pp=p; return
 moog_slope(...)`) get discovered and spliced — together collapsing
 `moon_process → moog_slope → moog_taps → flt_onepole_tick` to zero `bl`,
-confirmed via disasm, for a modest, honestly-reported ~1.2% tl_bench win (same
+confirmed via disasm, for a modest, honestly-reported ~1.2% sf_bench win (same
 lesson again: bl elimination doesn't proportionally move wall-clock once the
 call itself was cheap).
 
@@ -14565,7 +14565,7 @@ every poll (`isKeyWindow`) instead of trusting only the event stream.
 ## 2026-06-24 — closing the inlined-call-sites arc on the real DSP chain, then a leaf-detection bug from the switch case nobody walked
 
 Three real DSP-chain functions still fell back to B3 after the previous day's
-Phase 4: `moon_process`, `tl_channel_process`, `rotary_tick` — each blocked by
+Phase 4: `moon_process`, `sf_channel_process`, `rotary_tick` — each blocked by
 a genuinely different control-flow shape. Phase 6a opened the day with pure
 mechanical groundwork, zero behavior change: the hand-rolled mini-walker
 driving the whole expansion mechanism was replaced with a direct call into
@@ -14578,7 +14578,7 @@ intermediate assignment. One real gap fixed along the way: the return-arity
 validator rejected ANY call in a return expression outright, with no
 exception for "the call IS the whole expression" — needed once expansion
 itself is recursing into a callee that also ends in a direct return-of-a-
-call. Phase 6c closed `tl_channel_process`'s gap — two nested expandable
+call. Phase 6c closed `sf_channel_process`'s gap — two nested expandable
 calls each guarded by a plain `if` with no else and no return inside (a
 conditional UPDATE, not an early return) — needed ZERO new emission logic at
 all, since the existing T_IF case already builds real blocks for both arms;
@@ -14615,7 +14615,7 @@ permanent dump trigger (`__rg_swap_<name>`) was added alongside the existing
 per-stage debug hooks specifically because none of them showed Stage E's
 FINAL gate outcome on their own — confirmed all four real DSP-chain targets
 read clean afterward: `moog_taps`, `moon_process`, and `rotary_tick` get the
-full int+float swap; `tl_channel_process` gets the int swap, with float
+full int+float swap; `sf_channel_process` gets the int swap, with float
 correctly still deferred by one last, separately-scoped gate — live-range
 splitting.
 
@@ -14631,7 +14631,7 @@ own assignment output for genuine inconsistency, rather than the mechanism
 that makes splitting safe in the first place.
 
 Turning that fix on against the one remaining real target it was built for
-(`tl_channel_process`) hung the compiler's gen2→gen3 bootstrap step solid —
+(`sf_channel_process`) hung the compiler's gen2→gen3 bootstrap step solid —
 not slow, genuinely stuck, confirmed by letting it run over five real minutes
 of CPU time with no progress. Tracing it down (`bug --disasm`, `lldb`,
 several disposable worktrees isolating which exact piece of the day's change
@@ -14683,7 +14683,7 @@ Full verification closed the day: a new regression fixture
 coincidental — without it, the fixture's own split variable lands on two
 different slots across its sub-intervals; with it, both halves agree, every
 time. `gen1→gen2→gen3` bootstrap converges byte-identical, native suite
-214/0/12, C-emit suite 172/0/54, all 5 regalloc gates green, `tiny_lofi
+214/0/12, C-emit suite 172/0/54, all 5 regalloc gates green, `sound_fusion
 --render`'s audio export matches the documented md5
 (`f61fac72be5077a6e9ef9cae21dde2a1`) exactly. The "RegAlloc v2 sees through
 inlined call sites" arc that opened the day before is now closed: every real

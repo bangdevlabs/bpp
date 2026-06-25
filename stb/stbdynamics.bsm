@@ -1,0 +1,234 @@
+// stbdynamics.bsm — a compressor/limiter in the spirit of the EMI TG12345's
+// channel dynamics section (Abbey Road, installed 1968 — Beatles' Abbey Road,
+// Pink Floyd's Dark Side of the Moon). Tier-1: no imports, names no genre.
+//
+// The original circuit (per the EMI TG12345 Mk.II factory Handbook, plus
+// the historical record of which classic valve units it was built to
+// emulate) had exactly two controls: a mode switch and a 6-position release
+// switch. Attack was FIXED at ~8ms ("found to be the optimum value" — not
+// user-adjustable). The two modes:
+//   COMPRESS — 2:1 ratio, emulating the Altec/EMI RS124's classic curve.
+//   LIMIT    — 8:1 ratio, emulating the Fairchild 660's more aggressive
+//              curve (some revisions used 7:1 — the historical record
+//              disagrees by one step; 8:1 is the more commonly cited value
+//              and is what this cartridge uses).
+// The gain-reduction element was four matched Zener diodes whose impedance
+// is approximately a LOGARITHMIC function of control current — a soft-knee,
+// musical curve, not a hard-threshold VCA. This cartridge keeps that same
+// "few controls, each definitive" shape: mode + release, nothing else
+// switchable, fixed attack — and now runs the gain math in the dB domain a
+// real circuit (and every textbook compressor model) actually reasons in,
+// using the real `log_f`/`exp_f`/`amp_to_db_f`/`db_to_amp_f` added to
+// bpp_math.bsm for exactly this purpose (the first concrete need for real
+// transcendental math anywhere in the engine).
+//
+// Gain-reduction formula: the standard feedforward soft-knee compressor
+// (Reiss & McPherson, "Audio Effects: Theory, Implementation and
+// Application" — the same formula nearly every software compressor
+// implements). Quadratic interpolation inside a fixed-width knee around
+// the threshold, linear beyond it:
+//
+//   over = level_db - threshold_db
+//   if      (2*over <= -knee_db):  gr_db = 0
+//   elif (2*|over| <= knee_db):    gr_db = (1/ratio - 1) * (over + knee_db/2)^2 / (2*knee_db)
+//   else:                          gr_db = (1/ratio - 1) * over
+//
+// `gr_db` is always <= 0 (a reduction); `db_to_amp_f(gr_db)` turns it into
+// the linear multiplier applied to the sample.
+//
+// Canonical use:
+//   auto c: Compressor;
+//   c = comp_new(44100.0);
+//   comp_set_mode(c, COMP_LIMIT);
+//   comp_set_release(c, COMP_REL_500);
+//   ... per sample ...
+//   auto wet: float;
+//   wet = comp_process(c, dry);
+//   comp_free(c);
+
+const COMP_COMPRESS = 0;   // 2:1 ratio — gentle, the RS124-style mode
+const COMP_LIMIT     = 1;   // 8:1 ratio — the Fairchild-660-style mode
+
+const COMP_REL_100  = 0;
+const COMP_REL_250  = 1;
+const COMP_REL_500  = 2;
+const COMP_REL_1000 = 3;
+const COMP_REL_2000 = 4;
+const COMP_REL_5000 = 5;
+
+// Fixed attack time constant, milliseconds — "found to be the optimum
+// value" per the original handbook. Not exposed as a setter on purpose.
+const _COMP_ATTACK_MS = 8.0;
+
+// Fixed knee width in dB. Not exposed as a setter — a generous, soft knee
+// is the whole point of modeling the Zener diodes' logarithmic response
+// rather than a hard-threshold VCA.
+const _COMP_KNEE_DB = 6.0;
+
+// One compressor instance. `env` is the smoothed, rectified input level
+// (linear amplitude — the envelope follower's running state, the only
+// thing that carries across samples). `attack_g`/`release_g` are one-pole
+// coefficients precomputed from milliseconds + sample rate (via exp_f), so
+// the hot path (`comp_process`) does zero exponentials per sample for the
+// envelope follower itself — only the gain-reduction curve below calls
+// amp_to_db_f/db_to_amp_f per sample, same as a real dB-domain compressor.
+struct Compressor {
+    sr: float,
+    env: float,
+    attack_g: float,
+    release_g: float,
+    mode,
+    release_idx,
+    ratio: float,
+    threshold_db: float
+}
+
+// Init hook for symmetry with the other cartridges (stbrotary, stbfilter).
+// Nothing global to set up.
+init_dynamics() { return 0; }
+
+// One-pole coefficient from a time constant in milliseconds: the standard
+// `g = 1 - exp(-1 / (tau_seconds * sample_rate))` exponential-smoother
+// derivation, using the real exp_f added to bpp_math for this purpose.
+static _comp_coeff_from_ms(ms: float, sample_rate: float) -> float {
+    auto tau_s: float;
+    tau_s = ms / 1000.0;
+    return 1.0 - exp_f(0.0 - 1.0 / (tau_s * sample_rate));
+}
+
+// Map a release step (COMP_REL_*) to its time constant in milliseconds —
+// the original handbook's own six values: 100, 250, 500, 1000, 2000, 5000.
+// Out-of-range steps clamp to the nearest end, same convention as
+// rotary_set_mode's out-of-range handling.
+static _comp_release_ms(step) -> float {
+    switch (step) {
+        COMP_REL_100  { return 100.0; }
+        COMP_REL_250  { return 250.0; }
+        COMP_REL_500  { return 500.0; }
+        COMP_REL_1000 { return 1000.0; }
+        COMP_REL_2000 { return 2000.0; }
+        else          { return 5000.0; }
+    }
+}
+
+// Allocate a compressor bound to `sample_rate`. Starts in COMPRESS mode,
+// release step 500ms (a centrist default), threshold at -6dBFS (the
+// dB-domain equivalent of the old linear default, 0.5 amplitude). The
+// caller owns the returned pointer and frees it with comp_free.
+comp_new(sample_rate: float) -> ptr {
+    auto c: Compressor;
+    c = malloc(sizeof(Compressor));
+    c.sr           = sample_rate;
+    c.env          = 0.0;
+    c.attack_g     = _comp_coeff_from_ms(_COMP_ATTACK_MS, sample_rate);
+    c.mode         = COMP_COMPRESS;
+    c.ratio        = 2.0;
+    c.threshold_db = 0.0 - 6.0;
+    c.release_idx  = COMP_REL_500;
+    c.release_g    = _comp_coeff_from_ms(_comp_release_ms(COMP_REL_500), sample_rate);
+    return c;
+}
+
+// Set the mode: COMP_COMPRESS (2:1) or COMP_LIMIT (8:1). Out-of-range
+// modes are ignored, matching rotary_set_mode's convention.
+void comp_set_mode(compressor: Compressor, mode) {
+    auto c: Compressor;
+    c = compressor;
+    if (mode != COMP_COMPRESS && mode != COMP_LIMIT) { return; }
+    c.mode = mode;
+    if (mode == COMP_LIMIT) { c.ratio = 8.0; }
+    else                    { c.ratio = 2.0; }
+}
+
+// Set the release step (COMP_REL_100 .. COMP_REL_5000). Recomputes the
+// one-pole release coefficient once, here — never per sample.
+void comp_set_release(compressor: Compressor, step) {
+    auto c: Compressor;
+    c = compressor;
+    if (step < COMP_REL_100)  { step = COMP_REL_100; }
+    if (step > COMP_REL_5000) { step = COMP_REL_5000; }
+    c.release_idx = step;
+    c.release_g   = _comp_coeff_from_ms(_comp_release_ms(step), c.sr);
+}
+
+// Set the threshold in dB — how hard a signal must drive the channel
+// before the compressor engages. Not part of the original's two-switch
+// control surface, but the practical equivalent of the analog workflow's
+// "drive into the compressor" gain-staging, expressed the way a real
+// engineer thinks about it (dB, not a raw linear fraction).
+void comp_set_threshold_db(compressor: Compressor, threshold_db: float) {
+    auto c: Compressor;
+    c = compressor;
+    c.threshold_db = threshold_db;
+}
+
+comp_get_mode(compressor: Compressor) {
+    auto c: Compressor;
+    c = compressor;
+    return c.mode;
+}
+
+comp_get_release(compressor: Compressor) {
+    auto c: Compressor;
+    c = compressor;
+    return c.release_idx;
+}
+
+comp_get_threshold_db(compressor: Compressor) -> float {
+    auto c: Compressor;
+    c = compressor;
+    return c.threshold_db;
+}
+
+// Process one sample and return the compressed/limited output — the
+// per-sample tick the channel strip (via the zener_comp plugin) calls
+// every frame.
+//
+// Shape: rectify -> asymmetric one-pole envelope follower (fast attack,
+// slow release, linear domain — smoothing happens before the dB
+// conversion, the same order a real feedforward compressor's detector
+// uses) -> convert the smoothed level to dB -> the textbook soft-knee
+// gain-reduction curve (see this file's header comment for the formula)
+// -> convert the reduction back to a linear multiplier -> apply.
+comp_process(compressor: Compressor, in: float) -> float {
+    auto c: Compressor, lvl: float, g: float;
+    auto (level_db, over, gr_db, gain): float;
+    c = compressor;
+    lvl = abs_f(in);
+
+    if (lvl > c.env) { g = c.attack_g; } else { g = c.release_g; }
+    c.env = c.env + g * (lvl - c.env);
+
+    level_db = amp_to_db_f(c.env);
+    over = level_db - c.threshold_db;
+
+    if (2.0 * over <= 0.0 - _COMP_KNEE_DB) {
+        return in;     // below the knee — untouched, the common case
+    }
+
+    if (2.0 * abs_f(over) <= _COMP_KNEE_DB) {
+        auto knee_term: float;
+        knee_term = over + _COMP_KNEE_DB * 0.5;
+        gr_db = (1.0 / c.ratio - 1.0) * knee_term * knee_term / (2.0 * _COMP_KNEE_DB);
+    } else {
+        gr_db = (1.0 / c.ratio - 1.0) * over;
+    }
+
+    gain = db_to_amp_f(gr_db);
+    return in * gain;
+}
+
+// Reset the envelope follower's state — used when a render pass must not
+// carry gain-reduction memory across runs, the same discipline
+// sf_channel_reset_filters applies to the Moog insert and rotary_reset
+// applies to the Leslie's LFO phase.
+void comp_reset(compressor: Compressor) {
+    auto c: Compressor;
+    c = compressor;
+    c.env = 0.0;
+}
+
+// Free a compressor allocated by comp_new.
+void comp_free(compressor) {
+    free(compressor);
+}

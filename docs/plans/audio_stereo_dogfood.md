@@ -11,7 +11,7 @@ giving that feature a real product consumer while making the DAW genuinely stere
 
 ## Part A — The audit (measured 2026-06-19)
 
-Feature usage across `tools/tiny_lofi`, `tools/mini_synth`, `tools/moon_filter`,
+Feature usage across `tools/sound_fusion`, `tools/mini_synth`, `tools/moon_filter`,
 `stb/stbfilter`, `stb/stbmixer`, `stb/stbsound`, `stb/stbaudio`:
 
 | b++ feature | hits | note |
@@ -31,7 +31,7 @@ Feature usage across `tools/tiny_lofi`, `tools/mini_synth`, `tools/moon_filter`,
   killer use case (stereo `(L,R)` in registers) was never built; the feature is
   *orphaned*, not wrong.
 - **`@safe` absent from realtime paths** → the one place the project sells `@safe`
-  (no malloc/IO in the audio callback) isn't using it. (`tiny_lofi` is offline-
+  (no malloc/IO in the audio callback) isn't using it. (`sound_fusion` is offline-
   render so it's exempt, but `stbmixer`'s fill path + `mini_synth`'s realtime loop
   are exactly the contract.)
 - **scalar mix loop** → the autovectoriser (a whole shipped arc) has no audio
@@ -185,18 +185,18 @@ stbmixer   per-voice pan → mixer_fill writes a real stereo sum (today: L==R mo
    ↑
 stbfilter  (mono filters stay mono; a stereo insert processes L,R — two states)
    ↑
-tl_channel tl_channel_process(tr, dryL, dryR) -> (float, float)   // (L,R)
+sf_channel sf_channel_process(tr, dryL, dryR) -> (float, float)   // (L,R)
    ↑
-tl_timeline tl_render sums (L,R) per channel into the stereo out_buf
+sf_timeline sf_render sums (L,R) per channel into the stereo out_buf
 ```
 
-- **`tl_channel_process(tr, dry_l, dry_r) -> (float, float)`** — the headline
+- **`sf_channel_process(tr, dry_l, dry_r) -> (float, float)`** — the headline
   multi-return consumer. Applies the insert + per-channel `vol` and `pan` (constant-
   power pan: `l = in * cos(θ)`, `r = in * sin(θ)`, θ from pan ∈ [-1,1]). Returns
   `(L, R)`.
-- **`tl_render`** — accumulate `(mL, mR)` per frame across channels; write distinct
+- **`sf_render`** — accumulate `(mL, mR)` per frame across channels; write distinct
   L/R to `out_buf` (kills the `// R (mono)` line).
-- **`Track`** gains a `pan: float` field; the mixer strip (`tl_gui`) gets a pan knob.
+- **`Track`** gains a `pan: float` field; the mixer strip (`sf_gui`) gets a pan knob.
 - **`stbmixer`** — add per-voice pan so `mixer_fill` produces a genuine stereo sum
   (today line 562: "Left and right carry the same mono sum"); `mini_synth` then
   plays in stereo for free.
@@ -214,8 +214,8 @@ a flag — never a parallel mono codepath.** A `Track` carries `stereo: bit`:
 - **stereo track** (`stereo = 1`): the insert runs **twice** (independent L/R state)
   → `(L_wet, R_wet)`, then per-channel gain/pan.
 
-Both return the **same `(float, float)`** from the same `tl_channel_process`; the flag
-only gates *how many filter passes* run inside. So `tl_render`, the `Track` struct,
+Both return the **same `(float, float)`** from the same `sf_channel_process`; the flag
+only gates *how many filter passes* run inside. So `sf_render`, the `Track` struct,
 the multi-return ABI path, and the mixer sum are **identical** for mono and stereo —
 the flag is the only difference. (A mono *bus/submix* that should stay mono until the
 master is the same idea one level up: a `stereo: bit` on the bus.) This keeps the
@@ -223,16 +223,16 @@ multi-return consumer real for both, and lets a Moog-bass mono channel be the ch
 common case without a second codepath to maintain.
 
 ### Phasing (each shippable + dogfoodable; the audio md5 baseline MOVES — re-baseline)
-- **S1 — model: `tl_channel_process -> (float, float)` + pan, `tl_render` stereo
+- **S1 — model: `sf_channel_process -> (float, float)` + pan, `sf_render` stereo
   sum. ✅ SHIPPED 2026-06-19.** `Track` gained `pan`/`stereo`/precomputed
   `gain_l`/`gain_r` (constant-power gains computed once in `_tl_apply_pan`, NOT
-  per frame — pan is constant). `tl_channel_process` is the **first real product
-  multi-return consumer** (`return l, r` → `d0/d1`; `tl_render` does `chl, chr =
-  tl_channel_process(...)` and sums each side). The mono path is the gated common
+  per frame — pan is constant). `sf_channel_process` is the **first real product
+  multi-return consumer** (`return l, r` → `d0/d1`; `sf_render` does `chl, chr =
+  sf_channel_process(...)` and sums each side). The mono path is the gated common
   case (one filter pass + pan); the stereo-source two-pass path is reserved for
   S2 (no stereo source yet). Verified: compiles, **new stereo baseline md5
   `3e258737c9f0ef83193793b63eb7eed8`** (bass centre → L==R, lead pan 0.5 → R>L,
-  both confirmed), tl_bench ~14.6 ms (~205× realtime). (`mini_synth` is still mono
+  both confirmed), sf_bench ~14.6 ms (~205× realtime). (`mini_synth` is still mono
   — it rides `stbmixer`, which goes stereo in S2.)
 - **S2 — `stbmixer` per-voice pan + stereo `mixer_fill`. ✅ CORE SHIPPED 2026-06-19.**
   Per-voice pan gains (`_mx_voice_pan_l/r`, fixed-point /1024, **unity-centre =
@@ -244,8 +244,8 @@ common case without a second codepath to maintain.
   now run on L and R independently. So a **stereo sample WAV now plays in stereo**
   (it used to be averaged to mono) and tone voices are pannable. Verified:
   `test_mixer_sample` + `test_mixer_stream` pass (centre byte-identical); pan probe
-  confirms centre → L==R (6400/6400), hard-right → L=0 / R live. `tiny_lofi`'s
-  render is **unaffected** (it uses stbfilter/`tl_render`, not stbmixer — md5
+  confirms centre → L==R (6400/6400), hard-right → L=0 / R live. `sound_fusion`'s
+  render is **unaffected** (it uses stbfilter/`sf_render`, not stbmixer — md5
   stays `3e258737…`).
 
   **S2b (pending) — the consumer wiring:**
@@ -253,15 +253,15 @@ common case without a second codepath to maintain.
     there): pan-by-key (keyboard tracking — can be disorienting), a master/pan
     control, or stay centre. Interactive, so it needs an ear-check, not a headless
     md5. *Decide the UX before wiring.*
-  - `tl_gui` pan knobs (GUI — needs the window to verify).
-  - the stereo-source two-pass branch in `tl_channel_process` — deferred until a
+  - `sf_gui` pan knobs (GUI — needs the window to verify).
+  - the stereo-source two-pass branch in `sf_channel_process` — deferred until a
     stereo *source* (stereo clip import) exists; no consumer yet.
 - **S3 — `@safe` on the realtime mix path** (mixer fill / mini_synth loop) — dogfood
   backlog #2; proves no-alloc on the realtime path.
 - **S4 — (optional perf) autovec / block-planar mix**, or the `: double` lane-pair
   stereo spike — only if a real workload needs it (measure first).
 - **THEN** the inliner arc's Inc 5 (multi-value-return splice) finally has a *real,
-  hot, product* multi-return target (`tl_channel_process`) to inline + measure —
+  hot, product* multi-return target (`sf_channel_process`) to inline + measure —
   instead of the orphaned `moog_taps`.
 
 ---
@@ -271,13 +271,13 @@ common case without a second codepath to maintain.
 The inliner's remaining lever (multi-return inlining + the nested-inline
 architecture) was about to optimise `moog_taps` — a feature with one contrived
 consumer. Building stereo first means: (a) multi-return earns its keep with a real
-consumer, (b) `tl_bench` becomes a representative stereo workload, (c) Inc 5 then
+consumer, (b) `sf_bench` becomes a representative stereo workload, (c) Inc 5 then
 optimises code the product actually runs. Dogfood, then optimise — not optimise an
 orphan.
 
 ## Cross-references
 - `docs/manual/stb++_lib.md` Cap 29–31 (audio stack), Cap 39/ autovec notes.
 - `docs/plans/inliner_arc.md` — Inc 5 (multi-return splice) waits on a real consumer.
-- `docs/plans/tiny_lofi.md` — the DAW build order (stereo slots into the mixer slice).
+- `docs/plans/sound_fusion.md` — the DAW build order (stereo slots into the mixer slice).
 - Rule 35 (games/tools as infra stress test), Rule 20/28 (a feature earns its keep
   via a real consumer), Rule 39 (explicit vs implicit SIMD — the block-planar path).
