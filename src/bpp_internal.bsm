@@ -18,7 +18,11 @@ static auto tmp_arr, list_stack, list_sp, list_depth, last_list_cnt;
 // every pass that walks the AST (type inference, dispatch analysis,
 // call graph build, validation). The arena is never reset during
 // compilation — nodes persist through all passes until the process exits.
-// 2MB covers the compiler's own self-host (~14K nodes × 64 bytes = ~900KB).
+// The arena is shared between Node structs (~64 bytes each) and the
+// child-pointer lists `list_end` builds. 16MB covers the compiler's own
+// self-host with comfortable headroom (raised from 8MB on 2026-06-30 once
+// the inliner + RegAlloc-v2 growth pushed the self-compile past 8MB and the
+// malloc-fallback warning started firing on every build).
 static auto _ast_arena;
 
 // ── Initialization ─────────────────────────────────────────
@@ -30,7 +34,7 @@ void init_internal() {
     list_sp = 0;
     list_depth = 0;
     last_list_cnt = 0;
-    _ast_arena = arena_new(8388608);
+    _ast_arena = arena_new(16777216);
     _ast_overflow_warned = 0;
 }
 
@@ -307,7 +311,7 @@ make_node(type) {
     nd = arena_alloc(_ast_arena, sizeof(Node));
     if (nd == 0) {
         // Arena full — fall back to malloc. This shouldn't happen with
-        // a properly sized arena (8MB covers ~130K nodes). If it does,
+        // a properly sized arena (16MB covers ~260K nodes). If it does,
         // increase the arena size in init_internal.
         if (_ast_overflow_warned == 0) {
             diag_str("warning: AST arena full, falling back to malloc");
