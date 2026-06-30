@@ -512,6 +512,58 @@ _stb_screen_capture(out_w, out_h) {
     return buf;
 }
 
+// The main screen's backing scale factor (2.0 on a Retina display,
+// 1.0 otherwise). A captured screen image is in backing PIXELS while
+// the cursor query below reports POINTS, so this is the conversion
+// factor between them. Returns a double via the float_ret() builtin
+// that reads d0 after the objc_msgSend, the same way the GPU-timing
+// reads work.
+static _stb_backing_scale() -> float {
+    auto scr;
+    auto s: float;
+    scr = objc_msgSend(objc_getClass("NSScreen"), sel_registerName("mainScreen"));
+    if (scr == 0) { return 1.0; }
+    objc_msgSend(scr, sel_registerName("backingScaleFactor"));
+    s = float_ret();
+    if (s < 1.0) { s = 1.0; }
+    return s;
+}
+
+// Report the mouse cursor's position in the SAME pixel coordinate
+// space _stb_screen_capture returns (top-left origin, backing pixels),
+// so a caller can index a captured screen buffer directly at the
+// cursor. CoreGraphics CGEventGetLocation gives the cursor in the
+// global display coordinate space — already top-left origin (no Y
+// flip needed, unlike Cocoa's bottom-left mouseLocation) but measured
+// in POINTS, so scale by the backing factor to land on backing pixels.
+//
+// If a picked pixel ever lands off-target, this point-to-pixel
+// conversion (or the float_ret read of the CGPoint) is the first
+// suspect.
+void _stb_global_cursor(out_x, out_y) {
+    auto cg, cf, fn_evcreate, fn_evloc, fn_cfrel, ev;
+    auto px: float, py: float, scale: float;
+    auto ix: word, iy: word;
+
+    cg = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", 1);
+    cf = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", 1);
+    fn_evcreate = dlsym(cg, "CGEventCreate");
+    fn_evloc    = dlsym(cg, "CGEventGetLocation");
+    fn_cfrel    = dlsym(cf, "CFRelease");
+
+    ev = call(fn_evcreate, 0);
+    call(fn_evloc, ev);          // CGPoint returned in d0 (x), d1 (y)
+    px = float_ret();
+    py = float_ret2();
+    call(fn_cfrel, ev);          // CGEventRef is CF-retained — release it
+
+    scale = _stb_backing_scale();
+    ix = px * scale;
+    iy = py * scale;
+    *(out_x) = ix;
+    *(out_y) = iy;
+}
+
 // Sleep for the remaining time in the current frame budget.
 void _stb_frame_wait() {
     auto elapsed_ms, remaining_us;
