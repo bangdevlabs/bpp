@@ -1,0 +1,119 @@
+// test_stbreverb.bpp — pin the stbreverb spring topology by its DEFINING
+// behaviours. A reverb's full impulse response is not hand-computable, so
+// instead of exact per-sample values this checks the properties a correct
+// spring MUST have (and a broken feedback loop would violate): true bypass,
+// silence in -> silence out, a bounded decaying tail, unconditional stability,
+// a clean reset, and independent instances.
+//
+// Covers:
+//   1. mix=0 is a true bypass — output == input, exactly.
+//   2. Silence in (after reset) -> silence out.
+//   3. An impulse produces a tail that (a) carries real energy, (b) never
+//      blows up or goes NaN, and (c) decays over time.
+//   4. Sustained loud input stays bounded (the feedback loop is stable).
+//   5. spring_reset clears the tail.
+//   6. Two instances keep independent state.
+
+import "stbreverb.bsm";
+
+fabs_f(x: float) -> float {
+    if (x < 0.0) { return 0.0 - x; }
+    return x;
+}
+
+main() {
+    auto s, s2, i;
+    auto (o, early_peak, late_peak, gmax, av) : float;
+
+    s = spring_new(44100.0);
+
+    // ── (1) mix=0 is a true bypass ────────────────────────────────────
+    spring_set(s, 0.84, 0.2, 0.0);
+    o = spring_process(s, 0.7);
+    if (o != 0.7) {
+        putmsg("FAIL: mix=0 must pass the dry signal through unchanged");
+        return 1;
+    }
+
+    // ── (2) silence in -> silence out (after clearing the bypass tail) ─
+    spring_reset(s);
+    for (i = 0; i < 100; i++) {
+        o = spring_process(s, 0.0);
+        if (o != 0.0) {
+            putmsg("FAIL: silence in must give silence out after reset");
+            return 2;
+        }
+    }
+
+    // ── (3) an impulse produces a bounded, decaying, real tail ────────
+    // Wet-only (mix=1) so we measure the reverb itself. Compare the peak of
+    // an early window against a late window; a correct tail decays.
+    spring_set(s, 0.84, 0.2, 1.0);
+    spring_reset(s);
+    early_peak = 0.0;
+    late_peak  = 0.0;
+    gmax       = 0.0;
+    for (i = 0; i < 40000; i++) {
+        if (i == 0) { o = spring_process(s, 1.0); } else { o = spring_process(s, 0.0); }
+        // NaN never equals itself — this catches a blown-up loop going NaN.
+        if (o != o) {
+            putmsg("FAIL: reverb output went NaN (unstable feedback)");
+            return 3;
+        }
+        av = fabs_f(o);
+        if (av > gmax) { gmax = av; }
+        if (i < 4000)                { if (av > early_peak) { early_peak = av; } }
+        if (i >= 30000 && i < 34000) { if (av > late_peak)  { late_peak  = av; } }
+    }
+    if (early_peak < 0.00001) {
+        putmsg("FAIL: an impulse should excite a non-silent reverb tail");
+        return 4;
+    }
+    if (gmax > 4.0) {
+        putmsg("FAIL: reverb tail is not bounded (blew up on an impulse)");
+        return 5;
+    }
+    if (late_peak >= early_peak * 0.5) {
+        putmsg("FAIL: reverb tail should decay (late window not quieter than early)");
+        return 6;
+    }
+
+    // ── (4) sustained loud input stays bounded (loop is stable) ───────
+    spring_reset(s);
+    gmax = 0.0;
+    for (i = 0; i < 44100; i++) {
+        o = spring_process(s, 1.0);
+        if (o != o) { putmsg("FAIL: sustained input drove the reverb to NaN"); return 7; }
+        av = fabs_f(o);
+        if (av > gmax) { gmax = av; }
+    }
+    if (gmax > 4.0) {
+        putmsg("FAIL: sustained input must not make the reverb run away");
+        return 8;
+    }
+
+    // ── (5) spring_reset clears the tail ──────────────────────────────
+    // After a loud burst, reset, then feed silence: the tail must be gone.
+    for (i = 0; i < 2000; i++) { o = spring_process(s, 0.9); }
+    spring_reset(s);
+    for (i = 0; i < 100; i++) {
+        o = spring_process(s, 0.0);
+        if (o != 0.0) { putmsg("FAIL: spring_reset must clear the tail"); return 9; }
+    }
+    spring_free(s);
+
+    // ── (6) two instances keep independent state ──────────────────────
+    s  = spring_new(44100.0); spring_set(s,  0.84, 0.2, 1.0);
+    s2 = spring_new(44100.0); spring_set(s2, 0.84, 0.2, 1.0);
+    for (i = 0; i < 500; i++) { o = spring_process(s, 0.9); }   // excite s only
+    o = spring_process(s2, 0.0);                                // s2 still silent
+    if (o != 0.0) {
+        putmsg("FAIL: spring instances must not share state");
+        return 10;
+    }
+    spring_free(s);
+    spring_free(s2);
+
+    putmsg("PASS: stbreverb spring is a stable, decaying, bypass-clean reverb");
+    return 0;
+}

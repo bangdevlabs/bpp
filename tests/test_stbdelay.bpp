@@ -1,0 +1,135 @@
+// test_stbdelay.bpp — pin the stbdelay atoms (DelayLine, Comb, Allpass) to
+// hand-computed impulse responses. Every expected value below was derived on
+// paper from the difference equations in stbdelay.bsm's header, then checked
+// against the running program — not read back from whatever the first run
+// printed. All coefficients are 0.5 and all delays are tiny + coprime, so
+// every expected sample is an exact power of two (no rounding to hide a bug).
+//
+// Covers:
+//   1. DelayLine is a pure M-sample delay (out[n] = in[n-size]).
+//   2. delay_reset clears the line back to silence.
+//   3. Comb (fb=0.5, no damping) emits a decaying echo train M apart:
+//      1.0 at n=M, 0.5 at n=2M, 0.25 at n=3M.
+//   4. comb_reset clears the tail.
+//   5. Allpass (fb=0.5) impulse response: -0.5, then 0.75, 0.375, 0.1875
+//      at n = 0, M, 2M, 3M.
+//   6. The allpass is a TRUE allpass — sum of squared outputs == 1.0
+//      (energy preserving; this is the property that makes it "diffusion,
+//      not colouration").
+//   7. Two instances keep independent state.
+
+import "stbdelay.bsm";
+
+// Absolute value of a float (b++ math has no fabs builtin exposed here).
+fabs_f(x: float) -> float {
+    if (x < 0.0) { return 0.0 - x; }
+    return x;
+}
+
+main() {
+    auto d, c, a, a1, a2, i;
+    auto (o, o0, o1, o2, o3, o4, o5, o6, energy): float;
+
+    // ── (1) DelayLine: a size-4 line is a 4-sample delay ──────────────
+    d = delay_new(4);
+    o0 = delay_tick(d, 1.0);   // n=0 → 0 (line still filling)
+    o1 = delay_tick(d, 2.0);   // n=1 → 0
+    o2 = delay_tick(d, 3.0);   // n=2 → 0
+    o3 = delay_tick(d, 4.0);   // n=3 → 0
+    o4 = delay_tick(d, 5.0);   // n=4 → in[0] = 1.0
+    o5 = delay_tick(d, 6.0);   // n=5 → in[1] = 2.0
+    if (o0 != 0.0 || o1 != 0.0 || o2 != 0.0 || o3 != 0.0) {
+        putmsg("FAIL: DelayLine should read silence while still filling");
+        return 1;
+    }
+    if (fabs_f(o4 - 1.0) > 0.000001 || fabs_f(o5 - 2.0) > 0.000001) {
+        putmsg("FAIL: DelayLine did not return the sample from `size` steps ago");
+        return 2;
+    }
+
+    // ── (2) delay_reset rewinds to silence ────────────────────────────
+    delay_reset(d);
+    o = delay_tick(d, 7.0);
+    if (o != 0.0) {
+        putmsg("FAIL: delay_reset should clear the line back to silence");
+        return 3;
+    }
+    delay_free(d);
+
+    // ── (3) Comb: fb=0.5, size=3 → echoes 1.0, 0.5, 0.25 at n=3,6,9 ──
+    c = comb_new(3);
+    comb_set(c, 0.5, 0.0);           // feedback 0.5, no damping
+    o = comb_tick(c, 1.0);           // n=0 (impulse in), out 0
+    o = comb_tick(c, 0.0);           // n=1
+    o = comb_tick(c, 0.0);           // n=2
+    o3 = comb_tick(c, 0.0);          // n=3 → 1.0
+    o = comb_tick(c, 0.0);           // n=4
+    o = comb_tick(c, 0.0);           // n=5
+    o6 = comb_tick(c, 0.0);          // n=6 → 0.5
+    if (fabs_f(o3 - 1.0) > 0.000001 || fabs_f(o6 - 0.5) > 0.000001) {
+        putmsg("FAIL: Comb echo train wrong (expected 1.0 at n=M, 0.5 at n=2M)");
+        return 4;
+    }
+
+    // ── (4) comb_reset clears the tail ────────────────────────────────
+    comb_reset(c);
+    o = comb_tick(c, 1.0);           // fresh impulse
+    o = comb_tick(c, 0.0);
+    o = comb_tick(c, 0.0);
+    o3 = comb_tick(c, 0.0);          // n=3 → 1.0 again if the tail was cleared
+    if (fabs_f(o3 - 1.0) > 0.000001) {
+        putmsg("FAIL: comb_reset should clear the tail so a fresh impulse repeats");
+        return 5;
+    }
+    comb_free(c);
+
+    // ── (5) Allpass: fb=0.5, size=3 → -0.5, 0.75, 0.375 at n=0,3,6 ───
+    a = allpass_new(3);
+    allpass_set(a, 0.5);
+    o0 = allpass_tick(a, 1.0);       // n=0 → -0.5
+    o = allpass_tick(a, 0.0);        // n=1
+    o = allpass_tick(a, 0.0);        // n=2
+    o3 = allpass_tick(a, 0.0);       // n=3 → 0.75
+    o = allpass_tick(a, 0.0);        // n=4
+    o = allpass_tick(a, 0.0);        // n=5
+    o6 = allpass_tick(a, 0.0);       // n=6 → 0.375
+    if (fabs_f(o0 - (0.0 - 0.5)) > 0.000001) {
+        putmsg("FAIL: Allpass n=0 output should be -feedback (-0.5)");
+        return 6;
+    }
+    if (fabs_f(o3 - 0.75) > 0.000001 || fabs_f(o6 - 0.375) > 0.000001) {
+        putmsg("FAIL: Allpass echo train wrong (expected 0.75 at n=M, 0.375 at n=2M)");
+        return 7;
+    }
+
+    // ── (6) The allpass is energy-preserving: sum(out^2) == 1.0 ───────
+    // The defining property of a TRUE allpass. 60 samples covers ~20 echoes
+    // of the size-3 line — the geometric tail past that is far below eps.
+    allpass_reset(a);
+    o = allpass_tick(a, 1.0);
+    energy = o * o;
+    for (i = 1; i < 60; i++) {
+        o = allpass_tick(a, 0.0);
+        energy = energy + o * o;
+    }
+    if (fabs_f(energy - 1.0) > 0.0001) {
+        putmsg("FAIL: allpass impulse energy should be 1.0 (not a real allpass)");
+        return 8;
+    }
+    allpass_free(a);
+
+    // ── (7) Two instances keep independent state ──────────────────────
+    a1 = allpass_new(3); allpass_set(a1, 0.5);
+    a2 = allpass_new(3); allpass_set(a2, 0.5);
+    o = allpass_tick(a1, 1.0);       // disturb a1 only
+    o = allpass_tick(a2, 0.0);       // a2 is untouched → still silent
+    if (o != 0.0) {
+        putmsg("FAIL: allpass instances must not share delay state");
+        return 9;
+    }
+    allpass_free(a1);
+    allpass_free(a2);
+
+    putmsg("PASS: stbdelay atoms (DelayLine, Comb, Allpass) match hand-derived values");
+    return 0;
+}

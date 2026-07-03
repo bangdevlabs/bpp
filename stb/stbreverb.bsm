@@ -1,0 +1,152 @@
+// stbreverb.bsm — algorithmic reverb, built from the stbdelay atoms.
+//
+// A reverb is a NETWORK of delays. This cartridge owns the network topologies;
+// the raw delay/comb/allpass elements live one layer down in stbdelay so that
+// every reverb here — and any future echo/chorus — shares one implementation of
+// the circular-buffer bookkeeping. The named products (a Morricone-style spring
+// plugin, etc.) live one layer UP in tools/, wrapping a topology here.
+//
+//   TOPOLOGIES:
+//     spring_*   a dispersive feedback reverb — an allpass diffuser chain
+//                inside a damped feedback loop. The cascaded allpasses give
+//                the frequency-dependent delay ("chirp"/"drip") that is the
+//                signature of a real spring tank, which is exactly the wet,
+//                splashy guitar reverb of a spaghetti-western score.
+//
+// Plate/hall (a parallel comb bank + allpass diffusion, Schroeder/Freeverb
+// style) is the planned SECOND topology and lands here as `plate_*`, reusing
+// the same stbdelay comb/allpass atoms — which is why the reverb network layer
+// is its own cartridge from the start rather than folded into the plugin.
+//
+// Everything runs in float (64-bit). Tier-2: imports stbdelay only.
+//
+// Canonical use (one spring insert):
+//   auto s: Spring;
+//   s = spring_new(44100.0);
+//   spring_set(s, 0.84, 0.2, 0.3);     // decay, damping, dry/wet mix
+//   ... per sample ...
+//   auto y: float;
+//   y = spring_process(s, x);          // returns the dry/wet-mixed output
+//   spring_reset(s);                   // clear the tail between renders
+//   spring_free(s);
+
+import "stbdelay.bsm";
+
+// ── Spring — dispersive feedback reverb ────────────────────────────
+//
+// Signal flow, one sample:
+//   back = the tail coming back around the loop (loop-delay output)
+//   damp the tail with a one-pole lowpass (rooms lose treble first)
+//   inject: x = input + damped_tail * decay
+//   diffuse: x through four allpasses in series (short, spread delays)
+//   push x into the loop delay; the wet signal IS the diffused x
+//   out = dry/wet mix
+//
+// The four allpasses supply the dispersion; the loop delay + `decay` supply
+// the sustain; `damp` shapes the tone of the decay. The wet output is scaled
+// by (1 - decay) so the tail's LENGTH (set by decay) is decoupled from its
+// LEVEL — lengthening the reverb does not make it louder or clip, the way a
+// bare single-loop reverb would build up to 1/(1-decay) on sustained input.
+
+struct Spring {
+    ap0, ap1, ap2, ap3,   // the diffuser chain (Allpass pointers)
+    loop,                 // the feedback loop delay (DelayLine pointer)
+    fbstore: float,       // one-pole damping memory in the feedback path
+    damp: float,          // damping coefficient (0 = bright, 1 = dark)
+    decay: float,         // loop feedback / tail length (0..<1)
+    mix: float            // dry/wet (0 = dry only, 1 = wet only)
+}
+
+// Init hook for symmetry with the other cartridges. Nothing global to set up.
+init_stbreverb() { return 0; }
+
+// Convert a delay time in milliseconds to a whole sample count for the given
+// rate, clamped to at least 1 sample. Explicitly narrows the float to a word
+// (b++ refuses a silent float->int store — the `: word` local is the cast).
+_spring_len_ms(ms: float, sr: float) {
+    auto n: word;
+    n = ms / 1000.0 * sr;
+    if (n < 1) { n = 1; }
+    return n;
+}
+
+// Allocate a spring reverb bound to `sample_rate`. The four diffuser delays are
+// short and spread (5/7/10/13 ms) so their echoes interleave into a smooth
+// wash instead of a flutter; the loop is longer (35 ms). Defaults to a medium
+// tail. The caller owns the pointer and frees it with spring_free.
+spring_new(sample_rate: float) {
+    auto s: Spring;
+    s = malloc(sizeof(Spring));
+    s.ap0 = allpass_new(_spring_len_ms(5.0,  sample_rate));
+    s.ap1 = allpass_new(_spring_len_ms(7.0,  sample_rate));
+    s.ap2 = allpass_new(_spring_len_ms(10.0, sample_rate));
+    s.ap3 = allpass_new(_spring_len_ms(13.0, sample_rate));
+    allpass_set(s.ap0, 0.5);
+    allpass_set(s.ap1, 0.5);
+    allpass_set(s.ap2, 0.5);
+    allpass_set(s.ap3, 0.5);
+    s.loop    = delay_new(_spring_len_ms(35.0, sample_rate));
+    s.fbstore = 0.0;
+    s.damp    = 0.2;
+    s.decay   = 0.84;
+    s.mix     = 0.3;
+    return s;
+}
+
+// Set the tail length (`decay`, 0..<1 — keep below 1 or the tail never dies),
+// the damping (`damping`, 0 = bright, 1 = dark) and the dry/wet `mix` (0..1).
+void spring_set(spring, decay: float, damping: float, mix: float) {
+    auto s: Spring;
+    s = spring;
+    s.decay = decay;
+    s.damp  = damping;
+    s.mix   = mix;
+}
+
+// Process one sample and return the dry/wet-mixed output. At mix=0 this returns
+// the input unchanged (a true bypass), so a channel that never engages the
+// reverb pays only the loop bookkeeping.
+spring_process(spring, in: float) -> float {
+    auto s: Spring;
+    auto (back, x, wet): float;
+    s = spring;
+    back = delay_peek(s.loop);
+    // Damp the returning tail (one-pole lowpass): treble decays faster.
+    s.fbstore = back * (1.0 - s.damp) + s.fbstore * s.damp;
+    // Inject input + the decayed, damped feedback, then diffuse it.
+    x = in + s.fbstore * s.decay;
+    x = allpass_tick(s.ap0, x);
+    x = allpass_tick(s.ap1, x);
+    x = allpass_tick(s.ap2, x);
+    x = allpass_tick(s.ap3, x);
+    delay_push(s.loop, x);
+    // Normalise the wet level by (1 - decay) so length and loudness decouple.
+    wet = x * (1.0 - s.decay);
+    return in * (1.0 - s.mix) + wet * s.mix;
+}
+
+// Clear the entire tail — every diffuser and the loop delay — back to silence.
+// Use between render passes so a spring does not carry a wash across runs (the
+// same discipline moog_reset / rotary_reset follow for their state).
+void spring_reset(spring) {
+    auto s: Spring;
+    s = spring;
+    allpass_reset(s.ap0);
+    allpass_reset(s.ap1);
+    allpass_reset(s.ap2);
+    allpass_reset(s.ap3);
+    delay_reset(s.loop);
+    s.fbstore = 0.0;
+}
+
+// Free a spring allocated by spring_new (every element and the struct).
+void spring_free(spring) {
+    auto s: Spring;
+    s = spring;
+    allpass_free(s.ap0);
+    allpass_free(s.ap1);
+    allpass_free(s.ap2);
+    allpass_free(s.ap3);
+    delay_free(s.loop);
+    free(spring);
+}

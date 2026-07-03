@@ -1,23 +1,25 @@
 // sf_channel.bsm — the mixer channels.
 //
 // sound_fusion has SF_NTRACKS channels. Each channel is a volume fader plus a
-// fixed THREE-slot insert chain: a moon_filter (the Moog ladder), then a
-// zener_comp (the TG12345-style channel compressor), then a rotary (Leslie)
-// — docs/plans/sound_fusion.md slice 5a/5b/8. Three concrete plugin kinds,
-// in a fixed natural channel-strip order (shape the tone, tame the dynamics,
-// then spin the stereo field — the same order a real console drives filter
-// -> compressor -> modulation), so this stays named slots rather than a
-// generic N-deep polymorphic chain. The original two-slot comment here said
-// "a third insert kind is the trigger to generalize" — the trigger fired,
-// and the answer is still a concrete named slot, not a dynamic chain: we
-// know exactly what the compressor is, where it sits, and that nothing else
-// is queued behind it. Rule 20's bar is about HOW MANY CONSUMERS justify
-// promoting something to a shared, reusable place (the compressor's DSP
-// itself graduated INTO stb/stbdynamics.bsm, wrapped as the standalone
-// tools/zener_comp/ plugin, the same two-layer shape moon_filter/stbfilter
-// already established) — it does not mandate a generic dispatch mechanism
-// for a fixed, known, three-deep signal chain. Revisit if a FOURTH kind
-// shows up with no natural fixed position relative to the other three.
+// fixed FOUR-slot insert chain: a moon_filter (the Moog ladder), then a
+// zener_comp (the TG12345-style channel compressor), then a morricone_spring
+// (the spring reverb), then a rotary (Leslie) — docs/plans/sound_fusion.md
+// slice 5a/5b/8/9. Four concrete plugin kinds, in a fixed natural channel-strip
+// order (shape the tone, tame the dynamics, add the room, then spin the stereo
+// field — the same order a real console drives filter -> compressor -> reverb
+// -> modulation), so this stays named slots rather than a generic N-deep
+// polymorphic chain. The original two-slot comment here said "a third insert
+// kind is the trigger to generalize" — the trigger fired, and the answer is
+// still a concrete named slot, not a dynamic chain. Rule 20's bar is about HOW
+// MANY CONSUMERS justify promoting something to a shared, reusable place (each
+// insert's DSP graduated INTO an stb cartridge — stbfilter / stbdynamics /
+// stbreverb — wrapped as a standalone tools/ plugin, the same two-layer shape)
+// — it does not mandate a generic dispatch mechanism for a fixed, known signal
+// chain. The FOURTH kind (the spring reverb) has since arrived and kept the
+// named-slot model exactly: it has a natural fixed position (a mono insert
+// after the compressor, before the pan — a spring tank is a mono device, so
+// stereo width belongs to a later plate/hall, not here). Revisit only if a
+// kind shows up with no natural fixed position.
 // This module owns the channel array; the timeline and the tools reach a
 // channel only through the functions here.
 
@@ -44,7 +46,7 @@
 // nearly silent on a typical signal). `muted`/`solo` are the mixer's per-channel
 // flags, read by sf_render's mix loop: a muted channel is skipped, and when ANY
 // channel is soloed only soloed channels play.
-struct Track { vol: float, flt_on, flt, pan: float, stereo, gain_l: float, gain_r: float, rot_on, rot, comp_on, comp, cutoff: float, reso: float, slope, comp_mode, comp_rel, rot_mode, comp_thr: float, muted, solo }
+struct Track { vol: float, flt_on, flt, pan: float, stereo, gain_l: float, gain_r: float, rot_on, rot, comp_on, comp, cutoff: float, reso: float, slope, comp_mode, comp_rel, rot_mode, comp_thr: float, muted, solo, spring_on, spring, spring_decay: float, spring_damp: float, spring_mix: float }
 
 static auto _sf_tracks;     // malloc(SF_NTRACKS * sizeof(Track))
 
@@ -60,8 +62,8 @@ static void _sf_apply_pan(tk: Track, pan: float) {
 }
 
 // Allocate the channels and give each a sensible default: 80% volume, all
-// three insert slots off, and a fresh moon_filter + compressor + rotary
-// instance each. Call once at engine init.
+// four insert slots off, and a fresh moon_filter + compressor + spring +
+// rotary instance each. Call once at engine init.
 void sf_channel_init() {
     auto tr, tk: Track;
     _sf_tracks = malloc(SF_NTRACKS * sizeof(Track));
@@ -74,6 +76,8 @@ void sf_channel_init() {
         tk.comp    = zener_new(44100.0);
         tk.rot_on = 0;
         tk.rot    = rotary_new(44100.0);
+        tk.spring_on = 0;
+        tk.spring    = morricone_new(44100.0);
         tk.stereo = 0;     // mono source (panned into the stereo field)
         // Cached insert parameters with musical defaults, applied the first
         // time the user engages each insert from the GUI. These never touch
@@ -93,6 +97,11 @@ void sf_channel_init() {
         // (~-6 dBFS here) produces audible gain reduction immediately, rather
         // than the near-silent default the stbdynamics -6 dB threshold gives.
         tk.comp_thr  = 0.0 - 18.0;
+        // Spring reverb (Morricone) defaults: a medium tail, lightly damped,
+        // a subtle send — inert until spring_on is set from the GUI.
+        tk.spring_decay = 0.84;
+        tk.spring_damp  = 0.2;
+        tk.spring_mix   = 0.3;
         tk.muted     = 0;
         tk.solo      = 0;
         _sf_apply_pan(tk, 0.0);   // centre
@@ -212,6 +221,22 @@ void sf_track_set_rotary(tr, rot_on, mode) {
     if (rot_on != 0) { rotary_set_mode(tk.rot, mode); }
 }
 
+// Configure one channel's spring-reverb insert. `decay` is the tail length
+// (0..<1), `damping` the tone of the tail (0 = bright, 1 = dark), `mix` the
+// dry/wet blend (0..1). Applied to the live plugin only while engaged, the same
+// on-flag guard the other inserts use. A focused setter so each of the GUI's
+// three drag-bars can re-supply the group (reading the other two back) without
+// disturbing the other inserts — the same shape sf_track_set_filter follows.
+void sf_track_set_spring(tr, spring_on, decay: float, damping: float, mix: float) {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    tk.spring_on    = spring_on;
+    tk.spring_decay = decay;
+    tk.spring_damp  = damping;
+    tk.spring_mix   = mix;
+    if (spring_on != 0) { morricone_set(tk.spring, decay, damping, mix); }
+}
+
 // Clear every channel's insert state. The render calls this before a pass so
 // neither insert carries memory across renders.
 void sf_channel_reset_filters() {
@@ -220,6 +245,7 @@ void sf_channel_reset_filters() {
         tk = _sf_tracks + tr * sizeof(Track);
         moon_reset(tk.flt);
         zener_reset(tk.comp);
+        morricone_reset(tk.spring);
         rotary_reset(tk.rot);
     }
 }
@@ -301,6 +327,26 @@ sf_channel_pan(tr) -> float {
     tk = _sf_tracks + tr * sizeof(Track);
     return tk.pan;
 }
+sf_channel_spring_on(tr) {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    return tk.spring_on;
+}
+sf_channel_spring_decay(tr) -> float {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    return tk.spring_decay;
+}
+sf_channel_spring_damp(tr) -> float {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    return tk.spring_damp;
+}
+sf_channel_spring_mix(tr) -> float {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    return tk.spring_mix;
+}
 
 // 1 if ANY channel is soloed — the render asks this once per pass to decide
 // whether solo gating is in effect (when nothing is soloed, every unmuted
@@ -320,10 +366,11 @@ sf_any_solo() {
 // memory (a C++ `std::pair`/out-param would cost more).
 //
 // Mono source (tk.stereo == 0 — the common case, e.g. a Moog bass): the Moog
-// insert runs ONCE, then the compressor (when engaged) tames the dynamics
-// BEFORE the fader — gain-staging order: shape the tone, control the level,
-// then trim with the fader, the same order the TG12345's own channel strip
-// used. The wet, post-fader sample is placed into the field by a
+// insert runs ONCE, then the compressor (when engaged) tames the dynamics, then
+// the spring reverb (when engaged) adds the room — all three in the MONO stage,
+// BEFORE the fader — gain-staging order: shape the tone, control the level, add
+// the space, then trim with the fader, the same order the TG12345's own channel
+// strip used. The wet, post-fader sample is placed into the field by a
 // constant-power pan (equal power left+right, -3 dB at centre). The
 // rotary — when engaged — runs AFTER pan, on the now-stereo (L, R) pair, the
 // same position it occupies in stbmixer's master stage (a rotary modulates a
@@ -338,6 +385,10 @@ sf_channel_process(tr, dry: float) -> (float, float) {
     wet = dry;
     if (tk.flt_on != 0) { wet = moon_process(tk.flt, wet); }
     if (tk.comp_on != 0) { wet = zener_process(tk.comp, wet); }
+    // Spring reverb sits in the MONO stage (before the pan): a real spring tank
+    // is a mono device, so the wet is panned into the field together with the
+    // dry, like an amp in a fixed position. Stereo width is a later plate/hall's job.
+    if (tk.spring_on != 0) { wet = morricone_process(tk.spring, wet); }
     wet *= tk.vol;
     // Constant-power pan via the precomputed per-track gains (no trig in the
     // hot loop — see _sf_apply_pan).

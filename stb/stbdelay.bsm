@@ -1,0 +1,234 @@
+// stbdelay.bsm — delay-line primitives: the shared time-domain building
+// blocks every reverb (and, later, every echo/chorus) effect is built from.
+//
+// A reverb is not one algorithm — it is a NETWORK of tiny delay elements.
+// This cartridge ships the three atoms that network is wired from, so that
+// stbreverb (spring today, plate/hall next) and any future delay effect
+// compose them instead of re-deriving circular-buffer bookkeeping each time:
+//
+//   DelayLine   a circular buffer of past samples — a pure M-sample delay.
+//               peek the delayed sample, push a new one; the write head
+//               wraps on its own. The raw atom the two below are built on.
+//   Comb        a feedback comb filter (delay + scaled feedback + optional
+//               damping). Feeding it an impulse produces an exponentially
+//               decaying train of echoes M samples apart — the "tail" a
+//               plate/hall reverb is mostly made of.
+//   Allpass     a Schroeder allpass — a delay that passes ALL frequencies at
+//               equal magnitude but disperses their phase. This is the
+//               diffusion atom: it smears a signal in time without colouring
+//               it, which is exactly the "chirp/drip" a spring reverb wants.
+//
+// Everything runs in float (b++ `float` is a 64-bit double); samples are
+// stored in a raw malloc'd ring via peekfloat/pokefloat (8 bytes each).
+// Tier-1: depends on nothing, names no genre — the leaf of the audio graph.
+//
+// Canonical use (one allpass diffuser):
+//   auto a: Allpass;
+//   a = allpass_new(347);          // 347-sample delay (coprime lengths diffuse best)
+//   allpass_set(a, 0.5);           // feedback coefficient
+//   ... per sample ...
+//   auto y: float;
+//   y = allpass_tick(a, x);
+//   allpass_reset(a);              // clear the delay memory between renders
+//   allpass_free(a);
+
+// Pure leaf: no imports.
+
+// ── DelayLine — the raw circular buffer ────────────────────────────
+//
+// `buf` points at `size` consecutive 64-bit float slots; `idx` is the write
+// head. delay_peek reads the sample about to be overwritten (the one written
+// `size` steps ago), delay_push writes a fresh sample there and advances the
+// head one slot, wrapping at the end. A pure M-sample delay is therefore
+// "peek, then push the new input".
+
+struct DelayLine { buf, size, idx }
+
+// Init hook for symmetry with the other cartridges. Nothing global to set up.
+init_stbdelay() { return 0; }
+
+// Allocate a delay line holding `size` samples, all zero. The caller owns the
+// returned pointer and frees it with delay_free. `size` is the delay length
+// in samples (it is also the buffer length — a delay line's memory IS its
+// length).
+delay_new(size) {
+    auto d: DelayLine;
+    d = malloc(sizeof(DelayLine));
+    d.buf  = malloc(size * 8);   // `size` 64-bit float slots
+    d.size = size;
+    d.idx  = 0;
+    delay_reset(d);              // zero the buffer so a fresh line reads silence
+    return d;
+}
+
+// Clear the delay memory back to silence and rewind the write head. Use
+// between render passes so a line does not carry a tail across runs (the same
+// discipline moog_reset / rotary_reset already follow for their state).
+void delay_reset(line) {
+    auto d: DelayLine, i;
+    d = line;
+    for (i = 0; i < d.size; i++) {
+        pokefloat(d.buf + i * 8, 0.0);
+    }
+    d.idx = 0;
+}
+
+// Read the delayed sample at the write head WITHOUT advancing — the value
+// written `size` steps ago (0.0 until the line has filled). A feedback element
+// needs this value before it can decide what to write back, so peek and push
+// are separate calls rather than one combined tick.
+delay_peek(line) -> float {
+    auto d: DelayLine;
+    d = line;
+    return peekfloat(d.buf + d.idx * 8);
+}
+
+// Write one sample at the write head and advance it one slot, wrapping at the
+// end of the buffer. Pair with delay_peek to build a feedback element.
+void delay_push(line, v: float) {
+    auto d: DelayLine, i;
+    d = line;
+    i = d.idx;
+    pokefloat(d.buf + i * 8, v);
+    i++;
+    if (i >= d.size) { i = 0; }
+    d.idx = i;
+}
+
+// Convenience: push `x` and return the sample that fell off the end — a pure
+// `size`-sample delay in one call (out[n] = x[n - size], 0 while filling).
+delay_tick(line, x: float) -> float {
+    auto out: float;
+    out = delay_peek(line);
+    delay_push(line, x);
+    return out;
+}
+
+// Free a delay line allocated by delay_new (both the ring buffer and the
+// struct).
+void delay_free(line) {
+    auto d: DelayLine;
+    d = line;
+    free(d.buf);
+    free(line);
+}
+
+// ── Comb — feedback comb filter with damping ───────────────────────
+//
+// y[n] = x[n-M] + feedback * (damped y[n-M]). An impulse comes back as an
+// exponentially decaying echo train, one echo every M samples, scaled by
+// `feedback` each pass. The optional one-pole `damp` in the feedback path rolls
+// off the highs a little more on every pass — real rooms lose treble faster
+// than bass, so damping is what makes a comb tail sound like air, not metal.
+// `store` is the one-pole's memory.
+
+struct Comb { line, fb: float, damp: float, store: float }
+
+// Allocate a comb with an M-sample delay. Feedback and damping default to 0
+// (a single echo, no tail) until comb_set is called.
+comb_new(size) {
+    auto c: Comb;
+    c = malloc(sizeof(Comb));
+    c.line  = delay_new(size);
+    c.fb    = 0.0;
+    c.damp  = 0.0;
+    c.store = 0.0;
+    return c;
+}
+
+// Set the feedback amount (0..<1 — keep it below 1 or the tail never decays)
+// and the damping (0 = bright, 1 = fully rolled off / dead).
+void comb_set(comb, feedback: float, damping: float) {
+    auto c: Comb;
+    c = comb;
+    c.fb   = feedback;
+    c.damp = damping;
+}
+
+// Push one sample through the comb and return the delayed, fed-back output.
+comb_tick(comb, x: float) -> float {
+    auto c: Comb, out: float;
+    c = comb;
+    out = delay_peek(c.line);
+    // One-pole lowpass in the feedback path (the "damping"): store follows out.
+    c.store = out * (1.0 - c.damp) + c.store * c.damp;
+    delay_push(c.line, x + c.store * c.fb);
+    return out;
+}
+
+// Clear the comb's delay memory and its damping state between renders.
+void comb_reset(comb) {
+    auto c: Comb;
+    c = comb;
+    delay_reset(c.line);
+    c.store = 0.0;
+}
+
+// Free a comb allocated by comb_new.
+void comb_free(comb) {
+    auto c: Comb;
+    c = comb;
+    delay_free(c.line);
+    free(comb);
+}
+
+// ── Allpass — Schroeder allpass (the diffusion atom) ───────────────
+//
+// The true Schroeder allpass: magnitude is flat at every frequency (it neither
+// boosts nor cuts any tone), it only reshuffles phase — so it smears a signal
+// out in time without colouring it. Chaining a few with coprime, short delays
+// is how a reverb turns a hard echo into a smooth, dense wash. Realised with a
+// single delay line holding the filter's internal signal w:
+//
+//   w[n] = x[n] + feedback * w[n-M]
+//   y[n] = w[n-M] - feedback * w[n]
+//
+// Its defining property is energy preservation: feed it an impulse and the sum
+// of the squared outputs is exactly 1 (test_stbdelay checks this — it is what
+// proves the atom is a real allpass and not merely some filter).
+
+struct Allpass { line, fb: float }
+
+// Allocate an allpass with an M-sample delay. Feedback defaults to 0 (a plain
+// M-sample delay negated at the tap) until allpass_set is called; 0.5 is the
+// classic Schroeder diffusion value.
+allpass_new(size) {
+    auto a: Allpass;
+    a = malloc(sizeof(Allpass));
+    a.line = delay_new(size);
+    a.fb   = 0.0;
+    return a;
+}
+
+// Set the allpass feedback coefficient (0.5 is the classic diffusion value;
+// higher = denser but ringier).
+void allpass_set(allpass, feedback: float) {
+    auto a: Allpass;
+    a = allpass;
+    a.fb = feedback;
+}
+
+// Push one sample through the allpass and return the diffused output.
+allpass_tick(allpass, x: float) -> float {
+    auto a: Allpass, wm: float, w: float;
+    a = allpass;
+    wm = delay_peek(a.line);     // w[n-M], the delayed internal signal
+    w  = x + a.fb * wm;          // w[n]
+    delay_push(a.line, w);
+    return wm - a.fb * w;        // y[n] = w[n-M] - feedback * w[n]
+}
+
+// Clear the allpass's delay memory between renders.
+void allpass_reset(allpass) {
+    auto a: Allpass;
+    a = allpass;
+    delay_reset(a.line);
+}
+
+// Free an allpass allocated by allpass_new.
+void allpass_free(allpass) {
+    auto a: Allpass;
+    a = allpass;
+    delay_free(a.line);
+    free(allpass);
+}
