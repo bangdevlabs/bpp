@@ -1,5 +1,7 @@
 # Sidequest: extend `put` to accept N args via smart-dispatch concat
 
+**Status: CLOSED / SHIPPED** (`236d9ff`, variadic put/put_err via parser-level smart-dispatch concat; doctrine recorded as Tonify Rule 45). Moved to legacy 2026-07-03.
+
 > **Goal**: `put("count: ", n, " of ", total, "\n");` works.
 > Each arg is independent, goes through smart-dispatch in order.
 > No format string. No placeholders. No new function names. The

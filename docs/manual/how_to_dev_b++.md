@@ -267,7 +267,7 @@ if (x > 0) {
 } else if (x == 0) {
     y = 1;
 } else {
-    y = 0 - x;   // no unary minus; use 0 - x
+    y = -x;      // unary minus works on variables and literals alike
 }
 
 // Single-statement body may omit braces:
@@ -339,7 +339,7 @@ identity peephole, inline trivials) that layer on top of folding.
 ```
 *  /  %       multiply, divide, remainder
 +  -          add, subtract
--x            unary negate (note: `-literal` must be `0 - literal`)
+-x            unary negate (works on variables AND literals: -1, -0.5, -x)
 ~x            bitwise NOT
 !x            logical NOT (1 if x == 0, else 0)
 ```

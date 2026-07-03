@@ -1,5 +1,7 @@
 # Plan — the Inliner Arc (codegen Frontier 1)
 
+**Status: CLOSED 2026-06-24** — Inc 1-8 shipped (leaf floats, arr_struct_at hot-only, control-flow bodies, S4 hotness propagation; `comp_process` bl 2→1; sf_bench 16.9→~9.8 ms across the arc with RegAlloc v2). Known future levers, deliberately NOT in this arc: trailing-return-EXPRESSION nested shapes (`sf_channel_process`/`moon_process`/`rotary_tick`) and re-running hot-constant promotion on spliced subtrees. Moved to legacy 2026-07-03.
+
 **Goal:** close the **×3.7 inliner gap** the sound_fusion DAW exposed (16.6 ms
 `sf_render` vs 4.5 ms hand-inlined vs 2.2 ms clang -O2; see benchmarks.md). Real
 call-heavy programs pay a per-call tax that the tight microbenchmark kernels hid.

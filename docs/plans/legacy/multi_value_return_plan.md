@@ -1,5 +1,7 @@
 # Multi-Value Return — the arity-8 "register-window transformer"
 
+**Status: CLOSED / SHIPPED.** Multi-value return + multi-assign bank on BOTH native backends (a64 x0-x7/d0-d7, x64 custom window — see backend_parity.md parity row), with real product consumers (`svf_tick`, `moog_taps`, stereo `sf_channel_process`). The last out-of-scope item — C-emit multi-return — shipped 2026-07-03 (`83777e7`; write side stashes slots 1..N-1 into `_bpp_{float,int}_ret_p` globals, read side unpacks). Phase B's controlled register-residency measurement was superseded by the real sf_bench/stereo work. Moved to legacy 2026-07-03.
+
 Status: **planned, gate lifted 2026-06-14.** The performance gate
 (register-resident returns) was F.2.c — float compute-in-place + B3
 promotion — which shipped in `c099438` (1.27x on the biquad). This plan

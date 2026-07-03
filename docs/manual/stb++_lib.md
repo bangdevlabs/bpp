@@ -522,20 +522,18 @@ going to sit next to other plugin-style software, or if users are going
 to type numbers into a UI.
 
 ```c
-audio_set_volume_db(0);         // full scale — 32700 amp
-audio_set_volume_db(0 - 6);     // half    — 16350 amp
-audio_set_volume_db(0 - 12);    // quarter — 8192 amp (≈ old default)
-audio_set_volume_db(0 - 24);    // 1/16   — 2050 amp, comfortable
-audio_set_volume_db(0 - 36);    // 1/64   — 510  amp, quiet background
-audio_set_volume_db(0 - 60);    // 1/1024 — 32 amp, nearly silent
-audio_set_volume_db(0 - 96);    // silence (below s16 resolution)
+audio_set_volume_db(0);      // full scale — 32700 amp
+audio_set_volume_db(-6);     // half    — 16350 amp
+audio_set_volume_db(-12);    // quarter — 8192 amp (≈ old default)
+audio_set_volume_db(-24);    // 1/16   — 2050 amp, comfortable
+audio_set_volume_db(-36);    // 1/64   — 510  amp, quiet background
+audio_set_volume_db(-60);    // 1/1024 — 32 amp, nearly silent
+audio_set_volume_db(-96);    // silence (below s16 resolution)
 ```
 
-**Why a negative literal needs `0 - 36` instead of `-36`:** unary minus
-on integer literals is parsed as a subtraction expression in the current
-grammar. The workaround is either `0 - 36` or storing the constant in a
-variable first (`auto dim = 0 - 36; audio_set_volume_db(dim);`). This
-will be fixed when the lexer learns the unary-minus-on-literal shortcut.
+(Older editions of this chapter claimed a negative literal had to be
+written `0 - 36`; unary minus on literals has been supported since the
+parser gained `T_UNARY('-')` — see Tonify Pitfall 4. `-36` is canonical.)
 
 #### Under the hood: faking `pow()` without a math runtime
 

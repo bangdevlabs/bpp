@@ -1,6 +1,14 @@
 # Plan — stereo audio + dogfooding b++ features in the audio stack
 
-**Status:** proposed 2026-06-19. Two coupled goals the user surfaced: (1) the audio
+**Status:** PARTIALLY SHIPPED (updated 2026-07-03 — header was stale at "proposed").
+S1 (stereo project graph + pan) ✅ 2026-06-19; S2 core (stbmixer per-voice pan +
+stereo fill) ✅ 2026-06-19; multi-return now has real product consumers
+(`sf_channel_process -> (float,float)`, `svf_tick`). **What's left from Part A's
+audit:** `@safe` still unused in the audio stack (0 uses — its killer use case!),
+mix loop still scalar (no SIMD/autovec), voice kinds/bus ids still bare ints
+(no enum), callback registries untyped. Those remain the open dogfood items.
+
+Original framing: two coupled goals the user surfaced: (1) the audio
 tools barely use b++'s distinctive features, so the language isn't being
 stress-tested and codegen wins on those features (e.g. multi-return) optimise
 something almost nobody uses; (2) the DAW is fake-mono and needs real stereo.
