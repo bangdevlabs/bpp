@@ -20,10 +20,31 @@ const TOL    = 0.0001;     // typical numerical-tolerance const
 const PI     = 3.14159;    // typical math const
 const SPEED  = 0.5;        // typical game tunable
 const COUNT  = 42;         // integer const — must NOT be broken
-// Note: const expressions like `0.0 - 0.5` still go through the
-// integer-only `const_eval_node` path. The gap B fast path covers
-// the killer use case (single literal RHS); float-const arithmetic
+// Note: const expressions like `0.5 + 0.1` still go through the
+// integer-only `const_eval_node` path. The fast paths cover single
+// literals — positive AND negated (see below); float-const arithmetic
 // would need a separate float interpreter.
+
+// ── 2026-07-03 extension: negative literals + const SLOTS ──────────
+//
+// Two more silent bug classes pinned here:
+//   1. `const N = -0.25;` parses as T_UNARY('-') over the float
+//      literal; the old fast path only matched a bare T_LIT, so the
+//      value fell into const_eval_node — an INTEGER evaluator that
+//      treats the '.' byte as digit -2, turning -0.25 into 175.
+//      Fixed by _const_neg_float_ref (parser).
+//   2. `global const G = 2.5;` / `static const S = -3.5;` (either
+//      sign) stored the literal's packed SOURCE REFERENCE into the
+//      data slot instead of the IEEE bits, reading back as a huge
+//      integer. Fixed by converting at glob_slot_init_value via
+//      cg_parse_float_bits_buf(vbuf, ...) + auto-registering the
+//      slot's type as float so readers load it as one.
+const THRESH_DB = -18.0;   // the audio-plugin shape that exposed bug 1
+const NSMALL    = -0.25;
+global const GPOS = 2.5;
+global const GNEG = -2.5;
+static const SPOS = 1.25;
+static const SNEG = -3.5;
 
 void check(label, got: float, want: float) {
     auto diff: float;
@@ -65,6 +86,20 @@ main() {
         putstr("FAIL: COUNT broke\n");
         sys_exit(1);
     }
+
+    // ── negative inline consts (bug 1) ────────────────────────────
+    check("thresh_db", THRESH_DB, -18.0);
+    check("nsmall",    NSMALL,    -0.25);
+
+    // ── const slots, both storage classes, both signs (bug 2) ─────
+    x = GPOS; check("global_const_pos", x, 2.5);
+    x = GNEG; check("global_const_neg", x, -2.5);
+    x = SPOS; check("static_const_pos", x, 1.25);
+    x = SNEG; check("static_const_neg", x, -3.5);
+
+    // ── negative const composes in arithmetic ─────────────────────
+    x = NSMALL * 4.0 + GPOS;           // -1.0 + 2.5
+    check("const_arith", x, 1.5);
 
     putstr("OK\n");
     return 0;

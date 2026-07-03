@@ -996,29 +996,58 @@ static void add_global(p, gclass) {
 // placement_canonical.md`) — same bytes flowing through 3 backends
 // means semantic decision belongs in the spine.
 glob_slot_init_value(name_p) {
+    auto j;
+    j = _glob_const_slot_idx(name_p);
+    if (j < 0) { return 0; }
+    // Float-literal const slots store the SOURCE REFERENCE of the
+    // literal (e.g. "-0.25"), not a number — convert to the raw IEEE
+    // 754 bits here, at the one choke point every data-section writer
+    // reads, so Mach-O / ELF emit the correct 8 bytes. Before this
+    // conversion existed the packed reference itself leaked into the
+    // slot and `global const X = 2.5;` read back as garbage. The
+    // reference indexes the parser's own `vbuf` (append-only, valid in
+    // every later phase — the same reason name printing works at emit
+    // time), so use the buffer-explicit converter: `cg_sbuf` only
+    // tracks the module currently under NATIVE codegen and is never
+    // set at all on the --c pipeline (reading it here segfaulted).
+    if (arr_get(glob_init_is_float, j) != 0) {
+        return cg_parse_float_bits_buf(vbuf, arr_get(glob_init_val, j));
+    }
+    return arr_get(glob_init_val, j);
+}
+
+// Where a const slot's value is a float literal, return the packed
+// source reference of the literal text ("2.5", "-0.25"); 0 otherwise.
+// The C emitter uses this to declare the slot as a real `double` with
+// the literal spelled out in the generated source, instead of a
+// `long long` holding IEEE bits that C would then re-convert.
+glob_slot_init_float_src(name_p) {
+    auto j;
+    j = _glob_const_slot_idx(name_p);
+    if (j < 0) { return 0; }
+    if (arr_get(glob_init_is_float, j) == 0) { return 0; }
+    return arr_get(glob_init_val, j);
+}
+
+// Shared lookup: index of `name_p` in the globals table when it is a
+// const slot (global const / static const); -1 for mutable globals
+// and unknown names.
+static _glob_const_slot_idx(name_p) {
     auto j, gp, gclass;
     j = 0;
     while (j < glob_cnt) {
         gp = arr_get(globals, j);
-        if (gp == name_p) {
+        if (gp == name_p || packed_eq(gp, name_p)) {
             gclass = arr_get(glob_class, j);
             if (gclass == GLOB_GLOBAL_CONST
                 || gclass == GLOB_STATIC_CONST) {
-                return arr_get(glob_init_val, j);
+                return j;
             }
-            return 0;
-        }
-        if (packed_eq(gp, name_p)) {
-            gclass = arr_get(glob_class, j);
-            if (gclass == GLOB_GLOBAL_CONST
-                || gclass == GLOB_STATIC_CONST) {
-                return arr_get(glob_init_val, j);
-            }
-            return 0;
+            return -1;
         }
         j++;
     }
-    return 0;
+    return -1;
 }
 
 // Flag set by try_type_annotation when it encounters `: serial`.
@@ -1657,16 +1686,50 @@ static const_eval_body(body, bcnt) {
 // literals are detected via SHAPE_DECIMAL and stored as raw IEEE
 // bits, mirroring the parse_const float fast path so codegen
 // can emit `.double` directives without re-deriving the bits.
+// Recognize a NEGATIVE float literal as a const's right-hand side.
+// `const X = -0.25;` parses as T_UNARY('-') over a SHAPE_DECIMAL T_LIT,
+// so the plain "is the RHS a SHAPE_DECIMAL literal?" fast path in the
+// two const handlers below misses it and the value falls through to
+// const_eval_node — an INTEGER evaluator that re-parses the source
+// bytes with '.' treated as a digit, yielding silent garbage
+// (-0.25 became 175). This helper detects the negated-literal shape
+// and synthesizes a "-<digits>" byte run in vbuf (the same
+// append-synthetic-text pattern the malloc<<3 rewrite uses), returning
+// a packed source ref that INCLUDES the sign. cg_parse_float_bits
+// already accepts a leading '-', and the C emitter prints the bytes
+// verbatim, so both backends decode the signed literal correctly.
+// Returns 0 when the node is not exactly `-<float literal>`.
+static _const_neg_float_ref(expr_node) {
+    auto un: Node, lit: Node, s, l, i, start;
+    un = expr_node;
+    if (un == 0) { return 0; }
+    if (un.ntype != T_UNARY) { return 0; }
+    if (peek(vbuf + unpack_s(un.a)) != '-') { return 0; }
+    lit = un.b;
+    if (lit == 0) { return 0; }
+    if (lit.ntype != T_LIT) { return 0; }
+    if (lit_shape(lit) != SHAPE_DECIMAL) { return 0; }
+    s = unpack_s(lit.a);
+    l = unpack_l(lit.a);
+    start = vbuf_pos;
+    poke(vbuf + vbuf_pos, '-');
+    vbuf_pos++;
+    for (i = 0; i < l; i++) { poke(vbuf + vbuf_pos + i, peek(vbuf + s + i)); }
+    vbuf_pos += l;
+    return pack(start, l + 1);
+}
+
 static void parse_global_const(gclass) {
     auto name_p, expr_node, val, _const_lit_node: Node, is_float;
     name_p = cur_packed();
     consume();   // consume name
 
-    // Optional type annotation (e.g. `: half`, `: float`). The hint
-    // is registered on the global itself via the same plumbing the
-    // mutable-slot path uses, so codegen + smart dispatch see the
-    // same declared type regardless of mutability.
+    // Optional type annotation (e.g. `: half`, `: float`). Register
+    // any hint on the global itself — the same plumbing parse_global
+    // uses — so codegen + smart dispatch see the same declared type
+    // regardless of mutability.
     try_type_annotation(name_p);
+    if (_prim_hint != 0) { ty_set_global_type(name_p, _prim_hint); }
 
     consume();   // consume '='
     expr_node = parse_expr();
@@ -1686,6 +1749,16 @@ static void parse_global_const(gclass) {
             }
         }
     }
+    // Negative float literal (`global const X = -0.25;`) — see
+    // _const_neg_float_ref for why this shape needs its own capture.
+    if (is_float == 0) {
+        auto _neg_src;
+        _neg_src = _const_neg_float_ref(expr_node);
+        if (_neg_src != 0) {
+            val = _neg_src;
+            is_float = 1;
+        }
+    }
     if (is_float == 0) {
         // Integer or general-const path. const_eval_node walks
         // T_BINOP/T_UNARY/T_LIT and returns the resolved word.
@@ -1701,6 +1774,13 @@ static void parse_global_const(gclass) {
     arr_set_at(glob_init_val, glob_cnt - 1, val);
     if (is_float != 0) {
         arr_set_at(glob_init_is_float, glob_cnt - 1, 1);
+        // A float-literal const slot IS a float global: register the
+        // type so every reader (inference, smart dispatch, codegen
+        // load width) treats it as one without requiring the caller
+        // to repeat `: float` on the declaration. An explicit
+        // annotation, when present, was already registered above and
+        // simply agrees with this.
+        if (_prim_hint == 0) { ty_set_global_type(name_p, TY_FLOAT); }
     }
 
     if (val_is_ch(';')) { consume(); }
@@ -1763,6 +1843,16 @@ static void parse_const() {
                 return;
             }
         }
+    }
+
+    // Negative float literal (`const X = -0.25;`) — see
+    // _const_neg_float_ref for why this shape needs its own capture.
+    auto _neg_src;
+    _neg_src = _const_neg_float_ref(expr_node);
+    if (_neg_src != 0) {
+        add_enum_val_float(name_p, _neg_src);
+        if (val_is_ch(';')) { consume(); }
+        return;
     }
 
     val = const_eval_node(expr_node);
