@@ -1,0 +1,98 @@
+// test_svf.bpp — pin the state-variable filter (stbfilter SVF) by its defining
+// frequency-response properties. An SVF's exact impulse response is fiddly to
+// hand-derive, so instead this feeds signals whose answer is known — DC and
+// clean sinusoids well inside each passband — and checks the LP/HP/BP behave.
+//
+// Deliberately NOT tested at exactly Nyquist: there native's fused multiply-add
+// and the C emitter's separate mul+add round differently (a known, accepted
+// backend divergence), and a razor-edge threshold would flap between them. The
+// test tones sit two+ octaves from the corner, so both backends pass by a wide
+// margin — the property is real, the test is robust.
+//
+// Covers (corner = 1 kHz at 44.1 kHz):
+//   1. DC passes the LOWPASS (gain 1), blocked by the HIGHPASS and BANDPASS.
+//   2. A 100 Hz tone (below the corner): LP passes it, HP blocks it.
+//   3. An 8 kHz tone (above the corner): LP blocks it, HP passes it.
+//   4. Sustained loud input stays bounded, never NaN (TPT form is stable).
+
+import "stbfilter.bsm";
+
+fabs_f(x: float) -> float {
+    if (x < 0.0) { return 0.0 - x; }
+    return x;
+}
+
+// Drive `count` samples of a sine at `hz` through the SVF and return the peak
+// magnitude of the LOWPASS and HIGHPASS outputs over the settled tail. Phase is
+// accumulated in float (no int->float mixing); sin_f range-reduces the growing
+// phase. Returns (peak_low, peak_high) via multi-value return.
+_svf_tone_peaks(s, hz: float, count) -> (float, float) {
+    auto i;
+    auto (ph, dph, x, lo, bp, hi, mxlo, mxhi): float;
+    svf_reset(s);
+    ph   = 0.0;
+    dph  = _FLT_2PI * hz / 44100.0;
+    mxlo = 0.0;
+    mxhi = 0.0;
+    for (i = 0; i < count; i++) {
+        x  = sin_f(ph);
+        ph = ph + dph;
+        lo, bp, hi = svf_tick(s, x);
+        if (i > count / 2) {                 // measure only the settled tail
+            if (fabs_f(lo) > mxlo) { mxlo = fabs_f(lo); }
+            if (fabs_f(hi) > mxhi) { mxhi = fabs_f(hi); }
+        }
+    }
+    return mxlo, mxhi;
+}
+
+main() {
+    auto s, i;
+    auto (lo, bp, hi, plo, phi) : float;
+
+    s = malloc(svf_sizeof());
+    svf_set(s, 1000.0, 0.707, 44100.0);   // 1 kHz corner, flat (Butterworth) Q
+
+    // ── (1) DC: lowpass passes (gain 1), highpass + bandpass block ────
+    svf_reset(s);
+    for (i = 0; i < 4000; i++) { lo, bp, hi = svf_tick(s, 1.0); }
+    if (fabs_f(lo - 1.0) > 0.01) { putmsg("FAIL: SVF lowpass DC gain should be 1.0"); return 1; }
+    if (fabs_f(hi) > 0.01)       { putmsg("FAIL: SVF highpass should block DC");      return 2; }
+    if (fabs_f(bp) > 0.01)       { putmsg("FAIL: SVF bandpass should block DC");      return 3; }
+
+    // ── (2) 100 Hz (below corner): LP passes, HP blocks ───────────────
+    plo, phi = _svf_tone_peaks(s, 100.0, 8000);
+    if (plo < 0.8) { putmsg("FAIL: SVF lowpass should pass a tone below the corner");  return 4; }
+    if (phi > 0.2) { putmsg("FAIL: SVF highpass should block a tone below the corner"); return 5; }
+
+    // ── (3) 8 kHz (above corner): LP blocks, HP passes ────────────────
+    plo, phi = _svf_tone_peaks(s, 8000.0, 8000);
+    if (plo > 0.2) { putmsg("FAIL: SVF lowpass should block a tone above the corner");  return 6; }
+    if (phi < 0.8) { putmsg("FAIL: SVF highpass should pass a tone above the corner");  return 7; }
+
+    // ── (4) stability: sustained loud input stays bounded, no NaN ─────
+    svf_reset(s);
+    plo = 0.0;
+    for (i = 0; i < 44100; i++) {
+        lo, bp, hi = svf_tick(s, 2.0);
+        if (lo != lo) { putmsg("FAIL: SVF went NaN (unstable)"); return 8; }
+        if (fabs_f(lo) > plo) { plo = fabs_f(lo); }
+    }
+    if (plo > 8.0) { putmsg("FAIL: SVF lowpass output not bounded"); return 9; }
+
+    // ── (5) guard: out-of-range cutoff / Q must clamp, not NaN ────────
+    // A corner above Nyquist and Q = 0 would divide by ~0 without the clamp.
+    svf_set(s, 88200.0, 0.0, 44100.0);
+    svf_reset(s);
+    for (i = 0; i < 1000; i++) {
+        lo, bp, hi = svf_tick(s, 1.0);
+        if (lo != lo || hi != hi) {
+            putmsg("FAIL: SVF must clamp bad cutoff/Q, not produce NaN");
+            return 10;
+        }
+    }
+
+    free(s);
+    putmsg("PASS: SVF lowpass/highpass/bandpass match their frequency-response properties");
+    return 0;
+}

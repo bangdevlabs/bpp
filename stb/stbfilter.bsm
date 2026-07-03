@@ -7,6 +7,9 @@
 //   PRIMITIVES — the shared building blocks:
 //     flt_onepole_g     one-pole lowpass coefficient (exp-free)
 //     flt_onepole_tick  one-pole lowpass step
+//     svf_*             state-variable filter — resonant LP/HP/BP/notch from
+//                       one pass (TPT form, stable to Nyquist); the workhorse
+//                       behind EQ bands, amp tone controls, and cab roll-offs
 //
 //   FILTERS — built from the primitives:
 //     moog_*            4-pole resonant ladder low-pass (moon_filter's engine)
@@ -14,6 +17,7 @@
 // Everything runs in float; convert to/from s16 at the audio boundary.
 
 const _FLT_2PI = 6.2831853;
+const _FLT_PI  = 3.14159265;
 
 // ── Primitives ─────────────────────────────────────────────────────
 
@@ -101,4 +105,100 @@ moog_slope(m, in: float, poles) -> float {
         3    { return c; }
         else { return d; }
     }
+}
+
+// ── State-variable filter (SVF) ────────────────────────────────────
+//
+// A resonant filter that yields lowpass, highpass, bandpass and notch outputs
+// from ONE state update — the workhorse behind parametric EQ bands, an amp's
+// tone controls, and speaker-cabinet roll-off filters. This is the modern
+// topology-preserving (TPT) form (Andrew Simper / Cytomic, trapezoidal
+// integration): unlike the classic Chamberlin SVF it stays stable and accurate
+// all the way up to Nyquist, so a 4 kHz cab low-pass and a 20 kHz coupling
+// filter both behave. State is two integrators (ic1, ic2); the caller allocates
+// the struct (svf_sizeof) and passes the pointer, the same way the Moog above
+// is used.
+
+struct SVF { k: float, a1: float, a2: float, a3: float, ic1: float, ic2: float }
+
+// Bytes the caller must allocate for one SVF's state.
+svf_sizeof() { return 48; }   // 6 fields * 8 bytes
+
+// Clear the two integrator states (use when (re)starting playback so a filter
+// does not carry state across renders).
+void svf_reset(s) {
+    auto ss: SVF;
+    ss = s;
+    ss.ic1 = 0.0;
+    ss.ic2 = 0.0;
+}
+
+// Set the corner frequency (Hz) and resonance Q for a sample rate. Q = 0.707 is
+// a flat (Butterworth) response; higher Q peaks at the corner. Precomputes the
+// three TPT coefficients so the per-sample tick is a handful of multiply-adds.
+// `g = tan(pi*fc/fs)` is the bilinear prewarp (tan_f in bpp_math).
+void svf_set(s, cutoff_hz: float, q: float, sample_rate: float) {
+    auto ss: SVF;
+    auto wc: float, g: float, kk: float, a1: float, a2: float, fmax: float;
+    ss = s;
+    // Clamp the two divide-by-zero corners so a bad parameter can never yield a
+    // silent NaN: the corner must stay strictly below Nyquist (cos(pi*fc/fs)
+    // reaches 0 at fc = fs/2, where tan blows up), and Q must stay positive
+    // (k = 1/Q). 0.49*fs and Q >= 0.05 keep both terms finite with margin.
+    fmax = 0.49 * sample_rate;
+    if (cutoff_hz < 1.0)  { cutoff_hz = 1.0; }
+    if (cutoff_hz > fmax) { cutoff_hz = fmax; }
+    if (q < 0.05)         { q = 0.05; }
+    wc = _FLT_PI * cutoff_hz / sample_rate;
+    g  = tan_f(wc);                      // prewarp: tan(pi * fc / fs)
+    kk = 1.0 / q;                        // damping = 1 / Q
+    a1 = 1.0 / (1.0 + g * (g + kk));
+    a2 = g * a1;
+    ss.k  = kk;
+    ss.a1 = a1;
+    ss.a2 = a2;
+    ss.a3 = g * a2;
+}
+
+// Advance one sample and return ALL THREE core outputs at once: (low, band,
+// high). Returning the whole filter in one call is b++ multi-value return doing
+// real work — the three results bank into d0..d2, so a caller that wants a
+// notch or a peak combines them with no second pass and no struct.
+svf_tick(s, in: float) -> (float, float, float) {
+    auto ss: SVF;
+    auto v1: float, v2: float, v3: float, lo: float, bp: float, hi: float;
+    ss = s;
+    v3 = in - ss.ic2;
+    v1 = ss.a1 * ss.ic1 + ss.a2 * v3;
+    v2 = ss.ic2 + ss.a2 * ss.ic1 + ss.a3 * v3;
+    ss.ic1 = 2.0 * v1 - ss.ic1;          // trapezoidal integrator update
+    ss.ic2 = 2.0 * v2 - ss.ic2;
+    lo = v2;
+    bp = v1;
+    hi = in - ss.k * v1 - v2;
+    return lo, bp, hi;
+}
+
+// Convenience single-mode taps (each advances the filter once), the same shape
+// moog_slope uses over moog_taps: pick one output from a single stateful tick.
+svf_low(s, in: float) -> float {
+    auto (lo, bp, hi): float;
+    lo, bp, hi = svf_tick(s, in);
+    return lo;
+}
+svf_high(s, in: float) -> float {
+    auto (lo, bp, hi): float;
+    lo, bp, hi = svf_tick(s, in);
+    return hi;
+}
+svf_band(s, in: float) -> float {
+    auto (lo, bp, hi): float;
+    lo, bp, hi = svf_tick(s, in);
+    return bp;
+}
+// A notch (band-reject) is low + high — the corner band removed.
+svf_notch(s, in: float) -> float {
+    auto (lo, bp, hi): float;
+    lo, bp, hi = svf_tick(s, in);
+    return lo + hi;
 }
