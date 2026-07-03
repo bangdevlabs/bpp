@@ -1,6 +1,6 @@
 # Plan — blondie_amp: a Fender Bassman model (preamp + convolution cab)
 
-**Status:** OPEN (2026-07-03). Increment 1 (SVF) DONE. Next: Increment 2 (stbdrive).
+**Status:** OPEN (2026-07-03). Increments 1 (SVF) + 2 (stbdrive) DONE. Next: 3 (stboversample).
 
 **Increment 1 note — a compiler bug fell out of it.** The SVF's guard test (an
 explicit `x != x` NaN check) exposed that the **C emitter never implemented
@@ -31,14 +31,21 @@ spaghetti-western guitar rig.
    preamp itself is nonlinear + IIR (NOT a Stage-F consumer); the cab is where
    the guitar feature and the compiler frontier finally coincide.
 
-## Reference (read the source, don't guess)
+## Reference + licence (RESOLVED 2026-07-03: clean-room)
 
-`github.com/flubber2077/Open-Source-Bassman-Preamp` (JUCE/C++). We **port the DSP
-model** to b++ — we do NOT copy the C++ text (different language anyway), and the
-Bassman circuit itself is public hardware (a schematic is not copyrightable). The
-tone-stack transfer function and the tube-saturation curve are textbook DSP.
-**TODO before shipping stbdrive/tonestack: check the repo's licence and credit it
-in the plugin header.** The SVF (Increment 1) is a textbook filter, no IP tie.
+`github.com/flubber2077/Open-Source-Bassman-Preamp` (JUCE/C++) is **GPL-3.0**.
+b++ is **Apache-2.0**. GPL-3.0 code cannot be pulled into an Apache-2.0 project
+(it would force the combined work to GPL). So we do **NOT** port their code — not
+their `clip()` formula, not any line. The repo is used only to confirm
+*architecture* (facts, not copyrightable): the signal chain, that a Bassman uses
+3 tube stages + an FMV tone stack + 2× oversampling + antiderivative anti-alias.
+
+Every DSP piece is implemented **independently from public / textbook sources**:
+the Fender circuit is public hardware; tube saturation = soft-clipping (tanh) is
+decades-old standard DSP; the FMV tone-stack transfer function derives from the
+published schematic's passive network; the ADAA anti-alias is an academic paper
+(Parker/Zavalishin/Le Bivic 2016) implemented from the paper's math. No GPL text
+is read into the implementation (only the `.h` interface names were ever seen).
 
 Signal chain the source revealed (2x oversampled):
 `up2x -> [tubeStage x3, with the FMV tone stack before stage 3] -> down2x -> cab`
@@ -53,9 +60,11 @@ IR convolution.
    workhorse resonant LP/HP/BP/notch. Highest leverage — it unblocks the preamp's
    coupling/Miller filters, the cheap cab, AND the deferred **TG12345 2-band EQ
    slice** (`sound_fusion.md`). Three planned consumers (Rule 36). ← DONE
-2. **`stbdrive`** (new Tier-1): the tube-saturation waveshaper. Port the exact
-   curve from `Saturation.cpp`. `exp_f` gives tanh if needed, or a cheaper
-   polynomial/rational soft clip.
+2. **`stbdrive`** (new Tier-1): the tube-saturation waveshaper. ← DONE. Modeled
+   independently (clean-room): `tanh_f` added to `bpp_math` (soft-clip built on
+   `exp_f`); `drive_soft` = symmetric tanh clip (odd harmonics), `drive_tube` =
+   asymmetric valve curve (even harmonics, DC-free). Stateless pure functions;
+   `test_stbdrive` pins exact tanh values + the asymmetry, green on both backends.
 3. **`stboversample`** (new): 2x up/down with an anti-alias half-band FIR —
    mandatory so the tube nonlinearity's harmonics above Nyquist don't alias.
    (Its half-band filter is itself a small FIR — a secondary Stage-F touch.)

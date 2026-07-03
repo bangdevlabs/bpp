@@ -1,0 +1,64 @@
+// test_stbdrive.bpp — pin the tube-style waveshaper (stbdrive) by exact
+// reference values and its defining nonlinearity properties.
+//
+// drive_soft(x, 1) is just tanh(x), so the reference values are hand-computable:
+//   tanh(0.5) = 0.46211716,  tanh(1) = 0.76159416,  tanh(2) = 0.96402758
+// The structural properties (odd symmetry, boundedness, more-drive-more-clip,
+// and the asymmetry / DC-freedom of the valve curve) are checked directly.
+
+import "stbdrive.bsm";
+
+fabs_f(x: float) -> float {
+    if (x < 0.0) { return 0.0 - x; }
+    return x;
+}
+
+main() {
+    auto i;
+    auto (x, y, ya, yb, mx, s) : float;
+
+    // ── (1) drive_soft(x, 1) == tanh(x): exact reference values ───────
+    if (fabs_f(drive_soft(0.5, 1.0) - 0.46211716) > 0.001) { putmsg("FAIL: drive_soft(0.5,1) != tanh(0.5)"); return 1; }
+    if (fabs_f(drive_soft(1.0, 1.0) - 0.76159416) > 0.001) { putmsg("FAIL: drive_soft(1,1) != tanh(1)");    return 2; }
+    if (fabs_f(drive_soft(2.0, 1.0) - 0.96402758) > 0.001) { putmsg("FAIL: drive_soft(2,1) != tanh(2)");    return 3; }
+
+    // ── (2) silence in → silence out ─────────────────────────────────
+    if (fabs_f(drive_soft(0.0, 7.0)) > 0.000001) { putmsg("FAIL: drive_soft(0) should be 0"); return 4; }
+
+    // ── (3) odd symmetry: drive_soft(-x, d) == -drive_soft(x, d) ──────
+    ya = drive_soft(0.7, 3.0);
+    yb = drive_soft(0.0 - 0.7, 3.0);
+    if (fabs_f(ya + yb) > 0.000001) { putmsg("FAIL: drive_soft not odd-symmetric"); return 5; }
+
+    // ── (4) always bounded in (-1, 1), even driven hard ──────────────
+    mx = 0.0;
+    x  = 0.0 - 20.0;                          // sweep -20 .. +20 in float
+    for (i = 0; i < 400; i++) {
+        y = drive_soft(x, 12.0);
+        if (fabs_f(y) > mx) { mx = fabs_f(y); }
+        x = x + 0.1;
+    }
+    // tanh asymptotes to 1 and, under extreme drive, rounds to exactly 1.0 in
+    // float — that IS correct saturation; the failure would be EXCEEDING it.
+    if (mx > 1.0) { putmsg("FAIL: drive_soft exceeded the (-1,1) soft-clip bound"); return 6; }
+
+    // ── (5) more drive = more saturation (for a fixed sub-unity input) ─
+    if (drive_soft(0.3, 5.0) <= drive_soft(0.3, 1.0)) { putmsg("FAIL: higher drive should clip harder"); return 7; }
+
+    // ── (6) valve curve: bias 0 collapses to the symmetric soft-clip ──
+    if (fabs_f(drive_tube(0.4, 3.0, 0.0, 1.0) - drive_soft(0.4, 3.0)) > 0.000001) {
+        putmsg("FAIL: drive_tube with bias 0 should equal drive_soft"); return 8;
+    }
+
+    // ── (7) valve curve stays DC-free at silence (bias subtracted) ────
+    if (fabs_f(drive_tube(0.0, 4.0, 0.6, 1.0)) > 0.000001) { putmsg("FAIL: drive_tube should be 0 at x=0"); return 9; }
+
+    // ── (8) a nonzero bias IS asymmetric (even harmonics present) ─────
+    // For an odd (symmetric) shaper, f(x) + f(-x) == 0 everywhere. A tube's
+    // asymmetry means the sum is nonzero — that residual is the even content.
+    s = drive_tube(0.3, 2.0, 0.5, 1.0) + drive_tube(0.0 - 0.3, 2.0, 0.5, 1.0);
+    if (fabs_f(s) < 0.01) { putmsg("FAIL: drive_tube with bias should be asymmetric"); return 10; }
+
+    putmsg("PASS: stbdrive soft-clip matches tanh and the valve curve is asymmetric + DC-free");
+    return 0;
+}
