@@ -507,6 +507,36 @@ void emit_node(nd) {
     }
 
     if (t == T_ASSIGN) {
+        // Multi-value assignment `a, b, … = f()` — n.c is the array of target
+        // T_VAR nodes, n.d the count. Emit the call into target 0 (which runs
+        // it and fills the banked globals), then copy each remaining target
+        // from its banked global. Classification uses the callee's declared
+        // return-slot types, so the read side lands on exactly the slots the
+        // T_RET write side stored into.
+        if (n.d > 1) {
+            auto mtargets, mcall: Node, mcallee, mk2, mcls, mpos, mj, mtn: Node;
+            mtargets = n.c;
+            mcall = n.b;
+            mcallee = find_func_idx(mcall.a);
+            emit_node(*(mtargets + 0));
+            out(" = ");
+            emit_node(n.b);
+            out("; ");
+            for (mk2 = 1; mk2 < n.d; mk2 = mk2 + 1) {
+                mtn  = *(mtargets + mk2 * 8);
+                mcls = is_float_type(get_fn_ret_type_at(mcallee, mk2));
+                mpos = 0;
+                for (mj = 0; mj < mk2; mj = mj + 1) {
+                    if (is_float_type(get_fn_ret_type_at(mcallee, mj)) == mcls) { mpos = mpos + 1; }
+                }
+                emit_node(mtn);
+                out(" = ");
+                if (mcls) { out("_bpp_float_ret_"); } else { out("_bpp_int_ret_"); }
+                emit_int(mpos);
+                if (mk2 < n.d - 1) { out("; "); }
+            }
+            return;
+        }
         // Stack struct copy: b = a becomes memcpy(b, a, sizeof_struct).
         an = n.a;
         if (an.ntype == T_VAR) {
@@ -734,6 +764,31 @@ void emit_node(nd) {
     }
 
     if (t == T_RET) {
+        // Multi-value return `return e1, e2, …;`. Value 0 goes in the normal C
+        // return; values 1..N-1 are stashed in the banked globals BEFORE the
+        // return, one slot per bank position within each type class — the exact
+        // banking the native backends do with x0..x7 / d0..d7, so the C-emit
+        // path agrees with the native suite. The multi-assign read side (and
+        // the float_ret() builtins) read these back after the call.
+        if (n.c > 1) {
+            auto rexprs, rk, rcls, rpos, rj;
+            rexprs = n.b;
+            for (rk = 1; rk < n.c; rk = rk + 1) {
+                rcls = is_float_type(get_fn_ret_type_at(cur_fn_idx, rk));
+                rpos = 0;
+                for (rj = 0; rj < rk; rj = rj + 1) {
+                    if (is_float_type(get_fn_ret_type_at(cur_fn_idx, rj)) == rcls) { rpos = rpos + 1; }
+                }
+                if (rcls) { out("_bpp_float_ret_"); } else { out("_bpp_int_ret_"); }
+                emit_int(rpos);
+                out(" = ");
+                emit_node(*(rexprs + rk * 8));
+                out("; ");
+            }
+            out("return ");
+            emit_node(*(rexprs + 0));
+            return;
+        }
         out("return ");
         emit_node(n.a);
         return;
@@ -2012,12 +2067,18 @@ void emit_mem_model() {
     // _bpp_argc/_bpp_argv/_bpp_envp are now declared in brt0.bsm as B++
     // globals, so the C emitter produces them through the normal global
     // emission path. The runtime only needs the scratch buffer here.
-    // Float return slots. Populated after every FFI call whose declared
-    // return type is a float/double, so that float_ret()/float_ret2()
-    // builtins can read back the last value even when the call result
-    // was used in a void-statement context.
-    out("static double _bpp_float_ret_1 = 0.0;"); putchar('\n');
-    out("static double _bpp_float_ret_2 = 0.0;"); putchar('\n');
+    // Banked multi-value-return slots. A function returning N values places
+    // value 0 in the normal C return; values 1..N-1 are stashed here, one slot
+    // per bank position within each type class — mirroring how the native
+    // aarch64/x86_64 backends bank integers in x0..x7 and floats in d0..d7.
+    // The T_RET write side stores into them and the multi-assign read side
+    // loads from them; the float_ret()/float_ret2() builtins also read slots
+    // 1 and 2 (e.g. after an FFI call used in a void-statement context).
+    auto _rs;
+    for (_rs = 0; _rs < 8; _rs = _rs + 1) {
+        out("static double _bpp_float_ret_"); emit_int(_rs); out(" = 0.0;"); putchar('\n');
+        out("static long long _bpp_int_ret_"); emit_int(_rs); out(" = 0;"); putchar('\n');
+    }
     putchar('\n');
 }
 
