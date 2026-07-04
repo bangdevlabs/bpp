@@ -530,14 +530,15 @@ expectations to every caller.
 | `sound_load_wav(path)` where `path` is a C-string pointer | Add: `sound_load_wav(path: ptr)` |
 | `image_load(path)` where `path` is a string pointer | Add: `image_load(path: ptr)` |
 
-**The `: ptr` annotation (shipped 2026-05-12).** Same shape as
-`: float` / `: word` / `: byte` — declares the parameter is a pointer.
-The motivating bug: `put_err(path)` inside an unannotated-param body
-silently dispatches to `putnum_err` (TY_WORD default) and prints the
-pointer as a decimal integer instead of dereferencing the string.
-Annotating the parameter `: ptr` routes the smart dispatch through
-`putstr_err` and the path prints correctly. See `docs/journal.md`
-2026-05-12 for the codebase-wide sweep that introduced this pattern.
+**`: str` vs `: ptr` (split 2026-07-04, T2 inc 2/D).** `: str` = a
+pointer whose bytes are a C string (put/put_err dispatch putstr);
+`: ptr` = an opaque address (put prints the NUMBER — increment D).
+And per increment E you usually need NEITHER: a parameter every
+caller feeds a string is inferred `: str` by call-site consensus.
+Annotate `: str` only when consensus can't see the sites (fn_ptr
+dispatch, mixed callers that are all genuinely strings). The
+historical `: ptr`-for-strings pattern (2026-05-12) was renamed
+repo-wide in the B' sweep.
 
 **Why.** API is contract. Without explicit hints on public parameters,
 two callers using the same function disagree about its type intent.

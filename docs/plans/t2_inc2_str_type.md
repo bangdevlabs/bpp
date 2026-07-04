@@ -1,8 +1,16 @@
 # Plan — T2 inc 2: the TY_STR / TY_PTR split (str-aware promotion)
 
-**Status:** Increments A-C + **E SHIPPED 2026-07-04**. Only D (flip
-bare-PTR put dispatch — the breaking cleanup) remains, now gated solely
-on the `: ptr`→`: str` residual-rename sweep (B').
+**Status: ARC COMPLETE — A-C, E, B' and D all SHIPPED 2026-07-04.**
+B' renamed 113 string-meaning `: ptr` params + 6 `-> str` returns
+(opaque handles keep `: ptr`). D then flipped: put/put_err route putstr
+ONLY for STR; a bare `: ptr` prints its ADDRESS, and the annotation
+suppresses W032 (printing an opaque pointer's number is the stated
+intent). The breaking flip broke nothing — full suites + render md5
+held, proving the rename swept every observable site. `: ptr` finally
+means what it says. Backlog noted en route: `auto p: ptr; p =
+buf_byte(8);` E053s even though buf_byte is `-> ptr` (PRE-EXISTING,
+worktree-bisected to before this arc — the ret type arrives as word at
+the assign-compat check; separate scrutiny item).
 
 **Increment E landed as:** the dormant `propagate_call_params` walker
 (written for any-site float propagation, never wired — that policy would
