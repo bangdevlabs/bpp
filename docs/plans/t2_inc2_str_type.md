@@ -1,8 +1,24 @@
 # Plan — T2 inc 2: the TY_STR / TY_PTR split (str-aware promotion)
 
-**Status:** Increments A-C SHIPPED 2026-07-04. D (flip bare-PTR put
-dispatch) + E (param str inference from call sites — the utopia's next
-step, kills the `path: ptr` annotation class) remain gated.
+**Status:** Increments A-C + **E SHIPPED 2026-07-04**. Only D (flip
+bare-PTR put dispatch — the breaking cleanup) remains, now gated solely
+on the `: ptr`→`: str` residual-rename sweep (B').
+
+**Increment E landed as:** the dormant `propagate_call_params` walker
+(written for any-site float propagation, never wired — that policy would
+have broken mixed callers) repurposed into whole-program CONSENSUS: a
+parameter types STR only when every direct call site agrees; fn_ptr-taken
+functions, arity mismatches and mixed sites poison. Runs after all
+modules infer; changed functions re-infer (put dispatch re-fires via
+markers 200/201/202 — variadic subcalls included); chains converge one
+link per round. W032 became DEFERRED (collected at inference, flushed
+after consensus) so the compiler never warns about an ambiguity it fixes
+itself moments later — malloc-style genuine ambiguity still warns.
+Three walker/encoding bugs fixed en route: Node.itype widened byte →
+quarter (TY_STR's bit-8 flag was truncated on every AST stamp; fn-type
+ids had ALREADY been overflowing the byte), the walker gained the
+T_TERNARY case it never had (a call inside `c ? f(x) : y` was invisible
+to consensus), and multi-value T_RET exprs now walk.
 
 **Design decisions locked during landing:**
 - TY_STR = TY_PTR | 0x100 (flag bit 8, NOT a new base) — the base nibble

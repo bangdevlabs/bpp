@@ -99,6 +99,7 @@ static auto ty_gl;
 
 // Initialize the type inference engine. Call once at startup.
 void init_types() {
+    init_put_warn();
     ty_vt = arr_struct_new(sizeof(VtEntry), 64);
     fn_ret_table = arr_struct_new(sizeof(FtEntry), 64);
     fn_metas = arr_struct_new(sizeof(FnMeta), 64);
@@ -483,11 +484,58 @@ void add_type_list(arr, cnt) {
 // The warning fires only when the argument is a T_VAR (variable
 // reference). Literal integers like `put(42)` are obviously
 // intentional and never warn.
+// W032 is DEFERRED since increment E: at round-0 inference a parameter
+// may look TY_WORD and later become STR by call-site consensus — warning
+// immediately would be a false alarm the compiler itself fixes moments
+// later. Candidates are collected here (keyed by the CALL NODE, so a
+// re-infer just re-appends the same node) and flushed by
+// _put_warn_flush after infer_str_params settles: any call whose target
+// ended up in the putstr family is dropped, everything else warns
+// exactly once.
+static auto _put_warn_nodes;
+static auto _put_warn_names;
+static auto _put_warn_suggs;
+
+void init_put_warn() {
+    _put_warn_nodes = arr_new();
+    _put_warn_names = arr_new();
+    _put_warn_suggs = arr_new();
+}
+
 static void _put_warn_ambiguous(arg0, call_node, fn_name, suggestion) {
     auto (a, c): Node;
+    auto k;
     a = arg0;
     c = call_node;
     if (a.ntype != T_VAR) { return; }
+    for (k = 0; k < arr_len(_put_warn_nodes); k++) {
+        if (arr_get(_put_warn_nodes, k) == call_node) { return; }
+    }
+    _put_warn_nodes = arr_push(_put_warn_nodes, call_node);
+    _put_warn_names = arr_push(_put_warn_names, fn_name);
+    _put_warn_suggs = arr_push(_put_warn_suggs, suggestion);
+}
+
+// Emit the surviving W032s. Called once, after str-param consensus.
+void _put_warn_flush() {
+    auto k, c: Node, tgt_s, tgt_l;
+    for (k = 0; k < arr_len(_put_warn_nodes); k++) {
+        c = arr_get(_put_warn_nodes, k);
+        // The node's CURRENT target tells the final story: a call the
+        // consensus upgraded now points at putstr / putstr_err.
+        tgt_s = unpack_s(c.a); tgt_l = unpack_l(c.a);
+        if (tgt_l == 6  && buf_eq(vbuf + tgt_s, "putstr", 6))      { continue; }
+        if (tgt_l == 10 && buf_eq(vbuf + tgt_s, "putstr_err", 10)) { continue; }
+        _put_warn_emit(c, arr_get(_put_warn_names, k), arr_get(_put_warn_suggs, k));
+    }
+    arr_clear(_put_warn_nodes);
+    arr_clear(_put_warn_names);
+    arr_clear(_put_warn_suggs);
+}
+
+static void _put_warn_emit(call_node, fn_name, suggestion) {
+    auto c: Node;
+    c = call_node;
     diag_warn(32);
     diag_str("'");
     diag_str(fn_name);
@@ -704,9 +752,29 @@ add_type(nd) {
             // Smart dispatch: rewrite put(x)/put_err(x) to the right output
             // function before codegen sees the call. TY_PTR → putstr,
             // TY_FLOAT → putfloat, anything else → putnum.
-            auto target;
+            auto target, _re_put;
             target = 0;
-            if (fn_l == 3 && buf_eq(vbuf + fn_s, "put", 3)) {
+            // Re-entrancy for increment E: a re-inferred body meets the
+            // ALREADY-substituted putstr/putnum/putfloat call. The
+            // dispatch marker (201 = put family, 202 = put_err family)
+            // lets the choice be recomputed from the CURRENT arg type —
+            // a param that just became STR upgrades putnum -> putstr.
+            _re_put = n.dispatch;
+            // Variadic subcalls (marker 200) re-fire too — the family is
+            // read off the CURRENT target name (…_err or not), since the
+            // 200 marker intentionally carries no family of its own.
+            auto _re200_out, _re200_err;
+            _re200_out = 0;
+            _re200_err = 0;
+            if (_re_put == 200) {
+                if (fn_l == 6  && buf_eq(vbuf + fn_s, "putstr", 6))       { _re200_out = 1; }
+                if (fn_l == 6  && buf_eq(vbuf + fn_s, "putnum", 6))       { _re200_out = 1; }
+                if (fn_l == 8  && buf_eq(vbuf + fn_s, "putfloat", 8))     { _re200_out = 1; }
+                if (fn_l == 10 && buf_eq(vbuf + fn_s, "putstr_err", 10))  { _re200_err = 1; }
+                if (fn_l == 10 && buf_eq(vbuf + fn_s, "putnum_err", 10))  { _re200_err = 1; }
+                if (fn_l == 12 && buf_eq(vbuf + fn_s, "putfloat_err", 12)) { _re200_err = 1; }
+            }
+            if (_re_put == 201 || _re200_out || (fn_l == 3 && buf_eq(vbuf + fn_s, "put", 3))) {
                 if (is_float_type(arg0.itype)) {
                     target = _put_target("putfloat", 8);
                 } else if (arg0.itype == TY_PTR || arg0.itype == TY_STR) {
@@ -720,7 +788,7 @@ add_type(nd) {
                     }
                 }
             }
-            if (fn_l == 7 && buf_eq(vbuf + fn_s, "put_err", 7)) {
+            if (_re_put == 202 || _re200_err || (fn_l == 7 && buf_eq(vbuf + fn_s, "put_err", 7))) {
                 if (is_float_type(arg0.itype)) {
                     target = _put_target("putfloat_err", 12);
                 } else if (arg0.itype == TY_PTR || arg0.itype == TY_STR) {
@@ -733,6 +801,7 @@ add_type(nd) {
                 }
             }
             if (target != 0) {
+                if (n.dispatch != 200) { n.dispatch = _re_put == 202 ? 202 : 201; }
                 n.a = target;
                 ty = func_type(n.a);
             }
@@ -1136,19 +1205,59 @@ infer_one_func(func_idx) {
     return ty_cur_ret;
 }
 
-// Propagate float types from call sites to callee parameters.
-// If function F calls G(x) and x is float, then G's param is float.
-// Returns 1 if any param type changed (needs another iteration).
+// ── T2 increment E — parameter str-inference by call-site CONSENSUS ──
+//
+// History note: this walker was originally written to propagate FLOAT
+// from call sites into callee params and was never wired in — its
+// any-single-site policy would have broken every mixed caller with
+// E240. The traversal (the most complete statement walker in this
+// file, switch arms included) is reused; only the T_CALL policy
+// changed: a parameter's type is inferred ONLY when every direct call
+// site in the whole program agrees. The utopian rule this implements:
+// `sound_load_wav(path)` needs no annotation — every caller passes a
+// string, so the parameter IS a string, and put/put_err inside the
+// body dispatch correctly.
+//
+// Consensus lattice per (callee, param): 0 = no site seen,
+// TY_STR = every site so far passed a string, -1 = poisoned (a
+// non-str site, an arg-count mismatch, or the function's address
+// taken via fn_ptr — indirect call sites are invisible, so consensus
+// cannot be trusted for those functions at all).
+static auto _estr_cons;      // buf_word(func_cnt): per-fn consensus buf ptr
+
+static _estr_buf(fi) {
+    auto b, fn_rec, pcnt, k;
+    b = _estr_cons[fi];
+    if (b != 0) { return b; }
+    fn_rec = funcs[fi];
+    pcnt = *(fn_rec + FN_PCNT);
+    if (pcnt < 1) { pcnt = 1; }
+    b = buf_word(pcnt);
+    for (k = 0; k < pcnt; k++) { b[k] = 0; }
+    _estr_cons[fi] = b;
+    return b;
+}
+
+static void _estr_poison_all(fi) {
+    auto b, fn_rec, pcnt, k;
+    fn_rec = funcs[fi];
+    pcnt = *(fn_rec + FN_PCNT);
+    b = _estr_buf(fi);
+    for (k = 0; k < pcnt; k++) { b[k] = -1; }
+}
+
+// One consensus round: walk every body folding call sites, then apply
+// TY_STR to every un-annotated, still-word parameter whose sites all
+// agree. Returns the number of parameters that changed.
 propagate_call_params() {
-    auto changed, i, fn_rec, body_arr, body_cnt;
-    changed = 0;
+    auto i, fn_rec, body_arr, body_cnt;
     for (i = 0; i < func_cnt; i++) {
         fn_rec = funcs[i];
         body_arr = *(fn_rec + FN_BODY);
         body_cnt = *(fn_rec + FN_BCNT);
-        changed += propagate_in_body(body_arr, body_cnt, i);
+        propagate_in_body(body_arr, body_cnt, i);
     }
-    return changed;
+    return 0;
 }
 
 // Walk a statement list looking for function calls with float arguments.
@@ -1176,33 +1285,43 @@ propagate_in_node(nd, caller_idx) {
     changed = 0;
 
     if (t == T_CALL) {
+        auto _nm_s, _nm_l;
         name_p = n.a;
         args = n.b;
         cnt = n.c;
-        // Find the callee function index.
+        _nm_s = unpack_s(name_p);
+        _nm_l = unpack_l(name_p);
+        // fn_ptr(target): the target gains INVISIBLE call sites (every
+        // `call(fp, ...)`) — consensus cannot see them, so the whole
+        // function is poisoned out of parameter inference.
+        if (_nm_l == 6 && buf_eq(vbuf + _nm_s, "fn_ptr", 6)) {
+            if (cnt >= 1) {
+                an = args[0];
+                if (an != 0) {
+                    if (an.ntype == T_VAR) {
+                        fi = find_func_idx(an.a);
+                        if (fi >= 0) { _estr_poison_all(fi); }
+                    }
+                }
+            }
+        }
+        // Fold this direct call site into the callee's consensus.
         fi = find_func_idx(name_p);
         if (fi >= 0) {
+            auto _cb;
             callee_func = funcs[fi];
-            callee_params = *(callee_func + FN_PARS);
             callee_pcnt = *(callee_func + FN_PCNT);
-            callee_body = *(callee_func + FN_BODY);
-            callee_bcnt = *(callee_func + FN_BCNT);
-            for (j = 0; j < cnt; j++) {
-                an = args[j];
-                if (an != 0) {
-                    arg_ty = an.itype;
-                    if (is_float_type(arg_ty)) {
-                        // If callee param is not already float, promote it —
-                        // but only if the param is not used with integer-only ops.
-                        if (is_float_type(get_fn_par_type(fi, j)) == 0) {
-                            if (j < callee_pcnt) {
-                                par_p = callee_params[j];
-                                if (uses_int_ops_list(callee_body, callee_bcnt, par_p) == 0) {
-                                    propagate_set_par_type(fi, j, TY_FLOAT);
-                                    changed = 1;
-                                }
-                            }
-                        }
+            _cb = _estr_buf(fi);
+            for (j = 0; j < callee_pcnt; j++) {
+                if (j >= cnt) { _cb[j] = -1; }        // arity mismatch: poison
+                else {
+                    an = args[j];
+                    arg_ty = 0;
+                    if (an != 0) { arg_ty = an.itype; }
+                    if (arg_ty == TY_STR) {
+                        if (_cb[j] == 0) { _cb[j] = TY_STR; }
+                    } else {
+                        _cb[j] = -1;
                     }
                 }
             }
@@ -1231,6 +1350,13 @@ propagate_in_node(nd, caller_idx) {
     }
     if (t == T_RET) {
         changed += propagate_in_node(n.a, caller_idx);
+        // Multi-value return: results 2..N live in the n.b array.
+        if (n.c > 1) {
+            auto _rr;
+            for (_rr = 0; _rr < n.c; _rr++) {
+                changed += propagate_in_node(*(n.b + _rr * 8), caller_idx);
+            }
+        }
         return changed;
     }
     if (t == T_IF) {
@@ -1261,6 +1387,16 @@ propagate_in_node(nd, caller_idx) {
             changed += propagate_in_body(sw_bods[sk * 2], sw_bods[sk * 2 + 1], caller_idx);
         }
         if (n.e > 0) { changed += propagate_in_body(n.d, n.e, caller_idx); }
+        return changed;
+    }
+    // Ternary postdates this walker's original float era — a call inside
+    // `cond ? f(x) : g(y)` was INVISIBLE to consensus until 2026-07-04
+    // (found when the minimal `return f("s") == 5 ? 0 : 1;` probe never
+    // folded its site).
+    if (t == T_TERNARY) {
+        changed += propagate_in_node(n.a, caller_idx);
+        changed += propagate_in_node(n.b, caller_idx);
+        changed += propagate_in_node(n.c, caller_idx);
         return changed;
     }
     if (t == T_MEMLD) {
@@ -1436,6 +1572,59 @@ find_func_idx(name_p) {
 }
 
 // Set a parameter type in the persistent par_types array.
+// The increment-E driver. Runs AFTER every module (and the entry) has
+// been inferred, when all direct call sites carry their final arg
+// itypes. Each round: rebuild the consensus from scratch (monotone —
+// str-ness only ever grows), apply it to un-annotated still-word
+// params, then RE-INFER the changed functions so their bodies' put
+// dispatch, local promotions and downstream call args see the new
+// parameter type; chains (f passes its param to g) converge one link
+// per round. The round cap is a safety net, not a tuning knob.
+void infer_str_params() {
+    auto round, i, fi, j, changed;
+    auto fn_rec, pcnt, hints, h, b, cur;
+    auto dirty;
+    round = 0;
+    while (round < 16) {
+        _estr_cons = buf_word(func_cnt);
+        for (i = 0; i < func_cnt; i++) { _estr_cons[i] = 0; }
+        propagate_call_params();
+        changed = 0;
+        dirty = arr_new();
+        for (fi = 0; fi < func_cnt; fi++) {
+            b = _estr_cons[fi];
+            if (b == 0) { continue; }
+            fn_rec = funcs[fi];
+            pcnt  = *(fn_rec + FN_PCNT);
+            hints = *(fn_rec + FN_HINTS);
+            for (j = 0; j < pcnt; j++) {
+                if (b[j] != TY_STR) { continue; }
+                h = 0;
+                if (hints != 0) { h = hints[j]; }
+                if (h != 0) { continue; }             // explicit annotation wins
+                cur = get_fn_par_type(fi, j);
+                if (cur != TY_WORD && cur != TY_UNK) { continue; }
+                propagate_set_par_type(fi, j, TY_STR);
+                changed = 1;
+                dirty = arr_push(dirty, fi);
+            }
+        }
+        if (changed == 0) { arr_free(dirty); _put_warn_flush(); return; }
+        // Re-infer only the functions whose parameters changed. The
+        // re-run re-registers params from get_fn_par_type (now STR),
+        // re-walks the body (put dispatch re-fires via the 201/202
+        // re-entrancy markers), and re-persists vt + the T2 hint pokes
+        // (idempotent). Return types are NOT re-published — a param
+        // passthrough return staying word is the conservative reading.
+        for (i = 0; i < arr_len(dirty); i++) {
+            infer_one_func(arr_get(dirty, i));
+        }
+        arr_free(dirty);
+        round++;
+    }
+    _put_warn_flush();
+}
+
 void propagate_set_par_type(func_idx, par_idx, ty) {
     auto block, pcnt, fn_rec, k, m: FnMeta;
     m = arr_struct_at(fn_metas, func_idx);
