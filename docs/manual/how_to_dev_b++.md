@@ -415,11 +415,16 @@ The two reasons this form is restricted, smaller to bigger:
    `1.toFixed()` is ambiguous and the parser has to special-case
    it.
 
-**Float warning:** float literals retain IEEE bits only when
-assigned to a `: float`, `: half float`, or `: quarter float`
-local. An un-annotated `auto x = 44100.0;` **silently truncates
-to int** and produces diagnostic **E232** — always annotate float
-locals.
+**Float inference (T2, 2026-07-04):** a bare local whose stores are
+float is inferred `: float` automatically — `auto x; x = 44100.0;`
+just works, and the compiler writes the annotation back into the
+declaration for you (codegen, dispatch and the C emitter all see it).
+**E232** still fires where the promotion refuses: the local's address
+is taken (`&x` — retyping behind a pointer's back is forbidden), the
+local is struct-typed, or the value's float-ness never reached a store.
+Annotate `: float` yourself only when the annotation carries MEANING —
+an int→float widening cast (`db_f = db;`) or widening a `half float`
+read into a double local. See tonify Rule 12 for the two classes.
 
 **Strings:** null-terminated byte sequences. Escapes: `\n` `\r`
 `\t` `\\` `\"` `\0` `\xHH`. String literals are immutable; the
@@ -512,10 +517,14 @@ The compiler emits the NARROWEST instruction that fits:
 - `*(p + i) = val` with `p: half` — `strh` on aarch64
 - `auto f: float; f = 3.14;` — materializes in `d0` (FP reg)
 
-Without annotations, everything defaults to word (8 bytes). Hints
-are opt-in performance tuning, never auto-inferred — an un-hinted
-`auto` NEVER becomes a sub-word type even if the assigned value
-fits in a byte.
+Without annotations, everything defaults to word (8 bytes), with ONE
+deliberate exception: a bare local whose stores are float is promoted
+to `: float` by the compiler (T2 smart-promotion, 2026-07-04 — the
+inferred type is written back into the declaration's own hint slot).
+Sub-word hints stay strictly opt-in — an un-hinted `auto` NEVER
+becomes `: byte` / `: half` / `: half float` even if the assigned
+value fits: width and precision slices are the programmer's explicit
+call, only full-float obviousness is inferred.
 
 ### §4.4 — Type propagation
 
@@ -624,14 +633,19 @@ orthogonal-type-system decision in B++ encoded the escape.
 Three diagnostics implement the doctrine:
 
 ```bpp
-// E232 — fatal. The destination is untyped (defaults to word) but
-// the value is float; the IEEE 754 bits would be silently dropped.
-auto x = 44100.0;
-//   ^ error[E232]: 'x' has no type annotation but the value being
-//                  stored is a float — the IEEE 754 bits will be
-//                  silently truncated to an integer.
-// Fix: write `auto x: float = 44100.0;` to preserve, or
-//      `auto x = 44100;` to use an integer literal directly.
+// Bare float store — NO diagnostic since T2 (2026-07-04): the local
+// promotes to `: float` automatically, the compiler writes the
+// annotation back into the declaration for every downstream consumer.
+auto x;
+x = 44100.0;          // x IS a float — bits preserved, no E232.
+
+// E232 — fatal — still fires where promotion must refuse:
+auto y;
+y = 1.5;
+poke(&y, 3);          // address taken: retyping behind the pointer's
+//   ^ error[E232]      back would silently reinterpret those bytes.
+// Fix: annotate `: float` if float was the intent (and mind the raw
+//      byte access), or drop the decimal point for integer math.
 
 // W010 — warning. Narrowing within the same base (word → byte).
 auto x: byte;

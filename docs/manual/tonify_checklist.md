@@ -391,19 +391,35 @@ Both forms desugar to `T_TERNARY` in the AST, so the backends see a
 single canonical node. Adding the idiom costs zero runtime overhead
 versus the longer form.
 
-## Rule 12: Float bits across an `auto` slot need `: float`
+## Rule 12: Float locals — the compiler writes the annotation; YOU annotate only semantics
 
-Storing a float-typed value into a bare `auto` local converts it to
-int via FCVTZS — the IEEE 754 bit pattern is gone. The compiler now
-catches this with E232 (assignment) and E233 (call site), so the
-practical rule is: when a local needs to hold a float, annotate it.
+> **REWRITTEN 2026-07-04 (T2 smart-promotion,
+> `docs/plans/t2_local_float_promotion.md`).** The old rule ("when a
+> local needs to hold a float, annotate it") is RETIRED — it was an
+> E232-era crutch, and ~170 such annotations were swept from the repo
+> the day T2 shipped. A bare local whose stores are float is inferred
+> `: float` and the compiler writes the annotation back into the
+> declaration (codegen, C emitter, put dispatch, E232 all see it).
+> Multi-assign targets type from the callee's declared ret slots the
+> same way (`auto lo, bp, hi; lo, bp, hi = svf_tick(...)` just works).
+
+The rule today: **write `: float` on a local ONLY when the annotation
+carries meaning the stores don't.** Exactly two such classes exist —
+comment the why at the site, so the next sweep knows they are real:
+
+| Class | Example | Why the annotation is load-bearing |
+|-------|---------|-----------------------------------|
+| **int→float widening cast** | `auto db_f: float; db_f = db;` (stbaudio dB APIs, maestro's `acc_f`, fps input axes) | The store's VALUE is an int; the annotation IS the conversion — the exact mirror of `: word` consent-truncation (§4.7). Without it the local stays int and E240 fires downstream. |
+| **precision-slice widening** | `auto lf: float; lf = peekfloat_h(p);` (sf_io, mini_synth recording loop) | `peekfloat_h` reads a 32-bit half float; slices are strict opt-in by doctrine, so T2 never infers across a precision boundary. |
 
 | Pattern | Action |
 |---------|--------|
-| `auto sr; sr = 44100.0;` | Annotate: `auto sr: float;` |
-| `auto pi; pi = 3.14159;` | Annotate: `auto pi: float;` |
-| `auto x; x = some_float_func();` | Annotate `x: float`, OR use the return as a float-typed expression directly |
-| Truncation IS the intent | Drop the decimal point on the literal: `auto x; x = 3;` |
+| `auto sr; sr = 44100.0;` | Leave bare — promotes. Do NOT add `: float`. |
+| `auto x; x = some_float_func();` | Leave bare — promotes from the declared/inferred return. |
+| `auto a, b; a, b = fpair();` (float ret slots) | Leave bare — each target types from its slot. |
+| `auto d: float; d = int_var;` | Keep — widening cast (class 1), comment it. |
+| Truncation IS the intent | `auto x: word; x = float_var;` — annotation = consent (§4.7). |
+| Address-taken float local | Keep `: float` — promotion refuses `&x` locals, E232 enforces the choice. |
 
 The compiler emits the explicit conversion path (`FCVTZS` on ARM64,
 `CVTTSD2SI` on x86_64) for explicitly-int destinations annotated

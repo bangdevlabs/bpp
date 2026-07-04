@@ -14816,3 +14816,119 @@ the new instruction (showed it as `.word`, the same class of false signal the
 NEON-blind disassembler once gave) — so it was taught to decode FMOV (scalar,
 immediate) too (`src/bug_disasm.bsm`), confirmed against `otool -tv` as the
 authoritative cross-check.
+
+## 2026-07-02 — the spaghetti-western rig opens: spring reverb shipped, blondie_amp arc begins
+
+The audio pivot grew its second named pedal. `stbdelay` (Tier-1: DelayLine /
+Comb / Allpass atoms, the allpass proven by its energy-preservation property
+∑out²=1) + `stbreverb` (Tier-2 spring topology: four dispersive allpasses
+inside a damped feedback loop, wet normalised by (1-decay) so tail LENGTH and
+LEVEL decouple) + `tools/morricone_spring` (the plugin, wired as sound_fusion's
+4th channel insert). Mono on purpose — a real spring tank is mono; the engine
+pans it into the stereo field like every other mono source (`53361db`).
+
+Then the user named the next one: **blondie_amp** — a Fender Bassman replica
+(Blondie = Eastwood in the Morricone-scored Good/Bad/Ugly; one rig, one film).
+The plan (docs/plans/blondie_amp_arc.md) runs 7 increments and ends at a REAL
+convolution cab — the first genuine FIR consumer for the deferred Stage-F FP
+scheduler ("a meta é ir até o fim pra estressar a engine"). Inc 1 (SVF, TPT
+form, `svf_tick -> (low, band, high)`) and Inc 2 (stbdrive: `drive_soft` tanh +
+`drive_tube` asymmetric valve curve, clean-room — the reference repo is GPL-3.0
+and b++ is Apache-2.0, so architecture facts only) both shipped with
+hand-derived value tests. En route: `tan_f` + `tanh_f` landed in bpp_math, and
+the SVF's NaN-guard test exposed that **the C emitter had never implemented
+multi-value return** — `return a,b,c` emitted only `return a`, every later
+value garbage, all arities, int AND float, latent because NaN slips through
+`>` thresholds (NaN compares false). Fixed both sides (`83777e7`): banked
+`_bpp_{float,int}_ret_p` globals mirroring x0-x7/d0-d7.
+
+## 2026-07-03 — Fable 5 scrutiny day: six silent bugs, know-or-refuse, and the answer on weak typing
+
+New model, new standing order from the user: "estamos competindo com C++ pelo
+mercado do áudio — escrutine b++." The haul, every one a SILENT bug:
+
+1. **`const N = -0.25;` evaluated to 175** (both backends). T_UNARY('-') over
+   the float literal missed both const fast paths and fell into
+   const_eval_node — an INTEGER evaluator that re-parses source bytes with '.'
+   as digit -2. Fixed by synthesizing "-digits" into vbuf (`7734a3c`).
+2. **`global const G = 2.5;` never worked at all** — the slot stored the
+   literal's packed source REF; `glob_init_is_float` was write-only since
+   birth. Fixed at the spine choke point (glob_slot_init_value →
+   `cg_parse_float_bits_buf(vbuf, ref)` — cg_sbuf is per-module and NEVER set
+   on --c, which is why the first fix attempt segfaulted the emitter) + the
+   slot auto-registers TY_FLOAT + the C emitter declares a real `const double`.
+3. **`exp_f(±inf)` looped forever** (inf - ln2 == inf), reachable via
+   `comp_new(sample_rate=0)` → an audio-thread hang. Now total (IEEE rails
+   709/-745, NaN passthrough).
+4. **`sin_f(1e18)` was an effective hang** — O(|x|) subtraction reduction. Now
+   O(1) division reduction past 1e9; ±inf/NaN → 0.0 (audio-grade); normal
+   range bit-identical (render md5 unchanged — proven, not assumed).
+5. **x64 NaN comparisons were WRONG** — UCOMISD reports unordered as
+   ZF=PF=CF=1 and the lowering read bare setcc: NaN==NaN gave 1, NaN!=NaN gave
+   0, NaN<x gave 1. This silently defeated the brand-new totality guards
+   (`x != x`) on x64 ONLY — found because the hostile-parameter test hung in
+   Docker and a 6-line probe compared backends. Fixed gcc-style (LT/LE swap +
+   ABOVE family, EQ=ZF&&!PF, NE=!ZF||PF) (`f81a179`); the whole headless DSP
+   batch then passed on x64 for the first time.
+6. Family-wide **audio-grade setter clamps** (moog reso, comb/allpass fb,
+   spring decay, env sustain, lfo rate, onepole corners) + the hostile-param
+   gate test whose COMPLETION is the anti-hang assertion (`43e2872`).
+
+Plus **E267** (`a8e4b39`): the know-or-refuse doctrine's first instalment —
+const_eval_node now REFUSES SHAPE_DECIMAL instead of chewing its bytes.
+Hygiene rode along: 3 shipped plans → legacy, 6 tests un-skip-c'd (the
+multi-return fix unlocked them; C-emit 186/49), unary-minus doc drift fixed
+(works for int AND float literals; two manuals said otherwise), E230/E266
+log entries synced.
+
+The day also settled the design question the user pressed twice: the guard
+against weak typing is NOT more type syntax. Three verbs — **inferir**
+(smart defaults: the float-literal const auto-types its slot), **carregar**
+(declared once, flows everywhere), **recusar** (E232 at the user seam, E267 at
+the compiler's own internal seams). The boçalidade gate is measurable:
+annotations-per-KLOC in the corpus must never rise.
+
+## 2026-07-04 — T2 ships: the compiler writes the annotation, then the repo-wide float faxina removes ~170 of them
+
+The typing doctrine's stage 2, and the first type-system change in b++'s
+history whose effect is REMOVING annotations. `auto sr; sr = 44100.0;` just
+works now. The mechanism was already half-built on both ends and never wired:
+inference ALREADY learned a bare local's float-ness at the first store
+(ty_set_var_type in T_ASSIGN), and codegen ALREADY read per-name decl hints
+(n.e via cg_decl_var_hint, the Rule 42 channel). T2 = at end-of-function
+inference (save_fn_types), write the settled TY_FLOAT back into the decl's own
+hint slot. The poke IS the annotation: E232, native slot layout, the C
+emitter's `double`, put dispatch, argument banking — all downstream behaves as
+if the programmer typed `: float`. Zero new syntax, zero validate changes
+(`e577f17`). Conservative refusals: locked, address-taken (&x must not change
+meaning behind the pointer's back), struct-typed, no decl slot (params).
+Inc 3 same day (`a77f1d0`): bare multi-assign targets type from the callee's
+DECLARED ret-slot types — before, targets 2..N of `a, b = fpair()` silently
+read the WRONG register bank (silent bug #7 of the era). Inc 2 (`: ptr`)
+stays gated with the reason recorded: bare ptr stores are LEGAL today, so
+promotion would flip put(p) putnum→putstr in living programs — and the deeper
+finding is that `: ptr` conflates opaque-pointer with C-string; the real path
+is a TY_STR/TY_PTR split first.
+
+The safety property that made it shippable in one day: a float store into a
+bare local was E232-FATAL before, so no compiling program had candidates —
+and the bootstrap proved it at the strongest level, **gen1 == gen2
+byte-IDENTICAL, no oscillation at all**, even after bpp_math itself lost its
+annotations (the compiler now compiles ITSELF through promotion and emits the
+same bytes).
+
+Then the harvest the user had been waiting months for ("essa bengala que a
+gente carregou"): the repo-wide faxina, three batches, leaves-first
+(`1baf942` DSP cartridges 43, `7510a13` stb+tools ~73, `81bc87f`
+src+games+examples ~54). 254 → 16 annotated float-local decl lines. The
+compile-and-test net sorted every survivor into exactly TWO legitimate
+classes, each restored WITH a why-comment: (1) **int→float widening casts**
+(`db_f = db`, `amp_f = _aud_amplitude`, maestro's acc_f, fps input axes, rts
+tile coords — the annotation IS the conversion, mirror of `: word` consent-
+truncation) and (2) **half-float widenings** (peekfloat_h reads; precision
+slices stay explicit). The 13 audio/midi failures mid-sweep were class 1
+doing its job in the audio callback + maestro alpha path — restored, all
+green. tests/ deliberately unswept (they pin annotation-era diagnostics on
+purpose). Render md5 byte-identical through every batch
+(`f61fac72be5077a6e9ef9cae21dde2a1`) — promotion ≡ annotation, proven on the
+audio itself. Native 228/0/12, C-emit 189/0/51, bootstrap 0.29-0.32s.

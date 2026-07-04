@@ -66,7 +66,7 @@ noise.
 | E221 | duplicate definition | bpp_parser.bsm | 1085 | ✅ | Same function in two modules |
 | E222 | circular dependency | bpp_import.bsm | 198 | ❌ | Module import cycle |
 | E230 | _(retired — superseded by the 2026-05-14 storage-class sidequest)_ static const at file scope | — | — | 🗑 | `static const X = N;` is now a REAL module-private read-only slot (see E263/E264) — the old "silently produces 0" failure mode no longer exists and `diag_error(230)` is gone from the source. Float literals in const slots also work since 2026-07-03 (both signs; `tests/test_const_float.bpp`). Number burned, not reused. |
-| E232 | silent float→int at assignment | bpp_validate.bsm | 396 | ✅ | `auto x; x = 3.14;` drops IEEE 754 bits; annotate `: float` or write int literal |
+| E232 | silent float→int at assignment | bpp_validate.bsm | 396 | ✅ | Float value stored into a destination that is neither annotated nor T2-promotable. Since 2026-07-04 `auto x; x = 3.14;` PROMOTES (no diagnostic — the compiler writes the `: float` back into the decl); E232 now fires only where promotion refuses: address-taken locals, struct-typed locals, untyped globals. See Tonify Rule 12 (rewritten). |
 | E233 | silent float→int at call site | bpp_validate.bsm | 495 | ✅ | float arg passed to int param (promoted from W002) |
 | E240 | int passed to float param | bpp_validate.bsm | 519 | ✅ | callee expects float, caller passed int — annotate source `: float` or use float literal |
 | E242 | shift count out of range | bpp_validate.bsm | 558 | ✅ | shift count > 63 — hardware masks to 6 bits, value silently wrong |
