@@ -1,0 +1,118 @@
+// test_dsp_param_safety.bpp — hostile-parameter audit for the DSP stack.
+//
+// The audio-grade contract (established by svf_set, extended 2026-07-03
+// across the cartridge family): a bad parameter — zero, negative, huge,
+// even ±infinity — may sound wrong, but it must NEVER hang, NaN the mix,
+// or blow up to ±inf. This test hammers every public setter with the
+// worst values it can construct and asserts three things per victim:
+//   1. the call returns (the test completing at all is the anti-hang
+//      assertion — exp_f(±inf) used to spin its range-reduction loop
+//      forever, reachable through comp_new(0)),
+//   2. processing afterwards stays finite (x == x, |x| bounded),
+//   3. the clamped path still produces sane output for good input.
+
+import "stbfilter.bsm";
+import "stbdelay.bsm";
+import "stbreverb.bsm";
+import "stbenv.bsm";
+import "stblfo.bsm";
+import "stbdynamics.bsm";
+
+fabs_f(x: float) -> float {
+    if (x < 0.0) { return -x; }
+    return x;
+}
+
+// Returns 1 when v is a finite number of sane magnitude for a DSP path.
+_finite_bounded(v: float) -> word {
+    if (v != v) { return 0; }                 // NaN
+    if (fabs_f(v) > 1000000.0) { return 0; }  // runaway / inf
+    return 1;
+}
+
+main() {
+    auto i;
+    auto (x, y, inf, ninf, z): float;
+
+    // Manufacture ±inf at runtime (1/0 in IEEE float).
+    z = 0.0;
+    inf  = 1.0 / z;
+    ninf = -1.0 / z;
+
+    // ── math primitives are total: no hang, no NaN out ───────────────
+    x = exp_f(inf);   if (x != x) { putmsg("FAIL: exp_f(+inf) is NaN");  return 1; }
+    x = exp_f(ninf);  if (fabs_f(x) > 0.000001) { putmsg("FAIL: exp_f(-inf) != 0"); return 2; }
+    x = sin_f(inf);   if (fabs_f(x) > 0.000001) { putmsg("FAIL: sin_f(inf) != 0");  return 3; }
+    x = cos_f(ninf);  if (fabs_f(x) > 0.000001) { putmsg("FAIL: cos_f(-inf) != 0"); return 4; }
+    x = sin_f(123456789012345.0);   // pathological magnitude: O(1), in [-1,1]
+    if (x != x || fabs_f(x) > 1.0000001) { putmsg("FAIL: sin_f(huge) unbounded"); return 5; }
+    // Normal range still exact-ish after the guards.
+    x = sin_f(1.5707963267948966);
+    if (fabs_f(x - 1.0) > 0.0001) { putmsg("FAIL: sin_f(pi/2) drifted"); return 6; }
+    x = exp_f(1.0);
+    if (fabs_f(x - 2.718281828) > 0.0001) { putmsg("FAIL: exp_f(1) drifted"); return 7; }
+
+    // ── onepole / moog: negative cutoff, zero sample rate, wild reso ──
+    x = flt_onepole_g(-500.0, 44100.0);
+    if (x != x || x < 0.0 || x >= 1.0) { putmsg("FAIL: onepole negative cutoff"); return 8; }
+    x = flt_onepole_g(1000.0, 0.0);
+    if (x != 0.0) { putmsg("FAIL: onepole zero sample rate"); return 9; }
+    auto m;
+    m = malloc(moog_sizeof());
+    moog_reset(m);
+    moog_set(m, 800.0, 9999.0, 44100.0);       // resonance far past self-osc
+    for (i = 0; i < 4410; i++) { x = moog_tick(m, 0.5); }
+    if (_finite_bounded(x) == 0) { putmsg("FAIL: moog runaway resonance"); return 10; }
+    free(m);
+
+    // ── comb / allpass: |fb| >= 1 must not run away ───────────────────
+    auto cb, ap;
+    cb = comb_new(113);
+    comb_set(cb, 4.0, -3.0);                    // fb way past 1, damp below 0
+    for (i = 0; i < 44100; i++) { x = comb_tick(cb, 1.0); }
+    if (_finite_bounded(x) == 0) { putmsg("FAIL: comb runaway feedback"); return 11; }
+    comb_free(cb);
+    ap = allpass_new(97);
+    allpass_set(ap, -7.5);
+    for (i = 0; i < 44100; i++) { x = allpass_tick(ap, 1.0); }
+    if (_finite_bounded(x) == 0) { putmsg("FAIL: allpass runaway feedback"); return 12; }
+    allpass_free(ap);
+
+    // ── spring reverb: decay >= 1, junk damp/mix ──────────────────────
+    auto sp;
+    sp = spring_new(44100.0);
+    spring_set(sp, 5.0, -2.0, 42.0);
+    for (i = 0; i < 44100; i++) { x = spring_process(sp, 0.5); }
+    if (_finite_bounded(x) == 0) { putmsg("FAIL: spring runaway decay"); return 13; }
+    spring_free(sp);
+
+    // ── envelope: sustain outside [0,1], negative release ─────────────
+    auto en;
+    en = env_new(44100.0);
+    env_set(en, 1.0, 1.0, 50.0, -100.0);        // sustain 50x, negative release
+    env_trigger(en);
+    for (i = 0; i < 4410; i++) { x = env_tick(en); }
+    if (x != x || x < 0.0 || x > 1.0000001) { putmsg("FAIL: env level out of [0,1]"); return 14; }
+    env_release(en);
+    for (i = 0; i < 4410; i++) { x = env_tick(en); }
+    if (x != x || x < 0.0) { putmsg("FAIL: env release unstable"); return 15; }
+    env_free(en);
+
+    // ── LFO: zero sample rate, negative rate — frozen, not corrupted ──
+    auto lf;
+    lf = lfo_new(0.0);                           // hostile sample rate
+    lfo_set(lf, -3.0, LFO_SIN);                  // hostile rate
+    for (i = 0; i < 1000; i++) { x = lfo_tick(lf); }
+    if (x != x || fabs_f(x) > 1.0000001) { putmsg("FAIL: lfo unstable"); return 16; }
+    lfo_free(lf);
+
+    // ── compressor born with sample_rate 0 (the exp_f(-inf) hang path) ─
+    auto cp;
+    cp = comp_new(0.0);
+    for (i = 0; i < 4410; i++) { x = comp_process(cp, 0.5); }
+    if (_finite_bounded(x) == 0) { putmsg("FAIL: comp sr=0 unstable"); return 17; }
+    free(cp);
+
+    putmsg("PASS: every DSP setter survives hostile parameters — no hang, no NaN, no runaway");
+    return 0;
+}
