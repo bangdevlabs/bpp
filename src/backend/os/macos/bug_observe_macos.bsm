@@ -863,6 +863,33 @@ bug_run(target_path, start_idx, argc, bp_names, bp_count, flag_break_all) {
             } else {
                 ret = gdb_set_bp(_addr);
                 if (ret == 0) { _set_count++; }
+                // Inline-splice coverage (2026-07-04, born from a real
+                // debugging trap): the S4/B2 inliner splices small
+                // bodies into their callers, so an entry breakpoint
+                // never fires at those call sites. The .bug map's v5
+                // INLINE section records every splice range — cover
+                // them all, so `--break fn` means fn, wherever it ran.
+                auto _ii, _in;
+                _in = 0;
+                for (_ii = 0; _ii < bug_il_count; _ii++) {
+                    if (_cstr_eq_packed(_spec, arr_get(bug_il_name, _ii))) {
+                        if (gdb_set_bp(text_base + arr_get(bug_il_start, _ii)) == 0) {
+                            _in++;
+                            _set_count++;
+                        }
+                    }
+                }
+                if (_in > 0) {
+                    out_str("bug: `");
+                    auto _ni, _nch;
+                    _ni = 0;
+                    _nch = str_peek(_spec, 0);
+                    while (_nch != 0) { out_ch(_nch); _ni++; _nch = str_peek(_spec, _ni); }
+                    out_str("` is also inlined at ");
+                    out_int(_in);
+                    out_str(" call site(s) -- all covered");
+                    out_nl();
+                }
             }
         }
     }
@@ -908,7 +935,27 @@ bug_run(target_path, start_idx, argc, bp_names, bp_count, flag_break_all) {
                 auto d;
                 for (d = 0; d < call_depth; d++) { out_str("  "); }
                 out_str("-> ");
-                out_packed(arr_get(bug_am_name, fi));
+                // Re-attribute a PC inside an inline-splice range to the
+                // INLINED callee — the reason the v5 INLINE section exists.
+                // Without this, a covered inline breakpoint reported the
+                // enclosing caller's name and the trace lied about who ran.
+                auto _at, _atp;
+                _at = -1;
+                _atp = pc - text_base;
+                auto _aj;
+                for (_aj = 0; _aj < bug_il_count; _aj++) {
+                    if (_atp >= arr_get(bug_il_start, _aj)) {
+                        if (_atp < arr_get(bug_il_end, _aj)) { _at = _aj; }
+                    }
+                }
+                if (_at >= 0) {
+                    out_packed(arr_get(bug_il_name, _at));
+                    out_str(" [inlined in ");
+                    out_packed(arr_get(bug_am_name, fi));
+                    out_str("]");
+                } else {
+                    out_packed(arr_get(bug_am_name, fi));
+                }
                 // Show first 4 arguments (x0-x3 on ARM64).
                 out_str("(");
                 auto ai, av;

@@ -317,6 +317,23 @@ under `bug` the same way you'd run it directly.
 
 ## Selective breakpoints — `--break <fn>`
 
+> **Inline-aware since 2026-07-04.** A function-name breakpoint also
+> covers every inline-splice site recorded in the map's v5 INLINE
+> section, and a stop inside a spliced body is re-attributed:
+>
+> ```
+> bug: `half_of` is also inlined at 2 call site(s) -- all covered
+> -> half_of [inlined in main](...)
+> ```
+>
+> Before this, `--break fn` on a small leaf silently never fired — the
+> S4/B2 inliner had spliced the body into every hot caller (the exact
+> trap that cost a debugging detour during the 2026-07-04 round-4
+> scrutiny). The TUI's runtime `b fn` command covers splice sites the
+> same way. Map format v7 also widened every TYPE field u8 → u16, so
+> `: str` locals/params/returns (TY_STR = 0x104) dump truthfully
+> instead of collapsing to `ptr`.
+
 By default observe mode traces every function in the program.
 That is excellent for "what is this binary doing" surveys and
 terrible for "I need to know exactly when `foo` runs."
