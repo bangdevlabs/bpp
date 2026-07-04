@@ -43,8 +43,14 @@ struct VtEntry {
              // parameters). Written back by the T2 float smart-promotion
              // sweep in save_fn_types so an inferred float becomes a real
              // annotation for codegen + validate.
-    ataken   // 1 once &name is seen anywhere in the function — promotion
+    ataken,  // 1 once &name is seen anywhere in the function — promotion
              // must not silently change what the bytes at that address mean
+    nonstr   // 1 once any NON-string value was stored — the STR promotion
+             // requires string-PURE stores, because `s = 0;` (the universal
+             // release/reset idiom) is a legitimate word store that must
+             // not be turned into an E053 by a compiler-written hint.
+             // Float never needs this: an int store into a float local
+             // CONVERTS (scvtf); a word store into a str local CONFLICTS.
 }
 static auto ty_vt;
 
@@ -161,6 +167,7 @@ void ty_set_var_type(name_p, ty) {
     for (i = 0; i < n; i++) {
         e = arr_struct_at(ty_vt, i);
         if (packed_eq(e.name, name_p)) {
+            if (ty != TY_STR && ty != TY_UNK) { e.nonstr = 1; }
             if (e.locked) { return; }
             // TY_UNK in the slot means the local was pre-declared
             // by T_DECL without a hint — the first real assignment
@@ -206,6 +213,8 @@ void ty_set_var_type(name_p, ty) {
     e.elem   = TY_WORD;
     e.hslot  = 0;
     e.ataken = 0;
+    e.nonstr = 0;
+    if (ty != TY_STR && ty != TY_UNK) { e.nonstr = 1; }
 }
 
 // Mark a local as address-taken. The T_ADDR handler calls this whenever the
@@ -378,7 +387,9 @@ func_type(name_p) {
 promote(a, b) {
     auto ab, bb;
     ab = ty_base(a); bb = ty_base(b);
-    // PTR wins everything.
+    // PTR wins everything. TY_STR rides on BASE_PTR (flag bit 8), so a
+    // string is exactly as sticky and keeps its flag: `s + 1` returns
+    // the STR operand — still a C string, one byte in.
     if (ab == BASE_PTR) { return a; }
     if (bb == BASE_PTR) { return b; }
     // ARR wins over numeric types — arrays are not arithmetic operands.
@@ -418,7 +429,7 @@ type_of_lit(vstart, vlen) {
     auto ch, val, i, is_hex;
     // String literal: always a pointer.
     ch = peek(vstart);
-    if (ch == 34) { return TY_PTR; }
+    if (ch == 34) { return TY_STR; }   // a string literal IS a string
     // Float literal: contains a decimal point.
     for (i = 0; i < vlen; i++) {
         if (peek(vstart + i) == 46) { return TY_FLOAT; }
@@ -698,7 +709,7 @@ add_type(nd) {
             if (fn_l == 3 && buf_eq(vbuf + fn_s, "put", 3)) {
                 if (is_float_type(arg0.itype)) {
                     target = _put_target("putfloat", 8);
-                } else if (arg0.itype == TY_PTR) {
+                } else if (arg0.itype == TY_PTR || arg0.itype == TY_STR) {
                     target = _put_target("putstr", 6);
                 } else {
                     target = _put_target("putnum", 6);
@@ -712,7 +723,7 @@ add_type(nd) {
             if (fn_l == 7 && buf_eq(vbuf + fn_s, "put_err", 7)) {
                 if (is_float_type(arg0.itype)) {
                     target = _put_target("putfloat_err", 12);
-                } else if (arg0.itype == TY_PTR) {
+                } else if (arg0.itype == TY_PTR || arg0.itype == TY_STR) {
                     target = _put_target("putstr_err", 10);
                 } else {
                     target = _put_target("putnum_err", 10);
@@ -778,6 +789,7 @@ add_type(nd) {
                 e.hslot  = 0;
                 if (hints_arr != 0) { e.hslot = hints_arr + i * 8; }
                 e.ataken = 0;
+                e.nonstr = 0;
             }
         }
         if (hints_arr != 0) {
@@ -895,12 +907,16 @@ void save_fn_types(func_idx) {
     for (i = 0; i < cnt; i++) {
         _pe = arr_struct_at(ty_vt, i);
         if (_pe.locked)          { continue; }
-        if (_pe.type != TY_FLOAT) { continue; }
+        if (_pe.type != TY_FLOAT && _pe.type != TY_STR) { continue; }
+        if (_pe.type == TY_STR && _pe.nonstr) { continue; }
         if (_pe.ataken)          { continue; }
         if (_pe.hslot == 0)      { continue; }
         if (*(_pe.hslot) != 0)   { continue; }
         if (get_var_type_in_fn(_pe.name, func_idx) >= 0) { continue; }
-        *(_pe.hslot) = TY_FLOAT;
+        // TY_STR promotes for DISPATCH (putstr, no W032) — the slot
+        // stays a word either way; TY_FLOAT promotes for slot layout
+        // AND dispatch. Both are "the compiler writes the annotation."
+        *(_pe.hslot) = _pe.type;
     }
 
     block = buf_byte(cnt * 24);
