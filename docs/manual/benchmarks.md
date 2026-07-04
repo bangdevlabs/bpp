@@ -709,3 +709,40 @@ caught by the number, not just the timing). A new compile-time case goes into
 `bench_compile.sh`'s case list. Always print a checksum, always cite the binary
 identity, and update the "Latest results" section here in the same commit that
 moves a number.
+
+## 2026-07-04 — full catalog re-run after the T2 typing era (str arc, consensus params, allocator typing)
+
+The standing discipline after a run of compiler-internals work — and this
+was the biggest such run since the inliner arc: T2 float promotion +
+multi-assign targets, the TY_STR/TY_PTR split (Node.itype widened byte →
+quarter), parameter inference by call-site consensus (with re-inference),
+increment D's dispatch flip, and the allocator family gaining TY_PTR.
+Machine was under concurrent interactive use; gates + checksums + the
+audio md5 are the noise-robust signals.
+
+| Benchmark | Historical (06-24/25) | Today | Verdict |
+|---|---|---|---|
+| `bench_compile.sh` bootstrap | 0.29-0.34s | 0.31/0.33/0.35 | unchanged band — the consensus pass + re-inference cost stays in the noise |
+| `bench_codegen` biquad / lcg / xform / manylive vs gcc -O2 | 0.85-1.08 / 0.85-1.04 / 1.02-1.14 / 1.24-1.72× | **0.96 / 1.04 / 1.11 / 1.44×** | all in band; checksums identical both sides |
+| `sf_bench` (stereo, ours) | 9.8-11.1 ms | 11.25 ms / 266× | in the ±15% band (heavy concurrent load); oracle itself read 4.66 ms vs its 3.7-3.9 history — same-direction machine noise, not a code delta |
+| `sf_bench_flat` | 5.2-5.3 ms | 5.29 ms / 566× | unchanged |
+| `bench_compose` | 3-4× | 3×, PASS | unchanged |
+| `bench_simd_raw` | ~3× | 3×, checksums exact | unchanged |
+| `bench_outline` | 92-105% vs explicit | 5× vs serial, 101% | parity |
+| `bench_autovec_gate.sh` / `bench_mixed_auto.sh` | PASS | PASS (9 vector ops / cross-backend checksum) | — |
+| `bench_ecs_iter` | 0.92-0.95× (informational) | 0.96× | in band |
+| `bench_ecs_physics_simd` | 2×, PASS | PASS, positions bit-exact | unchanged |
+| `bench_ecs_scheduler` | 45-64% of sequential | 50%, PASS | unchanged |
+| `bench_ecs_sparse_query` | 2.8-13.8× buckets | 16.9× | in the historical spread |
+| `bench_stbflow` | 4-6× | 4×, PASS | unchanged |
+| `tablah` / `tablah_opt` | ~48/~39-43 ms totals | ~48.5/~44.5 ms, 24544 filtered both | within noise, same filter result |
+
+**Audio correctness:** `f61fac72be5077a6e9ef9cae21dde2a1` — unchanged
+through every commit of the typing era (verified after every increment,
+~30 consecutive identical renders).
+
+**Takeaway:** an entire type-system era — including a BREAKING dispatch
+flip — landed with the whole catalog at parity, every checksum identical,
+and the audio byte-stable. The zero-regression construction of each
+increment (E232-fatal candidates, consensus poison rules, contract locks)
+is what made a change this large this quiet.
