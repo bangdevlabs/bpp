@@ -356,12 +356,24 @@ static _builtin_ret_type(name_p) {
     // on ARM64) into the same arithmetic-friendly double slot.
     if (fn_l == 9  && buf_eq(vbuf + fn_s, "peekfloat",   9))  { return TY_FLOAT; }
     if (fn_l == 11 && buf_eq(vbuf + fn_s, "peekfloat_h", 11)) { return TY_FLOAT_H; }
+    // The allocator family returns TY_PTR (round-4 scrutiny, 2026-07-04).
+    // These are TRUE builtins (codegen-emitted, no B++ source), so the
+    // registry is their one honest home. Two bugs this closes at once:
+    //   1. `auto p: ptr; p = buf_byte(4);` fired E053 — the Phase D.4
+    //      parser inlining rewrites buf_byte/buf_word calls into direct
+    //      `malloc` calls, and an untyped malloc degraded the whole
+    //      expression to WORD at the assign-compat check.
+    //   2. put(malloc(...)) is finally SAFE to type: since increment D
+    //      a TY_PTR prints as its address (putstr keys on STR only), so
+    //      typing the allocator cannot turn heap bytes into fake text —
+    //      and the `: ptr`-aware W032 gate stops the noise.
+    if (fn_l == 6  && buf_eq(vbuf + fn_s, "malloc", 6))          { return TY_PTR; }
+    if (fn_l == 14 && buf_eq(vbuf + fn_s, "malloc_aligned", 14)) { return TY_PTR; }
+    if (fn_l == 7  && buf_eq(vbuf + fn_s, "realloc", 7))         { return TY_PTR; }
     // (argv_get / envp_get used to be tagged here on 2026-05-12;
     // retired 2026-05-13 because they became plain B++ source
     // functions in src/bpp_args.bsm that declare their return type
-    // via `-> ptr` directly on the signature. Registry now contains
-    // only TRUE builtins — peekfloat / peekfloat_h — that emit a
-    // single LDR S/D + FCVT and have no B++ source.)
+    // via `-> str` directly on the signature.)
     return 0;
 }
 
@@ -605,6 +617,20 @@ add_type(nd) {
                 && (c0 == '<' || c0 == '>' || c0 == '=' || c0 == '!'))) {
             n.itype = TY_WORD;
             return TY_WORD;
+        }
+        // Pointer DIFFERENCE is a number (C's ptrdiff), not a pointer:
+        // `b - a` with both sides pointer-class yields the byte distance,
+        // and promote()'s PTR-stickiness would otherwise drag the result
+        // back into pointer land — where E243 then flags an honest
+        // `b - a == 8` as a pointer-vs-literal bug (round-4 scrutiny).
+        // Subtraction only; ptr + ptr has no meaning worth blessing.
+        if (op_l == 1 && c0 == '-') {
+            if (ty_base(lt) == BASE_PTR || ty_base(lt) == BASE_ARR) {
+                if (ty_base(rt) == BASE_PTR || ty_base(rt) == BASE_ARR) {
+                    n.itype = TY_WORD;
+                    return TY_WORD;
+                }
+            }
         }
         ty = promote(lt, rt);
         n.itype = ty;
@@ -1204,6 +1230,16 @@ infer_one_func(func_idx) {
 
     // Walk the function body.
     add_type_list(body_arr, body_cnt);
+
+    // An explicit return annotation is a CONTRACT, not a seed: re-assert
+    // it after the body walk. Without this, `arr_new() -> array` whose
+    // body ends in `return raw + 16;` had its TY_ARR overridden by
+    // promote()'s PTR-wins rule the moment malloc became TY_PTR
+    // (round-4 scrutiny) — the same explicit-wins doctrine locals get
+    // via ty_lock_var.
+    if (_rh != 0 && _rh != TY_UNK) {
+        ty_cur_ret = _rh;
+    }
 
     // Save results.
     save_fn_types(func_idx);
