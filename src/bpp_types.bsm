@@ -581,6 +581,40 @@ add_type(nd) {
     if (t == T_ASSIGN) {
         rt = add_type(n.b);
         add_type(n.a);
+        // Multi-value assignment `a, b, … = f()` (T2 increment 3): type
+        // EVERY target from the callee's DECLARED return-slot type, not
+        // just the first from the call's overall type. The slot types come
+        // from the parser's `-> (t1, t2, …)` declaration, so a bare target
+        // receiving a float slot settles on TY_FLOAT and the promotion
+        // sweep in save_fn_types writes the annotation back — the codegen
+        // then reads the correct register bank (d-bank for floats).
+        // Before this, targets 2..N of an unannotated multi-assign kept
+        // TY_WORD and silently read the WRONG bank. Unknown callees
+        // (fidx < 0) and same-module forward references (ret_block not
+        // built yet — Rule 27's leaves-first ordering) fall back to
+        // TY_WORD, which promotes nothing: conservative, same as before.
+        if (n.d > 1) {
+            auto _ma_call: Node, _ma_fidx, _ma_k, _ma_tn: Node, _ma_targets;
+            _ma_call = n.b;
+            if (_ma_call != 0) {
+                if (_ma_call.ntype == T_CALL) {
+                    _ma_fidx = find_func_idx(_ma_call.a);
+                    if (_ma_fidx >= 0) {
+                        _ma_targets = n.c;
+                        for (_ma_k = 0; _ma_k < n.d; _ma_k++) {
+                            _ma_tn = *(_ma_targets + _ma_k * 8);
+                            if (_ma_tn != 0) {
+                                if (_ma_tn.ntype == T_VAR) {
+                                    ty_set_var_type(_ma_tn.a, get_fn_ret_type_at(_ma_fidx, _ma_k));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            n.itype = rt;
+            return rt;
+        }
         // Update variable type if left side is a var node.
         lhs = n.a;
         if (lhs.ntype == T_VAR) {

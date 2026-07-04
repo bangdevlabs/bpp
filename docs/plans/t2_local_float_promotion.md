@@ -1,7 +1,7 @@
 # Plan — T2: local float smart-promotion (typing evolution, stage 2)
 
-**Status:** Increment 1 SHIPPED 2026-07-04. Increments 2-3 open (gated on
-Rule 28 evidence). Verified: gen1==gen2 byte-IDENTICAL (the zero-regression
+**Status:** Increments 1 + 3 SHIPPED 2026-07-04. Increment 2 (`: ptr`) stays
+gated — see the note in its bullet. Verified: gen1==gen2 byte-IDENTICAL (the zero-regression
 property held at the strongest level), native 228/0/12, C-emit 189/0/51,
 probe green on x64-in-Docker, bench_compile 0.30/0.31s (unchanged band),
 audio md5 unchanged.
@@ -53,11 +53,18 @@ new syntax, no new diagnostic.
    hint array (`node.e = dh_arr` unconditionally); VtEntry grows
    `hslot`/`ataken`; T_DECL records the hint-slot address; T_ADDR marks
    address-taken; save_fn_types runs the promotion sweep. ← SHIPPED
-2. **`: ptr` from `-> ptr` flows** (kills residual W032 friction) — same
-   sweep, TY_PTR candidates whose every store is a `-> ptr` call result.
-   Gate on real W032 noise measurements first (Rule 28).
-3. **Multi-assign targets** — promote targets 2..N from the callee's
-   declared ret-slot types. Needs the multi-return typing audit first.
+2. **`: ptr` from `-> ptr` flows** — GATED, and now with the concrete
+   reason: unlike float (where E232 made bare candidates impossible),
+   `auto p; p = malloc(64);` is LEGAL today, so ptr promotion would change
+   put()/W032 dispatch in living programs — it breaks the zero-regression
+   property increments 1+3 were built on. Needs its own arc (likely a
+   W-diagnostic first). Rule 28 evidence required.
+3. **Multi-assign targets** — SHIPPED 2026-07-04, same commit family as
+   inc 1. add_type's T_ASSIGN multi path types EVERY target from the
+   callee's DECLARED ret-slot type (get_fn_ret_type_at), then the same
+   save_fn_types sweep promotes the float ones. Before: targets 2..N of a
+   bare multi-assign silently read the WRONG register bank. gen1==gen2
+   byte-identical again (the compiler has no bare float multi-assigns).
 
 ## Verification per increment
 
