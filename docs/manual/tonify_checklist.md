@@ -431,36 +431,32 @@ source bytes so codegen sees a normal float literal. Bit-pattern
 intent (hex), demotion concerns (typed int local), and compound
 expressions remain explicit by design.
 
-### `const` demotes float literals just like bare `auto`
+### `const` and float literals — RESOLVED (single literals work, arithmetic refuses)
 
-`const NAME = 0.001;` stores a parsed-int 0, NOT the IEEE bits of
-0.001. The const declaration has no type annotation slot in v0.23.x,
-so a float literal at the right-hand side is silently demoted at
-parse time. Subsequent uses see zero, not the intended fraction.
+> **Status 2026-07-03 — the demotion class is CLOSED.** Three arcs got it
+> there: the Excalibur gap-B fast path (`const TOL = 0.0001;` preserves
+> IEEE bits via SHAPE_DECIMAL rebuild), the negative-literal fix
+> (`const N = -0.25;` — used to silently become 175 through the integer
+> evaluator; `tests/test_const_float.bpp` pins both signs, and the const
+> SLOT variants `global const` / `static const` now store real IEEE bits
+> too), and **E267** (know-or-refuse: any decimal shape the fast paths
+> do not cover — e.g. `const X = 2.5 * 2.0;` float arithmetic — is a
+> clean compile error instead of silent garbage). The historical text
+> below is kept only for the discovery story; the "use an auto local"
+> workaround is NO LONGER required for single float literals.
 
-**Status post-Excalibur 1.B**: still broken. Session 1.B fixed only
-the call-site widening for decimal int literals. The const-storage
-demotion is a separate language gap that needs `const` to learn float
-typing at the slot level — tracked for a future Excalibur session
-or independent compiler sidequest. Until then, the `auto local: float`
-workaround below is the safe pattern.
+| Pattern | Status today |
+|---------|--------------|
+| `const TOL = 1e-9;` / `const PI = 3.14159;` | ✅ works — IEEE bits preserved |
+| `const N = -0.25;` (negated literal) | ✅ works (fixed 2026-07-03) |
+| `global const G = 2.5;` / `static const S = -3.5;` | ✅ works — real float slot, auto-typed TY_FLOAT (fixed 2026-07-03) |
+| `const X = 2.5 * 2.0;` (float arithmetic) | ❌ E267 — compute in an `auto x: float` local instead |
+| `const N = 8;` (integer) | ✅ unchanged |
+| `const NAME = "label";` (string) | ✅ unchanged |
 
-Discovered 2026-05-09 while writing `tests/test_json_float.bpp` —
-`const _JSON_FLOAT_TOL = 0.000000001;` was 0 at every comparison
-site, making `diff > tol` always true and the test always fail.
-Replacement: declare a local instead, with the annotation:
-
-```b++
-auto tol_floor: float;
-tol_floor = 0.000000001;
-```
-
-| Pattern | Action |
-|---------|--------|
-| `const TOL = 1e-9;` (float literal at RHS) | Use `auto tol: float;` local with the same value, OR move the literal to the only call site that needs it |
-| `const PI = 3.14159;` ditto | Same — local annotated `: float` |
-| `const N = 8;` (integer) | Fine, `const` works for ints |
-| `const NAME = "label";` (string) | Fine, `const` works for string-pool refs |
+Discovery story (2026-05-09): `const _JSON_FLOAT_TOL = 0.000000001;`
+was 0 at every comparison site, making `diff > tol` always true —
+the bug class that motivated the whole arc.
 
 W027 (the diagnostic that catches `auto` demotion) does NOT fire on
 `const`, so the pitfall is silent — easy to miss in code review.
@@ -995,16 +991,16 @@ These are compiler bugs or limitations that affect tonification. They are
 documented here so nobody hits them again. Each one has a corresponding
 diagnostic code in `warning_error_log.md`.
 
-### Pitfall 1: `static const` does not work at file scope
+### Pitfall 1: `static const` at file scope — RESOLVED 2026-05-14
 
-`static const X = 16;` compiles without error but the value is **0 at
-runtime**. The `const` inlining does not fire when combined with `static`.
-This causes silent bugs: variables that should be 16 are 0, leading to
-division by zero, null pointer dereference, etc.
-
-**Workaround**: use `auto X;` with assignment in the init function.
-**Diagnostic**: E230 (fatal error if `static const` is used at file scope).
-**Fix needed**: the parser/codegen must handle `static` + `const` together.
+**HISTORICAL.** `static const X = 16;` is now a real module-private
+read-only `.data` slot (the storage-class sidequest: E263 rejects
+writes, E264 catches unresolved extrns; see Rule 1's decision table).
+Float literals in these slots also work since 2026-07-03, both signs
+(`tests/test_const_float.bpp`). The old failure mode ("compiles but 0
+at runtime") and its E230 guard no longer exist — `diag_error(230)` is
+gone from the source. Kept only so readers of old code comments know
+the trap this once was.
 
 ### Pitfall 2: 1-cycle bootstrap oscillation is normal after codegen changes
 
