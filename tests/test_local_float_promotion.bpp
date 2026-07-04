@@ -1,0 +1,66 @@
+// test_local_float_promotion.bpp — T2 stage 1: local float smart-promotion.
+//
+// `auto x; x = 3.14;` used to be E232-fatal ("annotate : float"). The T2
+// sweep (save_fn_types, docs/plans/t2_local_float_promotion.md) now writes
+// the inferred TY_FLOAT back into the declaration's own hint slot, so every
+// downstream consumer — E232, native slot layout, the C emitter's `double`,
+// put's float dispatch, float argument banking — behaves as if the
+// annotation were written by hand. This test pins the positive shapes and
+// the conservative negatives (the disqualifiers must keep their existing
+// behaviour; the compile-error negatives live in their own xfail files).
+
+struct Pt { x: float, y: float }
+
+half_of(v: float) -> float { return v * 0.5; }
+
+fabs_f(x: float) -> float {
+    if (x < 0.0) { return -x; }
+    return x;
+}
+
+main() {
+    // ── promoted: literal store ───────────────────────────────────────
+    auto sr;
+    sr = 44100.0;
+    if (fabs_f(sr - 44100.0) > 0.0001) { putmsg("FAIL: literal promotion");   return 1; }
+
+    // ── promoted: float flows through as a real float argument ────────
+    if (fabs_f(half_of(sr) - 22050.0) > 0.0001) { putmsg("FAIL: promoted arg banking"); return 2; }
+
+    // ── promoted: call-result store ───────────────────────────────────
+    auto g;
+    g = half_of(2.5);
+    if (fabs_f(g - 1.25) > 0.0001) { putmsg("FAIL: call-result promotion");   return 3; }
+
+    // ── promoted THEN int store: float slot converts (like `: float`) ──
+    auto x;
+    x = 3.14;
+    x = 5;
+    if (fabs_f(x - 5.0) > 0.0001) { putmsg("FAIL: mixed-store widening");     return 4; }
+
+    // ── promoted: arithmetic between two promoted locals ──────────────
+    auto acc;
+    acc = sr * 0.001 + g;              // 44.1 + 1.25
+    if (fabs_f(acc - 45.35) > 0.001) { putmsg("FAIL: promoted arithmetic");   return 5; }
+
+    // ── NOT promoted: int-only local stays int ────────────────────────
+    auto i;
+    i = 7;
+    i = i + 1;
+    if (i != 8) { putmsg("FAIL: int local disturbed");                        return 6; }
+
+    // ── NOT promoted: explicit `: word` consent-truncation unchanged ──
+    auto t: word;
+    t = sr;                            // float variable -> int, consented
+    if (t != 44100) { putmsg("FAIL: consented truncation changed");          return 7; }
+
+    // ── NOT promoted: struct-typed local keeps its pointer nature ─────
+    auto p: Pt;
+    p = malloc(sizeof(Pt));
+    p.x = 1.5;
+    if (fabs_f(p.x - 1.5) > 0.0001) { putmsg("FAIL: struct local disturbed"); return 8; }
+    free(p);
+
+    putmsg("PASS: bare float locals promote; ints, consents and structs untouched");
+    return 0;
+}

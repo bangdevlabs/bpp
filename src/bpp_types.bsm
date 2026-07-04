@@ -37,7 +37,14 @@ struct VtEntry {
     name,    // packed name of the local
     type,    // TY_* code (TY_WORD, TY_FLOAT, etc.)
     locked,  // 1 = explicit annotation pinned the type (no widening)
-    elem     // for TY_ARR locals: element type (TY_WORD default)
+    elem,    // for TY_ARR locals: element type (TY_WORD default)
+    hslot,   // address of this local's per-name hint slot in its T_DECL's
+             // n.e array (0 when the local never went through T_DECL, e.g.
+             // parameters). Written back by the T2 float smart-promotion
+             // sweep in save_fn_types so an inferred float becomes a real
+             // annotation for codegen + validate.
+    ataken   // 1 once &name is seen anywhere in the function — promotion
+             // must not silently change what the bytes at that address mean
 }
 static auto ty_vt;
 
@@ -188,6 +195,8 @@ void ty_set_var_type(name_p, ty) {
         }
     }
     // New local variable: append to table, unlocked, word element by default.
+    // No hint slot: this entry did not come from a T_DECL, so the T2
+    // promotion sweep skips it (nothing to write an annotation into).
     auto idx;
     idx = arr_struct_alloc(ty_vt);
     e = arr_struct_at(ty_vt, idx);
@@ -195,6 +204,25 @@ void ty_set_var_type(name_p, ty) {
     e.type   = ty;
     e.locked = 0;
     e.elem   = TY_WORD;
+    e.hslot  = 0;
+    e.ataken = 0;
+}
+
+// Mark a local as address-taken. The T_ADDR handler calls this whenever the
+// operand of `&` is a plain variable; the T2 float smart-promotion sweep
+// refuses to promote such locals (the caller may be reading or writing raw
+// bytes through the pointer, and changing the slot's type behind that
+// pointer's back would be a silent reinterpretation).
+static void _ty_mark_addr_taken(name_p) {
+    auto i, n, e: VtEntry;
+    n = arr_struct_count(ty_vt);
+    for (i = 0; i < n; i++) {
+        e = arr_struct_at(ty_vt, i);
+        if (packed_eq(e.name, name_p)) {
+            e.ataken = 1;
+            return;
+        }
+    }
 }
 
 // Lock a variable's type. Subsequent ty_set_var_type calls become no-ops, so
@@ -583,9 +611,16 @@ add_type(nd) {
         return TY_WORD;
     }
 
-    // Address-of: &x always returns a pointer (integer address).
+    // Address-of: &x always returns a pointer (integer address). When the
+    // operand is a plain local, remember that its address escaped — the T2
+    // float promotion sweep must leave such locals alone (see VtEntry.ataken).
     if (t == T_ADDR) {
+        auto _adr_v: Node;
         add_type(n.a);
+        _adr_v = n.a;
+        if (_adr_v != 0) {
+            if (_adr_v.ntype == T_VAR) { _ty_mark_addr_taken(_adr_v.a); }
+        }
         n.itype = TY_WORD;
         return TY_WORD;
     }
@@ -703,6 +738,12 @@ add_type(nd) {
                 e.type   = TY_UNK;
                 e.locked = 0;
                 e.elem   = TY_WORD;
+                // Remember where this name's per-declarator hint slot
+                // lives so the T2 promotion sweep (save_fn_types) can
+                // write an inferred `: float` back into the declaration.
+                e.hslot  = 0;
+                if (hints_arr != 0) { e.hslot = hints_arr + i * 8; }
+                e.ataken = 0;
             }
         }
         if (hints_arr != 0) {
@@ -795,6 +836,39 @@ add_type(nd) {
 void save_fn_types(func_idx) {
     auto block, i, cnt, e: VtEntry, m: FnMeta;
     cnt = arr_struct_count(ty_vt);
+
+    // ── T2: local float smart-promotion ──────────────────────────
+    // A bare `auto x;` whose inference settled on exact TY_FLOAT gets its
+    // inferred type written back into the declaration's own hint slot —
+    // from here on, every consumer (E232 in validate, native slot layout
+    // via cg_decl_var_hint, the C emitter's `double`, put's dispatch)
+    // behaves as if the programmer wrote `: float`. The annotation is
+    // written by the compiler; the programmer only annotates when intent
+    // is genuinely ambiguous. Conservative by design — skip when:
+    //   locked   — an explicit annotation already decided;
+    //   != FLOAT — only the exact full-width float promotes (slices and
+    //              everything else stay strict opt-in);
+    //   ataken   — &x escaped; retyping the slot would silently change
+    //              what the bytes at that address mean;
+    //   hslot 0  — no declaration slot to write (parameters, locals first
+    //              seen at an assignment);
+    //   slot set — a hint is already there (defensive; locked covers it);
+    //   struct   — the parser's struct table owns this name's identity.
+    // Because a float store into a bare local was E232-fatal before this
+    // sweep existed, no previously-compiling program has candidates: the
+    // sweep only legalises programs the compiler used to reject.
+    auto _pe: VtEntry;
+    for (i = 0; i < cnt; i++) {
+        _pe = arr_struct_at(ty_vt, i);
+        if (_pe.locked)          { continue; }
+        if (_pe.type != TY_FLOAT) { continue; }
+        if (_pe.ataken)          { continue; }
+        if (_pe.hslot == 0)      { continue; }
+        if (*(_pe.hslot) != 0)   { continue; }
+        if (get_var_type_in_fn(_pe.name, func_idx) >= 0) { continue; }
+        *(_pe.hslot) = TY_FLOAT;
+    }
+
     block = buf_byte(cnt * 24);
     for (i = 0; i < cnt; i++) {
         e = arr_struct_at(ty_vt, i);
