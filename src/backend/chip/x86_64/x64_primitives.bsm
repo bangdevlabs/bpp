@@ -296,14 +296,17 @@ static _x64_cc_int(cond_id) {
     if (cond_id == CG_CC_HS) { return CC_AE; }   // unsigned >=
     return CC_E;
 }
+// Only GT / GE map through this table — the ABOVE family is the one
+// pair of condition codes that is already false when UCOMISD reports
+// unordered (a NaN operand sets ZF = PF = CF = 1). EQ / NE / LT / LE
+// need dedicated sequences in _x64_emit_cmp_flt below; routing them
+// through a bare setcc silently mis-answered every NaN comparison
+// (NaN == NaN read as 1, NaN != NaN as 0, NaN < x as 1) — found
+// 2026-07-03 when the DSP hostile-parameter test hung on x64 only.
 static _x64_cc_flt(cond_id) {
-    if (cond_id == CG_CC_EQ) { return CC_E;  }
-    if (cond_id == CG_CC_NE) { return CC_NE; }
-    if (cond_id == CG_CC_LT) { return CC_B;  }
-    if (cond_id == CG_CC_LE) { return CC_BE; }
     if (cond_id == CG_CC_GT) { return CC_A;  }
     if (cond_id == CG_CC_GE) { return CC_AE; }
-    return CC_E;
+    return CC_A;
 }
 
 // Integer compare: rax := (rax <cond> rcx) ? 1 : 0.
@@ -332,9 +335,52 @@ void _x64_emit_cmp_branch_rr(cond_id, lreg, rreg, lbl) {
 }
 
 // Float compare: rax := (xmm1 <cond> xmm0) ? 1 : 0.
-// ucomisd + setcc + movzx.
+//
+// IEEE-correct under UCOMISD's unordered result (any NaN operand sets
+// ZF = PF = CF = 1) — the same lowering gcc/clang use:
+//   LT / LE — swap the operand order and use the ABOVE family: CC_A /
+//             CC_AE read CF (and ZF) as zero, so unordered yields 0.
+//   GT / GE — ABOVE family directly, unordered yields 0 already.
+//   EQ      — ZF alone is a lie for NaN (unordered sets it): the true
+//             answer is ZF AND NOT PF, built from two setcc + an AND.
+//   NE      — the complement: NOT ZF OR PF, two setcc + an OR. This is
+//             what makes the `x != x` NaN idiom work on x64 — a64's
+//             FCMP gets it right by ISA design, and the DSP totality
+//             guards (sin_f/exp_f) depend on it on every backend.
+// rcx is the designated scratch register (same convention as the int
+// compare's right operand), free at this point in the accumulator flow.
 void _x64_emit_cmp_flt(cond_id) {
-    x64_enc_ucomisd(1, 0);
+    if (cond_id == CG_CC_LT) {
+        x64_enc_ucomisd(0, 1);            // flags = xmm0 ? xmm1 (right vs left)
+        x64_enc_setcc(CC_A, 0);           // left < right  ==  right > left
+        x64_enc_movzx8(0, 0);
+        return;
+    }
+    if (cond_id == CG_CC_LE) {
+        x64_enc_ucomisd(0, 1);
+        x64_enc_setcc(CC_AE, 0);
+        x64_enc_movzx8(0, 0);
+        return;
+    }
+    if (cond_id == CG_CC_EQ) {
+        x64_enc_ucomisd(1, 0);
+        x64_enc_setcc(CC_E, 0);           // al = ZF
+        x64_enc_setcc(CC_NP, 1);          // cl = !PF (0 when unordered)
+        x64_enc_movzx8(0, 0);
+        x64_enc_movzx8(1, 1);
+        x64_enc_and_reg(0, 1);            // rax = ZF && !PF
+        return;
+    }
+    if (cond_id == CG_CC_NE) {
+        x64_enc_ucomisd(1, 0);
+        x64_enc_setcc(CC_NE, 0);          // al = !ZF
+        x64_enc_setcc(CC_P, 1);           // cl = PF (1 when unordered)
+        x64_enc_movzx8(0, 0);
+        x64_enc_movzx8(1, 1);
+        x64_enc_or_reg(0, 1);             // rax = !ZF || PF
+        return;
+    }
+    x64_enc_ucomisd(1, 0);                // GT / GE — unordered-safe as-is
     x64_enc_setcc(_x64_cc_flt(cond_id), 0);
     x64_enc_movzx8(0, 0);
 }

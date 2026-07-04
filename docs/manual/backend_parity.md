@@ -33,6 +33,7 @@ always confirm a codegen change with the Docker self-host (`gen1 == gen2`).
 | `: double` 128-bit SIMD + 4×f32 `vec_*` (B4) | ✅ NEON | ✅ SSE2 | parity |
 | Byte-wide SIMD (`vec_load16b` … `vec_movemask`) | ✅ NEON | ✅ SSE2 (`PMOVMSKB`) | parity |
 | Multi-value return banking | ✅ x0..x7/d0..d7 | ✅ rax,rdx,rcx,rsi,rdi,r8-r10/xmm0-7 | parity (custom window) |
+| IEEE NaN float-compare semantics (`NaN != NaN` true, orderings false) | ✅ FCMP (by ISA design) | ✅ fixed 2026-07-03 (UCOMISD unordered: LT/LE swap+ABOVE, EQ/NE fold PF; was silently wrong for EQ/NE/LT/LE — `tests/test_float_nan_cmp.bpp` is the gate) | parity |
 | Autovec + outline (loop→worker, SIMD synth) | ✅ | ✅ | parity (shared spine) |
 | Dynamic linking / FFI externs | ✅ Mach-O | ✅ ELF PLT/GOT | parity |
 | Immediate-form shift (`<<`/`>>` by a constant) | ✅ SBFM/UBFM | ✅ `C1 /4,/5,/7` | parity (shared spine peephole) |
