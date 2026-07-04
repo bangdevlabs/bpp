@@ -518,10 +518,15 @@ The compiler emits the NARROWEST instruction that fits:
 - `*(p + i) = val` with `p: half` — `strh` on aarch64
 - `auto f: float; f = 3.14;` — materializes in `d0` (FP reg)
 
-Without annotations, everything defaults to word (8 bytes), with ONE
-deliberate exception: a bare local whose stores are float is promoted
-to `: float` by the compiler (T2 smart-promotion, 2026-07-04 — the
-inferred type is written back into the declaration's own hint slot).
+Without annotations, everything defaults to word (8 bytes), with TWO
+deliberate exceptions (T2 smart-promotion, 2026-07-04 — the inferred
+type is written back into the declaration's own hint slot):
+- a bare local whose stores are float promotes to `: float`;
+- a bare local whose stores are all STRINGS (literals, `-> str`
+  producers) promotes to `: str` — and an unannotated PARAMETER whose
+  every call site passes a string infers `: str` by whole-program
+  consensus (increment E), so `greet(who) { put("hi ", who); }` prints
+  text with zero annotations.
 Sub-word hints stay strictly opt-in — an un-hinted `auto` NEVER
 becomes `: byte` / `: half` / `: half float` even if the assigned
 value fits: width and precision slices are the programmer's explicit
@@ -762,7 +767,7 @@ void print_greeting() {
 physics_tick(world, dt: float) { ... }
 
 // With explicit return type — `->` glyph (NOT `:`):
-path_asset(relpath: ptr) -> ptr { ... }
+path_asset(relpath: str) -> str { ... }
 sin_f(x: float) -> float { ... }
 
 // With effect annotation (see §5.4):
@@ -811,7 +816,7 @@ that has an annotation must repeat the annotation:
 
 ```c
 stub compute(x)@safe;            // stub carries the effect signature
-stub path_asset(relpath: ptr) -> ptr;   // stub carries the return type
+stub path_asset(relpath: str) -> str;   // stub carries the return type
 ```
 
 ### §5.3 — Visibility
@@ -1747,7 +1752,8 @@ runtime cost.
 `put(x)` is the primary output function. The compiler rewrites it at compile time based on the inferred type of `x` — same philosophy as `auto x = 3.14`:
 
 ```c
-put("hello\n")    // TY_PTR   → putstr("hello\n")
+put("hello\n")    // TY_STR   → putstr("hello\n") — string literals ARE str;
+                  //   a bare `: ptr` prints its ADDRESS (increment D, 2026-07-04)
 put(42)           // TY_WORD  → putnum(42)
 put(3.14)         // TY_FLOAT → putfloat(3.14) — 4 decimal places
 ```

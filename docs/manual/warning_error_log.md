@@ -52,6 +52,7 @@ noise.
 
 | Code | Message | File | Line | Has loc? | Trigger |
 |------|---------|------|------|----------|---------|
+| W032 | ambiguous `put`/`put_err` on a TY_WORD variable | bpp_types.bsm | _put_warn_ambiguous | ✅ | Smart dispatch picked the integer formatter for a variable that might have been a string. **DEFERRED since 2026-07-04 (T2 inc E):** candidates collect during inference and only FLUSH after str-parameter consensus settles — the compiler never warns about an ambiguity it fixes itself (a param every caller feeds a string becomes `: str` and dispatches putstr). An explicit `: ptr` also never warns since increment D: printing an opaque pointer's ADDRESS is the annotation's stated meaning. Survivors are the genuinely ambiguous bare-word cases (e.g. `put(malloc(...))`-era code); help text points at `: str`. |
 | E001 | recursive import | bpp_import.bsm | 756 | ❌ | Module imports itself |
 | E002 | import/load not found | bpp_import.bsm | 977 | ❌ | File not found in search paths |
 | E050 | struct field type mismatch | bpp_validate.bsm | 218 | ❌ | Struct field with wrong type |

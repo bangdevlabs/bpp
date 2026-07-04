@@ -94,3 +94,20 @@ in the design space none of the peers occupy: **own backend + sub-second
 self-host + integrated engine + a typeless-B-to-smart-hints language**, with
 the codegen gap small enough that it is, for game work, mostly a non-issue —
 and shrinking. The story of the last two months is exactly that gap closing.
+
+
+## Addendum 2026-07-04 — the typing era
+
+Two days of Fable-5 scrutiny turned the "smart + weak" typing story into a
+sharper claim: **terse like B, predictable like the strict languages** —
+without adding a single mandatory annotation. Floats and strings now FLOW
+(literal / producer signature → locals by store-purity → parameters by
+whole-program call-site consensus → correct smart dispatch), `: ptr`
+finally means only "opaque address" (put prints the number), and the two
+annotations that remain on purpose are the two that carry MEANING: the
+int→float widening cast and the precision slices. ~280 crutch annotations
+left the repo; the conformance corpus now teaches the terse style. None
+of the peer languages (Zig / Odin / Jai) infer parameter types from
+call-site consensus with dispatch re-fire. The gauntlet that landed it:
+every increment zero-regression by construction, whole benchmark catalog
+at parity, ~30 consecutive byte-identical audio renders.

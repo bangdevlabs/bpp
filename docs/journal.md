@@ -14932,3 +14932,84 @@ green. tests/ deliberately unswept (they pin annotation-era diagnostics on
 purpose). Render md5 byte-identical through every batch
 (`f61fac72be5077a6e9ef9cae21dde2a1`) — promotion ≡ annotation, proven on the
 audio itself. Native 228/0/12, C-emit 189/0/51, bootstrap 0.29-0.32s.
+
+## 2026-07-04 (later) — the str era lands whole: TY_STR, consensus parameters, the D flip, and the debugger learns to see inlining
+
+The morning entry closed with inc 2 "gated". By nightfall the entire arc
+had shipped, because each step's blocker turned out to be a REAL bug
+wearing a design costume.
+
+**TY_STR** (`3c81b5f`): a pointer whose bytes are a C string — encoded as
+TY_PTR | bit 8, NOT a new base, after a near-disaster taught the encoding
+rules: the first draft picked base 0x05, and `is_float_type` is literally
+`ty & 1` — every string would have banked in FLOAT registers. Riding
+BASE_PTR gives width/arith/is_ptr_type/promote for free; only smart
+dispatch reads the flag. Producers annotate once (`str_dup -> str`,
+`path_asset -> str`); literals ARE str; the T2 sweep propagates to bare
+locals — with a purity guard float never needed (`s = 0;` is the
+universal release idiom; an int store into a float local CONVERTS, into a
+str hint it CONFLICTS — found when the bug binary's own sources stopped
+compiling).
+
+**Increment E** (`8f95018`) — the user's utopia realized: an unannotated
+parameter every caller feeds a string IS a string.
+`greet(who) { put("hello, ", who, "!\n"); }` prints text, zero
+annotations. Built by resurrecting `propagate_call_params` — a walker
+written for any-site float propagation and NEVER WIRED (that policy would
+have E240'd every mixed caller; whole-program CONSENSUS is the correct
+one: all sites agree or the param stays word; fn_ptr-taken functions
+poison — their indirect sites are invisible). Changed functions re-infer;
+put dispatch re-fires via markers (variadic subcalls included); chains
+converge one link per round. Three latent defects died en route:
+Node.itype was byte-wide (TY_STR's bit 8 truncated on every AST stamp —
+the local flow had been working BY LUCK through the PTR dispatch branch;
+fn-type ids had overflowed that byte since they existed), the walker
+predated the ternary (a call inside `c ? f(x) : y` was invisible), and
+multi-value returns never walked. W032 became DEFERRED — collected at
+inference, flushed after consensus — so the compiler never warns about an
+ambiguity it fixes itself moments later.
+
+**B' + D** (`cc257b6` + `44ed999`): 113 string-meaning `: ptr` params
+renamed `: str` (+ 6 `-> str` returns), then the breaking flip — put of a
+bare `: ptr` prints the ADDRESS, putstr keys on STR alone, and the
+annotation suppresses W032. The flip broke NOTHING: full suites + the
+render md5 held, which is the proof the rename swept every observable
+site. `: ptr` finally means what it says.
+
+**Round 4** (`930601f`) — the backlog edge pulled three type laws out:
+the Phase D.4 parser inlining rewrites buf_byte/buf_word into direct
+`malloc` calls, and malloc had NO registered return type, degrading whole
+expressions to word (that's why `p: ptr = buf_byte(4)` E053'd while the
+user-defined `-> ptr` twin compiled). So: (1) the allocator family
+(malloc / malloc_aligned / realloc) joins _builtin_ret_type as TY_PTR —
+safe ONLY because increment D made put(ptr) print addresses; arena_new
+and arr_push annotate their own signatures; (2) an explicit `-> T` is a
+CONTRACT, re-asserted after the body walk (promote()'s PTR-wins had
+silently overridden `arr_new() -> array` the moment malloc got typed);
+(3) ptr − ptr types WORD (C's ptrdiff) — `b - a == 8` is a length check,
+not an E243 pointer-vs-literal bug. Fallout was didactic: a pre-T2 relic
+in test_builtin_peek_lifted (`auto fbuf: float; fbuf = buf + 0.0;` — an
+address smuggled through a float local) is now rightly rejected.
+
+**The catalog** (`337ce47`): full re-run per the standing discipline —
+every row in band, every checksum identical, sf_bench 11.2 ms/266×
+within noise, the audio md5 on something like its 30th consecutive
+identical render across the era. A type-system era including a breaking
+dispatch flip, and the catalog never flinched.
+
+**The debugger catches up** (`c609793`): each piece born from a scar.
+`--break fn` now covers every v5 inline-splice site ("inlined at 2 call
+site(s) — all covered") — killing the trap that derailed round 4's own
+debugging (entry breakpoints are blind where the inliner spliced; that
+day it took file:line + temp instrumentation to see anything). Stops
+inside a splice re-attribute truthfully: `-> half_of [inlined in main]` —
+the v5 section's original purpose, finally wired, both observers. And map
+v7 widens every TYPE field u8 → u16 — the .bug writer had the SAME
+truncation wart as Node.itype, so `: str` dumped as `ptr`; now
+`bug --dump` prints `argv_get(i) -> str` and means it.
+
+Docs synced in the same sweep: Rule 13/17/19 rewritten for the str world,
+W032 finally has its log row (it never had one), debug_with_bug gains the
+inline-aware section, positioning gains the typing-era addendum. Two days
+of Fable 5: nine silent bugs, two type laws, the full T2 arc, ~280
+annotations gone, and a debugger that understands the compiler it debugs.

@@ -756,6 +756,7 @@ investigation.
 | Phase 6.5  | `caller(n)` sugar wrapper over `caller_pc` + `caller_name` | deferred (YAGNI — no consumer yet) |
 | CLI / disasm | `bug` re-split as the Linux-capable CLI (`src/bug.bpp`); `--bytes` + `--disasm` objdump-in-bug; v6 line table source interleaving; ELF/x86-64 **and** Mach-O/arm64 parity (2026-05-28 → 29) | shipped |
 | `file:line` + NEON | `--break file:line` via the v6 line table (mid-function locals, both observers); reader sizes buffers to the file (large maps like the compiler's own ~550KB load in full); `--disasm` decodes NEON `ldr q`/`str q` + `dup`/`fmul.4s`-family + scalar `fmadd` (2026-06-15) | shipped |
+| Inline-aware breaks + map v7 | `--break fn` / TUI `b fn` also cover every v5 inline-splice site ("inlined at N site(s) — all covered"); stops inside a splice re-attribute to the inlined callee (`-> half_of [inlined in main]`); map v7 widens every TYPE field u8 → u16 so `: str` (TY_STR = 0x104) dumps truthfully — v4-v6 maps still load (2026-07-04) | shipped |
 
 Phase 6 detail: see the planning doc archived at
 `legacy_bootstrap/legacy_docs/bug_phase6_plan.md` (kept for

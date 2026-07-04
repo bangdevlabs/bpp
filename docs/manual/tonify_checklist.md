@@ -527,8 +527,8 @@ expectations to every caller.
 | `pos_set(x, y)` where both are word | Keep as-is — word is the default |
 | `set_color(r, g, b, a)` where all are float | Add: `set_color(r: float, g: float, b: float, a: float)` |
 | `set_pixel(x: byte, y: byte, c: byte)` already follows the rule | No change |
-| `sound_load_wav(path)` where `path` is a C-string pointer | Add: `sound_load_wav(path: ptr)` |
-| `image_load(path)` where `path` is a string pointer | Add: `image_load(path: ptr)` |
+| `sound_load_wav(path)` where `path` is a C-string pointer | Usually NOTHING — call-site consensus (T2 inc E) infers `: str`; annotate `path: str` only when the sites are invisible (fn_ptr dispatch) |
+| `image_load(path)` where `path` is a string pointer | Same — consensus covers it; the explicit form is `path: str` |
 
 **`: str` vs `: ptr` (split 2026-07-04, T2 inc 2/D).** `: str` = a
 pointer whose bytes are a C string (put/put_err dispatch putstr);
@@ -565,7 +565,7 @@ ambiguous `put` / `put_err` call. Fires when smart dispatch picks
 `putnum` / `putnum_err` because the argument is a TY_WORD variable
 (parameter default OR untyped local) — but the call might have
 been intended as a string print whose pointer is being formatted as
-a decimal integer. The fix is either `param: ptr` on the declaration
+a decimal integer. The fix is either `param: str` on the declaration
 (smart dispatch then routes to `putstr` / `putstr_err`) or calling
 `putnum` / `putnum_err` directly to acknowledge the integer intent.
 Literals like `put(42)` never warn — they are obviously intentional.
@@ -579,16 +579,17 @@ output side of a function arrow). Same convention as Rust /
 Python / Swift / C++11+ trailing-return / TypeScript.
 
 ```bpp
-// Public API: declares the function returns a pointer. Callers
-// can write `auto local: ptr = path_asset("foo");` without E053,
-// and `put(path_asset(...))` routes through putstr (no W032).
-path_asset(relpath: ptr) -> ptr {
+// Public API: declares the function returns a C STRING. Callers
+// can chain the result, and `put(path_asset(...))` routes through
+// putstr (str drives the dispatch since the 2026-07-04 split —
+// a bare `-> ptr` return prints as an ADDRESS).
+path_asset(relpath: str) -> str {
     ...
-    return out;             // out is a malloc'd byte buffer
+    return out;             // out is a malloc'd NUL-terminated path
 }
 
 // stub form: same annotation on the declaration.
-stub path_asset(relpath: ptr) -> ptr;
+stub path_asset(relpath: str) -> str;
 
 // Higher-order: outer fn-def uses `->`, inner fn-type also uses `->`.
 make_handler() -> func(float) -> word {
@@ -616,7 +617,8 @@ both concepts. Mixing them is a parser error since the
 
 | Pattern | Action |
 |---------|--------|
-| Public function returning a malloc'd pointer (`str_dup`, `path_asset`, `image_load`, `strbuf_new`) | Annotate `-> ptr` so callers can chain without workarounds |
+| Public function returning a C STRING (`str_dup`, `path_asset`, dialog paths) | Annotate `-> str` — str-ness then FLOWS (locals promote, params infer by consensus, put dispatches putstr) |
+| Public function returning an opaque pointer (`buf_byte`, `arena_new`, plugin `_new`s) | Annotate `-> ptr` — put prints the address; typed-local assigns compat-check |
 | Public function returning a float (`game_dt`, `sin_f`, `cos_f`) | Annotate `-> float` (or `-> half float` for 32-bit precision) |
 | Public function returning a sub-word int by intent (rarely needed) | Annotate the matching slice type; usually unnecessary |
 | Static helpers used only in this file | Skip — flow analysis covers the call site |
@@ -787,7 +789,7 @@ the typed variant manually.
 | Before | After | Notes |
 |--------|-------|-------|
 | `putnum(i);` | `put(i);` | int/word |
-| `putstr(s);` | `put(s);` | pointer → treated as C-string |
+| `putstr(s);` | `put(s);` | STR (literal / `-> str` flow / `: str`) → putstr; a bare `: ptr` prints its ADDRESS since increment D |
 | `putfloat(f);` | `put(f);` | float |
 | `putnum_err(n);` | `put_err(n);` | stderr version |
 | `putstr_err(s);` | `put_err(s);` | stderr version |
@@ -865,7 +867,7 @@ on null-terminated C-strings.
 |----------|-----------|-------|
 | `str_cpy(dst, src)` | `→ len` | strcpy into dst; returns bytes written |
 | `str_cat_raw(dst, src)` | `→ len` | strcat into dst (dst must have space) |
-| `str_dup(s)` | `→ new_ptr` | malloc + copy; caller frees |
+| `str_dup(s)` | `-> str` | malloc + copy; caller frees. The `-> str` is where str-ness ENTERS the flow |
 | `str_from_int(val, buf)` | `→ len` | itoa into buf; returns number of digits written |
 
 ### `strbuf` — dynamic string builder
