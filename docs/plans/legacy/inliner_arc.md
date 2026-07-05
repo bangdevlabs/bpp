@@ -916,3 +916,19 @@ VOID-inlineable targets. Spring hot loop 59.9 → 36.2 ms (1.65×), md5
 unchanged, +6% binary accepted. Named next: VI doesn't fire on statement
 calls inside CLONE-SUBSTITUTED bodies (4 `delay_push` bls survive in
 spring_process), and the gcc -O2 spring oracle sits at 8.3 ms (4.3×).
+
+## Post-close addendum — Nested-VI (2026-07-05)
+
+The named next increment above, CLOSED. One edit in
+`_inline_find_nested_calls` (bpp_dispatch.bsm): admit `fn_void_inlineable`
+targets, mirroring the top-level walker's own VI branch — registration
+and splice agree on set+order by construction because both sides run
+this one function. `spring_process` 4 `bl` → **0 bl** (fully flat,
+disasm-verified); acc bit-identical native + x64-Docker; Docker
+self-host gen1==gen2; md5 unchanged; catalog at parity; binary +1.4%.
+Wall-clock only ~7% on the spring scratch (42→39 ms min-of-7) — the
+splice grew the body 219→325 insns (unpromoted mangled slots spill), so
+the remaining ~2× vs the oracle is spill quality (RegAlloc Stage-F) +
+scheduling, not calls. Tier-3 hot-only nested targets remain the one
+deliberately-unhandled shape in the discovery walk. See benchmarks.md
+2026-07-05 for the full honest record.

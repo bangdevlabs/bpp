@@ -764,3 +764,54 @@ bench_codegen spot: biquad 43.9 / lcg 18.3 / xform 6.7 / manylive
 101.5 ms — at or better than the morning band. Remaining spring gap is
 the named nested-VI miss (4 `delay_push` bls survive inside cloned
 bodies) plus scheduling.
+
+### 2026-07-05 — Nested-VI: the last per-sample bls leave spring_process
+
+The one-edit increment lever-1 named: `_inline_find_nested_calls` now
+admits VOID-inlineable targets (mirroring the top-level walker's own VI
+branch exactly, so registration time and splice time agree by
+construction — both run through the same discovery function). A
+statement call like `delay_push(...)` inside a clone-substituted body
+used to survive as a real `bl` because `ast_clone_subst` resets the
+clone's `.e` and only the nested-discovery walk can re-stamp it.
+
+**The mechanism metric (the honest headline): `spring_process` went
+4 `bl` → 0 `bl`** — fully flat, disasm-verified, the exact 4
+`delay_push` sites lever-1 left on the table. Wall-clock on the
+recreated spring scratch bench (2M `spring_process` samples with a
+serially-dependent input; NOT the same scratch shape as lever-1's
+table above — do not compare rows across the two entries):
+
+| build | 2M samples (min-of-7) | vs clang -O2 same source (~20 ms) |
+|---|---|---|
+| pre-fix | 42 ms | 2.1× |
+| **nested-VI** | **39 ms** | **~1.95×** |
+
+**~7% wall — a real but modest win, reported honestly:** the 4 removed
+call/returns were partly offset by the splice growing the body 219 →
+325 instructions (each spliced `delay_push` re-derives its struct
+pointer through an unpromoted mangled slot — B3's budget is exhausted
+by this point, so several `_inl<N>_*` slots live in the frame). The
+remaining ~2× on this bench is the same pair the roadmap already
+names: spill quality on mangled slots (RegAlloc Stage-F territory) +
+instruction scheduling. Same lesson as the "sees through inlined call
+sites" arc: a disasm-verified capability win does not always move
+wall-clock proportionally.
+
+Verified the full way: `acc` checksum bit-identical native +
+x64-in-Docker (both the repro and the spring bench); Docker self-host
+**gen1==gen2 byte-stable**; Linux suite 10/10 (5 headless + 5 X11 via
+XQuartz); native 231/0/12 + C-emit 192/0/51; render md5 unchanged
+(`f61fac72…`); bootstrap 0.31s flat; binary +1.4% (1168402 → 1184914).
+Full catalog re-run at parity: biquad 1.02× / lcg 0.99× / xform 1.00× /
+manylive 1.36×, sf_bench 11.06 ms/271× (unchanged — the demo project's
+hot inserts don't run through stbdelay), compose 3×, outline 6%/102%,
+all gates PASS. Two catalog findings, neither a code regression:
+`bench_autovec_gate.sh` FAILs when the INSTALLED `/usr/local/bin/bug`
+predates map v7 (it silently reads no `__synth` from a v7 map — the
+repo `./bug` reads it fine; re-run with the repo bug on PATH gives
+PASS, 9 vector ops; reinstall `bug` after any map-format bump), and
+`bench_ecs_sparse_query`'s 10%-bucket sat at the 2.5× gate's noise
+floor under load (the HEAD binary scored WORSE on the same machine at
+the same time — 2.28-2.44× vs our 2.51-3.56× — so the gate edge is
+machine noise, not this change).
