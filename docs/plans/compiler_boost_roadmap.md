@@ -124,6 +124,22 @@ CSE, we need:
 
 ## F.2 — Register Allocator v2 (SSA-lite + liveness)
 
+> **✅ STAGE F SHIPPED (2026-07-05): use-count spill-cost.**
+> `regalloc_linear_scan` now spills the victim with the FEWEST weighted
+> refs (`cg_var_refs`) instead of the furthest end_pos, ties broken by
+> end_pos (so uniform-ref functions are byte-unchanged). This mirrors
+> B3's ranking, so the `regalloc_compare_vs_b3` gate clears far more
+> often and the swap's slot-sharing applies: whole-compiler regression
+> instances **168 → 10** (59 → 9 unique functions refused), disasm-
+> verified frame-traffic cuts on the newly-cleared functions
+> (`_fdc_try_candidate` 70 → 25 frame-loads). a64-only (x64 discards the
+> scan). Wall-clock within noise (the touched functions aren't
+> frame-traffic-bound in aggregate). **Corrected a prior hypothesis:**
+> `manylive` (1.44×) is NOT Stage-F territory — its uniform ref counts
+> give lowest-refs no signal, so it degrades to furthest-end_pos and is
+> byte-identical; its gap is raw budget overflow (18-in-14), not victim
+> selection. See benchmarks.md 2026-07-05 (later).
+
 ### Phasing (added 2026-06-13 — grounded in measurement)
 
 > **✅ OUTCOME (2026-06-14): F.2.c SHIPPED in `c099438` (1.27× on the

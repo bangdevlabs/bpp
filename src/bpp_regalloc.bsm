@@ -2132,8 +2132,26 @@ static void _rg_force_spill(assigns, var_idx) {
     }
 }
 
+// Returns var_idx's weighted reference count from `refs` (the same
+// spine-level `cg_var_refs` B3 ranks by — loop refs weighted 1000×),
+// or 0 when `refs` is missing or the index is out of range. A weight
+// of 0 makes a variable the cheapest possible spill victim, which is
+// the correct default for anything the ref pass never counted.
+static _rg_refs_of(refs, vi) {
+    if (refs == 0) { return 0; }
+    if (vi < 0 || vi >= arr_len(refs)) { return 0; }
+    return arr_get(refs, vi);
+}
+
 // Computes a register assignment for every interval in `intervals`
 // (Stage C's own output), against a logical slot budget of `budget`.
+// `refs` is the spine-level per-var_idx weighted reference count
+// (`cg_var_refs`) — the SAME ranking B3 promotes by — used ONLY to
+// pick the spill victim (Stage F, below); pass 0 to fall back to the
+// pure furthest-end_pos heuristic. It stays a plain weight-per-var_idx
+// array, never a chip concept, so this function remains chip-agnostic
+// (it still only ever talks about slot COUNTs, never register names).
+//
 // Returns an arr_struct of RegAssign, one entry per interval — for a
 // variable with NO live-range splitting that's the same as one entry
 // per variable; for a SPLIT variable (more than one LiveInterval
@@ -2145,10 +2163,10 @@ static void _rg_force_spill(assigns, var_idx) {
 // function, no mechanism to change it mid-function) safely commit a
 // split variable's swap: from Stage E's perspective a split variable
 // is indistinguishable from one that was never split at all.
-regalloc_linear_scan(intervals, budget) {
+regalloc_linear_scan(intervals, budget, refs) {
     auto order, n, i, idx, cur: LiveInterval, active, k, act: _RgActive;
     auto assigns, asn: RegAssign, free_slots, slot;
-    auto worst_k, worst_end, worst_var;
+    auto worst_k, worst_end, worst_var, worst_refs, act_refs;
     auto envelope_end, var_decided, vi2, cur2: LiveInterval, decided;
 
     // Precompute each var_idx's ENVELOPE end_pos — the max end_pos
@@ -2235,14 +2253,38 @@ regalloc_linear_scan(intervals, budget) {
             act.slot = slot;
             act.dead = 0;
         } else {
-            // No free slot: spill whichever interval (the incoming one,
-            // or one currently active) has the FURTHEST end_pos.
+            // No free slot: pick a spill victim among the incoming
+            // interval and every currently-active one.
+            //
+            // Stage F (spill-cost model): spill the candidate with the
+            // FEWEST weighted references, ties broken by the FURTHEST
+            // end_pos. This mirrors B3's own promotion ranking (it keeps
+            // the top-`budget` by `cg_var_refs`), which is what makes the
+            // swap PAY: Stage E only commits linear-scan's decision when
+            // `regalloc_compare_vs_b3` finds it promoted everything B3
+            // promoted — so spilling a high-ref variable B3 would have
+            // kept (which the old pure-furthest-end_pos heuristic could
+            // do whenever that variable was also the longest-lived) got
+            // the whole swap REFUSED and the function fell back to B3,
+            // forfeiting linear-scan's non-overlapping-range SHARING.
+            // Spilling by lowest refs instead lands on the same victims
+            // B3 does, the gate clears, and the sharing benefit unlocks
+            // (the manylive kernel's 18-in-14 case is the standing
+            // gate). When every candidate has an equal ref count the
+            // secondary furthest-end_pos key makes this degrade EXACTLY
+            // to the previous heuristic, so a `refs == 0` caller (or a
+            // function whose refs carry no signal) is byte-unchanged.
             worst_k = -1; worst_end = cur.end_pos; worst_var = -1;
+            worst_refs = _rg_refs_of(refs, cur.var_idx);
             k = 0;
             while (k < arr_struct_count(active)) {
                 act = arr_struct_at(active, k);
-                if (act.dead == 0 && act.end_pos > worst_end) {
-                    worst_end = act.end_pos; worst_k = k; worst_var = act.var_idx;
+                if (act.dead == 0) {
+                    act_refs = _rg_refs_of(refs, act.var_idx);
+                    if (act_refs < worst_refs || (act_refs == worst_refs && act.end_pos > worst_end)) {
+                        worst_refs = act_refs; worst_end = act.end_pos;
+                        worst_k = k; worst_var = act.var_idx;
+                    }
                 }
                 k++;
             }

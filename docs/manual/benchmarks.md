@@ -815,3 +815,64 @@ PASS, 9 vector ops; reinstall `bug` after any map-format bump), and
 floor under load (the HEAD binary scored WORSE on the same machine at
 the same time — 2.28-2.44× vs our 2.51-3.56× — so the gate edge is
 machine noise, not this change).
+
+### 2026-07-05 (later) — Stage F: spill-cost by use-count (RegAlloc v2)
+
+The lever the nested-VI entry named. `regalloc_linear_scan` picks its
+spill victim by **fewest weighted references** (`cg_var_refs` — B3's own
+ranking, loop refs 1000×) instead of the old pure furthest-end_pos, ties
+broken by furthest end_pos so a function whose refs carry no signal
+degrades EXACTLY to the previous heuristic (byte-unchanged). It stays
+chip-agnostic: `refs` is a plain weight-per-var_idx array passed in, the
+scan still only talks about slot COUNTs.
+
+**Why it pays (the mechanism, not the wall-clock):** Stage E only
+commits linear-scan's decision when `regalloc_compare_vs_b3` finds it
+promoted everything B3 promoted. Furthest-end_pos would spill whatever
+lived longest — often a *high-ref* variable B3 kept — which tripped that
+gate and forced the whole function back to B3, forfeiting linear-scan's
+non-overlapping-range slot SHARING. Spilling by lowest-refs lands on the
+same victims B3 does, so the gate clears far more often:
+
+| metric (whole-compiler self-compile) | before | after |
+|---|---|---|
+| regalloc regression instances (`--regalloc-debug`) | 168 | **10** |
+| unique functions refused | 59 | **9** |
+
+**Disasm-verified** on the newly-cleared functions — the unlocked
+sharing genuinely cuts frame traffic (not just "changes" it):
+
+| function | frame-stores | frame-loads |
+|---|---|---|
+| `_fdc_try_candidate` | 39 → 22 | **70 → 25** |
+| `_json_parse_string` | 24 → 17 | 37 → 22 |
+| `_inline_register_callsite_slots` | 15 → 12 | 18 → 12 |
+
+**Wall-clock: within noise.** `bench_compile.sh` bootstrap min A/B
+(interleaved, `--bpp`): nested-VI 0.33 / Stage-F **0.32** — the ~50
+touched compiler functions aren't frame-traffic-bound in aggregate, so
+the self-compile barely moves (marginally faster/equal, no regression).
+Machine was under load (spring 39→50 ms same binary; small 0.03→0.04) —
+absolute numbers are directional, the A/B and the regression count are
+the noise-robust signals.
+
+**A hypothesis CORRECTED, per measure-don't-believe:** the earlier
+entries named `manylive` (1.44×) as "Stage F territory". It is NOT —
+`manylive` is **byte-identical** before/after. Its 18 locals have
+UNIFORM ref counts, so lowest-refs gives no discriminating signal and
+degrades to furthest-end_pos → same result. `manylive`'s gap is raw
+budget overflow (18 vars in a 14-slot leaf budget forces 4 spills no
+matter which victim), NOT spill-victim selection. Stage F's real
+beneficiaries are UNEVEN-ref functions — the compiler's own body, above.
+`spring_process` is also byte-identical (its mangled inline slots hit
+the uncovered-mangled refusal path, not the spill path).
+
+Verified the full way: bench_codegen all four checksums exact (biquad
+-0.2285 / lcg 8843630203987260673 / xform -231170789772321 / manylive
+108041794099160); a64 native 231/0/12 + C-emit 192/0/51 on the INSTALLED
+binary + `bpp --c` smoke; render md5 unchanged (`f61fac72…`); a64
+bootstrap gen2==gen3 (1-cycle, expected — the compiler re-emits its own
+50 changed functions); **x64 Docker self-host gen1==gen2 byte-stable**
+(Stage F is a64-only — `_x64_regalloc_apply` discards the scan's output,
+so x64 codegen is inert to this change; x64 spring acc bit-identical);
+zero warnings; binary +64 bytes.
