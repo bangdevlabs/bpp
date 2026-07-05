@@ -906,3 +906,13 @@ Re-verified after the fix: `xform` back to ~6.8-7.1ms (min-of-5, matching
 history), bootstrap byte-stable, suite 219/0/12, C-emit 176/0/55, all
 gates green, audio md5 unchanged, `comp_process`'s 1-`bl` count (Inc 8's
 win) confirmed intact.
+
+## Post-close addendum — Lever-1 (2026-07-04)
+
+Reopened for one increment (see benchmarks.md same date): builtin-using
+bodies 11..40 nodes admit as TIER 4 (per-callsite cost+hotness, never
+unconditional) and `_inline_has_disqualifying_tcall` composes through
+VOID-inlineable targets. Spring hot loop 59.9 → 36.2 ms (1.65×), md5
+unchanged, +6% binary accepted. Named next: VI doesn't fire on statement
+calls inside CLONE-SUBSTITUTED bodies (4 `delay_push` bls survive in
+spring_process), and the gcc -O2 spring oracle sits at 8.3 ms (4.3×).
