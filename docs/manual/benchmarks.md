@@ -746,3 +746,21 @@ flip — landed with the whole catalog at parity, every checksum identical,
 and the audio byte-stable. The zero-regression construction of each
 increment (E232-fatal candidates, consensus poison rules, contract locks)
 is what made a change this large this quiet.
+
+### 2026-07-04 (later) — Lever-1: builtin-body tier-4 window + void-composes
+
+New micro-benchmark shape (spring reverb hot loop: `delay_peek` + 4×
+`allpass_tick` + `delay_push` per sample, 2M samples):
+
+| build | 2M samples | vs gcc -O2 (8.3 ms) |
+|---|---|---|
+| pre-lever | 59.9 ms | 7.2× |
+| **lever-1** | **36.2 ms** | **4.3×** |
+
+`acc` checksum bit-identical on native + x64-in-Docker; render md5
+unchanged; suites green; bootstrap 0.32s (flat); compiler binary +6%
+(tier-4 splices are hot-gated per callsite — the accepted trade).
+bench_codegen spot: biquad 43.9 / lcg 18.3 / xform 6.7 / manylive
+101.5 ms — at or better than the morning band. Remaining spring gap is
+the named nested-VI miss (4 `delay_push` bls survive inside cloned
+bodies) plus scheduling.

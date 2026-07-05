@@ -6516,6 +6516,14 @@ static _inline_has_disqualifying_tcall(nd) {
         }
         fidx = find_func_idx(n.a);
         if (fidx >= 0 && arr_get(fn_inlineable, fidx)) { return 0; }
+        // Lever-1: a call to a VOID-inlineable target composes too — a
+        // void call can only ever sit in statement position (validate
+        // rejects a void value inside an expression), and the VI splice
+        // handles exactly that shape at emit time. Without this,
+        // allpass_tick stayed disqualified forever because its
+        // `delay_push(...)` statement pointed at a fn_void_inlineable
+        // body that fn_inlineable knows nothing about.
+        if (fidx >= 0 && arr_get(fn_void_inlineable, fidx)) { return 0; }
         return 1;
     }
     switch (t) {
@@ -7621,6 +7629,17 @@ const INLINE_MULTIRET_NODE_CAP = 70;
 // the first attempt — see docs/plans/inliner_arc.md). ~10 admits the thin u8/16/
 // 32/64 + float load/store wrappers and rejects multi-peek bodies (read_u16be …).
 const INLINE_BUILTIN_NODE_CAP = 10;
+// Lever-1 (2026-07-04, docs/plans/inliner_arc.md): a builtin-using body
+// OVER the thin-wrapper cap is no longer rejected outright — up to this
+// bound it is admitted as TIER 4 (Inc 8's oversized, per-callsite
+// cost-gated class). The +13% binary-bloat episode that created the
+// thin cap came from UNCONDITIONAL splicing at every call site; tier 4
+// only splices where the cost model plus transitive hotness say the
+// site is worth it (a cold site keeps its call). 40 admits the DSP
+// delay-line leaves (delay_peek 13, delay_push 32) whose calls dominate
+// spring_process/allpass chains, plus memcpy-class helpers, while
+// keeping genuinely fat bodies (_hash_insert_raw at 58) out.
+const INLINE_BUILTIN_TIER4_CAP = 40;
 // Inc 8 (S4 wiring) — the ABSOLUTE backstop for tier 4 (oversized,
 // cost-gated) candidates. Past the free cap, admission is decided
 // per-callsite by cost-vs-threshold (_inline_threshold tops out around
@@ -8016,7 +8035,12 @@ void classify_inlineable() {
         for (j = 0; j < body_cnt; j++) {
             if (_inline_has_inst_builtin(body_arr[j])) { ok = 1; break; }
         }
-        if (ok && body_cost > INLINE_BUILTIN_NODE_CAP) { continue; }
+        if (ok && body_cost > INLINE_BUILTIN_NODE_CAP) {
+            // Lever-1: admission window instead of a hard reject — see
+            // INLINE_BUILTIN_TIER4_CAP's comment for the whole story.
+            if (body_cost > INLINE_BUILTIN_TIER4_CAP) { continue; }
+            is_oversized = 1;
+        }
         if (want_void) {
             // Void candidate: reject if ANY statement is a T_RET. A mid- or
             // early-return would splice into a jump to the CALLER's epilogue.
