@@ -15013,3 +15013,95 @@ W032 finally has its log row (it never had one), debug_with_bug gains the
 inline-aware section, positioning gains the typing-era addendum. Two days
 of Fable 5: nine silent bugs, two type laws, the full T2 arc, ~280
 annotations gone, and a debugger that understands the compiler it debugs.
+
+## 2026-07-04 (night) — the last annotation faxina + inliner lever-1: the spring wakes up
+
+Closing act of the typing era, then straight into the parity roadmap's
+biggest lever.
+
+**Faxina-40** (`8e89dfa`): every `: str` on a STATIC function parameter
+removed — 36 signatures across stb/tools/games — and the call-site
+consensus (inc E) re-inferred ALL of them with zero W032 survivors.
+That's the system validating itself on its own repo. Final census: 16
+float locals (all meaningful casts), 49 `: ptr` (all opaque), 35 public
+`: str` KEPT as API contract — a doctrine decision (Rule 13 reads a
+public signature annotation as documentation), not debt.
+
+**Lever-1** (`ef5dae2`): the recon overturned the roadmap's own map —
+the moog chain (moon_process → moog_slope → moog_taps) had ALREADY
+fully collapsed (bl=0 standalone, Incs 6-8 composing since June); the
+docs were behind reality. Measurement (bl-count via `bug --disasm`,
+targets resolved through the --dump address map) pointed at the real
+villains: the delay-line leaves, with spring_process the worst
+call-heavy spot in the repo (6 bl per sample). Two spine-level
+relaxations, agnostic by construction:
+1. builtin-using bodies 11..40 nodes admit as TIER 4 (Inc 8's
+   per-callsite cost + transitive hotness — never unconditional; the
+   +13%-binary episode that created the thin cap stays impossible);
+2. `_inline_has_disqualifying_tcall` composes through VOID-inlineable
+   targets (a void call only exists in statement position — exactly
+   what VI splices), which un-blocked allpass_tick/comb_tick forever
+   stuck on their `delay_push(...)` statement.
+Spring hot loop, 2M samples: **59.9 → 36.2 ms (1.65×)**, acc
+bit-identical on native AND x64-in-Docker, render md5 unchanged,
+binary +6% (accepted: hot-gated), bootstrap flat at 0.32s. gcc -O2
+oracle: 8.3 ms — from 7.2× down to 4.3×.
+
+**Named next increment** (briefed in the lever-1 addendum of
+docs/plans/legacy/inliner_arc.md): VI does not fire on statement
+calls inside CLONE-SUBSTITUTED bodies — allpass_tick spliced into
+spring_process carries its `delay_push(a.line, w)` statement through
+ast_clone_subst, and at emit time those 4 sites stay real calls. Fix
+that and spring drops its last per-sample bls.
+
+## 2026-07-05 — nested-VI: spring_process goes fully flat, and the Linux backend gets the whole ritual
+
+The increment lever-1 named shipped as exactly the one edit the addendum
+predicted: `_inline_find_nested_calls` (the shared discovery walk that
+BOTH nested registration and splice-time stamping run through) now
+admits `fn_void_inlineable` targets, mirroring the top-level walker's
+own VI branch. Because one function serves both sides, registration and
+stamping agree on the identical set in the identical order by
+construction — the invariant that makes positional `nested_ids[nk]`
+stamping safe needed no new coordination. A statement call like
+`delay_push(a.line, w)` inside a clone-substituted body used to survive
+as a real `bl` (ast_clone_subst resets the clone's `.e`; only this walk
+can re-stamp it); now it splices like any top-level VI site.
+
+The mechanism metric closed completely: **spring_process 4 `bl` → 0 —
+fully flat**, disasm-verified, the .bug inline ranges showing
+delay_push spliced inside the allpass_tick splices. The honest
+wall-clock: ~7% (42 → 39 ms min-of-7 on the recreated spring scratch,
+2M samples; oracle ~20 ms on the same source — a different scratch
+shape than lever-1's table, not comparable row-to-row). The splice
+grew the body 219 → 325 instructions: several `_inl<N>_*` mangled
+slots exhaust B3's budget and live in the frame, so the removed
+call/return overhead was partly repaid in spills. The remaining ~2×
+is spill quality (RegAlloc Stage-F) + scheduling — the same two
+levers already named, now with the call-overhead lever fully spent on
+this workload. Same lesson as the "sees through inlined calls" arc:
+capability wins are durable; wall-clock follows only where the cycles
+actually were.
+
+Verification ran the FULL Linux ritual for the first time this arc
+(user had Docker + XQuartz up): spring + repro acc bit-identical on
+x64-in-Docker, the 10-test Linux loop 10/10 (5 headless + 5 X11 through
+XQuartz), and the backend_parity seal — **Docker self-host gen1==gen2
+byte-stable**. Native side: 1-cycle oscillation (expected — the
+compiler re-emits its own nested-VI shapes), gen2==gen3, suites
+231/0/12 + 192/0/51, zero warnings, render md5 `f61fac72…` unchanged,
+binary +1.4%, bootstrap 0.31s flat, whole catalog at parity.
+
+Two catalog findings, both infrastructure, neither a regression: the
+installed `/usr/local/bin/bug` predates yesterday's map v7 and silently
+reads no `__synth` from v7 maps — bench_autovec_gate reads through the
+PATH `bug`, so it false-FAILed until re-run with the repo `./bug`
+(PASS, 9 vector ops; the gate-only-as-honest-as-its-tool lesson again,
+this time the tool was merely stale, not blind — reinstall bug after
+any map bump). And bench_ecs_sparse_query's 10% bucket sat at its 2.5×
+gate's noise floor under load; the HEAD binary scored WORSE on the same
+machine at the same moment (2.28-2.44× vs our 2.51-3.56×), so the edge
+is machine noise. The journal's own stale pointer to a never-created
+`next_increment_nested_vi.md` plan was fixed to cite the lever-1
+addendum in `docs/plans/legacy/inliner_arc.md`, where this increment's
+close is now also recorded.
