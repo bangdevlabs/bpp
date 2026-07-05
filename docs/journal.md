@@ -15105,3 +15105,54 @@ is machine noise. The journal's own stale pointer to a never-created
 `next_increment_nested_vi.md` plan was fixed to cite the lever-1
 addendum in `docs/plans/legacy/inliner_arc.md`, where this increment's
 close is now also recorded.
+
+## 2026-07-05 (later) — Stage F: the spill victim learns to count uses, and 158 gate-refusals evaporate
+
+The lever the nested-VI close named ("spill-cost, Stage-F of the
+RegAlloc") — and the verification turned into a lesson about which
+kernel actually needed it. One edit to `regalloc_linear_scan`
+(`bpp_regalloc.bsm`): when the slot pool runs dry, spill the candidate
+with the FEWEST weighted references (`cg_var_refs` — the exact ranking
+B3 promotes by, loop refs 1000×), ties broken by the old furthest-end_pos
+key so a function whose refs carry no signal degrades byte-for-byte to
+the previous heuristic. `refs` is passed in as a plain weight-per-var_idx
+array, so the scan stays chip-agnostic (still only ever talks slot
+COUNTs, never register names).
+
+The mechanism is subtler and better than "spill smarter." Stage E only
+commits linear-scan's decision when `regalloc_compare_vs_b3` finds it
+promoted everything B3 promoted; otherwise the whole function falls back
+to B3, forfeiting linear-scan's non-overlapping-range slot SHARING (the
+one thing B3 can't do). Furthest-end_pos spills whatever lives longest —
+often a HIGH-ref variable B3 kept — so it tripped that gate constantly.
+Spilling by lowest-refs lands on the same victims B3 does, the gate
+clears, and the sharing unlocks. Whole-compiler self-compile: regalloc
+regression instances **168 → 10** (59 → 9 unique functions), and
+`bug --disasm` on the newly-cleared functions confirms the unlocked
+sharing genuinely cuts frame traffic — `_fdc_try_candidate` 70 → 25
+frame-loads, `_json_parse_string` 37 → 22, not merely "changed."
+
+Then the correction the measurement forced, exactly the measure-don't-
+believe discipline: **`manylive` (1.44×) was NOT the Stage-F workload the
+last three benchmark entries assumed.** It is byte-IDENTICAL before and
+after. Its 18 locals all carry uniform ref counts, so lowest-refs gives
+no discriminating signal and degrades to furthest-end_pos → same bytes.
+`manylive`'s gap is raw budget overflow (18 vars, 14-slot leaf budget,
+4 MUST spill no matter which), not victim selection — a different lever
+(wider budget or a smarter spill-code model) entirely. `spring_process`
+is byte-identical too (its mangled inline slots hit the uncovered-mangled
+refusal path, never the spill path). Stage F's real beneficiaries are
+UNEVEN-ref functions, which is the compiler's own body — so the win is a
+capability/hygiene win on the toolchain, disasm-proven, wall-clock within
+noise (bench_compile A/B interleaved: nested-VI 0.33 min / Stage-F 0.32).
+
+Verified whole: bench_codegen all four checksums exact; a64 native
+231/0/12 + C-emit 192/0/51 on the INSTALLED binary + `bpp --c` smoke;
+render md5 `f61fac72…` unchanged; a64 bootstrap gen2==gen3 (1-cycle,
+expected — the compiler re-emits its own 50 changed functions);
+**x64 Docker self-host gen1==gen2 byte-stable** (Stage F is a64-only,
+`_x64_regalloc_apply` discards the scan output, x64 codegen inert; x64
+spring acc bit-identical); zero warnings; binary +64 bytes. F.2's Stage
+F row added to compiler_boost_roadmap.md; the spill-cost lever the last
+two sessions kept pointing at is now spent — the remaining manylive gap
+is honestly relabelled as budget-overflow, not spill-victim, territory.
