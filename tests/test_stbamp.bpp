@@ -1,0 +1,101 @@
+// test_stbamp.bpp — pin the Fender-Bassman preamp topology (stbamp) by the
+// behaviour the composed chain must have: it stays bounded (soft-clipping tubes
+// + a passive tone stack + a passive cab can never run away), silence stays
+// silent, the gain knob makes it saturate harder (the cascade compresses more
+// as drive rises — the defining signature of a nonlinear amp vs a linear
+// filter), and the tone knobs actually change the sound.
+
+import "stbamp.bsm";
+
+fabs_f(x: float) -> float {
+    if (x < 0.0) { return 0.0 - x; }
+    return x;
+}
+
+// Peak steady-state output for a sine of the given frequency and amplitude
+// pushed through the (already configured) amp. Resets the amp, warms past the
+// filter transients (the ~10 Hz coupling highpasses settle slowly), then tracks
+// the largest output magnitude.
+static _amp_peak(amp, freq: float, amp_in: float, fs: float) -> float {
+    auto n;
+    auto (w, x, y, mx): float;
+    amp_reset(amp);
+    w = 6.2831853 * freq / fs;
+    mx = 0.0;
+    for (n = 0; n < 6000; n++) {
+        x = amp_in * sin_f(w * n);
+        y = amp_process(amp, x);
+        if (n >= 4000) { if (fabs_f(y) > mx) { mx = fabs_f(y); } }
+    }
+    return mx;
+}
+
+main() {
+    auto amp: Amp;
+    auto fs: float;
+    auto (y, mx, ratio_lo, ratio_hi, sm, big, t_lo, t_hi): float;
+    auto n;
+
+    fs = 44100.0;
+    amp = amp_new(fs);
+
+    // ── (1) silence in → silence out ─────────────────────────────────
+    amp_set_gain(amp, 0.7);
+    amp_set_tone(amp, 0.5, 0.5, 0.5);
+    amp_reset(amp);
+    mx = 0.0;
+    for (n = 0; n < 4000; n++) {
+        y = amp_process(amp, 0.0);
+        if (fabs_f(y) > mx) { mx = fabs_f(y); }
+    }
+    if (mx > 0.000001) { putmsg("FAIL: silence produced output"); return 1; }
+
+    // ── (2) bounded + finite at the hottest setting ──────────────────
+    // Full drive, full-scale input: three tanh stages + passive filters can
+    // never blow up or NaN, and the output must stay in a sane range.
+    amp_set_gain(amp, 1.0);
+    amp_set_tone(amp, 0.8, 0.5, 0.8);
+    mx = _amp_peak(amp, 300.0, 1.0, fs);
+    if (mx != mx) { putmsg("FAIL: NaN at full drive"); return 2; }
+    if (mx > 3.0) { putmsg("FAIL: amp output exploded (not bounded)"); return 3; }
+
+    // ── (3) the amp actually makes sound ─────────────────────────────
+    // A real input must produce a real output (the chain isn't filtering
+    // everything to zero at a normal guitar frequency).
+    amp_set_gain(amp, 0.5);
+    amp_set_tone(amp, 0.5, 0.5, 0.5);
+    mx = _amp_peak(amp, 300.0, 0.3, fs);
+    if (mx < 0.001) { putmsg("FAIL: amp is silent for a normal input"); return 4; }
+
+    // ── (4) more gain = more saturation (the nonlinearity signature) ──
+    // Measure how much the output grows when the input grows 10x. A linear
+    // chain would grow 10x too; the tube cascade compresses, and it compresses
+    // MORE as the gain rises. So the high-gain growth ratio must be smaller.
+    amp_set_gain(amp, 0.1);
+    amp_set_tone(amp, 0.5, 0.5, 0.5);
+    sm  = _amp_peak(amp, 300.0, 0.05, fs);
+    big = _amp_peak(amp, 300.0, 0.5, fs);
+    ratio_lo = big / sm;
+
+    amp_set_gain(amp, 0.95);
+    sm  = _amp_peak(amp, 300.0, 0.05, fs);
+    big = _amp_peak(amp, 300.0, 0.5, fs);
+    ratio_hi = big / sm;
+
+    if (ratio_hi >= ratio_lo) { putmsg("FAIL: raising gain did not increase saturation"); return 5; }
+    if (ratio_hi <= 1.0)      { putmsg("FAIL: output did not grow with input (dead amp)"); return 6; }
+
+    // ── (5) the tone control changes the sound ───────────────────────
+    // With everything else fixed, sweeping treble must change the high-end
+    // output level (the chain honours the tone stack, not just the tubes).
+    amp_set_gain(amp, 0.5);
+    amp_set_tone(amp, 0.1, 0.5, 0.5);
+    t_lo = _amp_peak(amp, 4000.0, 0.2, fs);
+    amp_set_tone(amp, 0.9, 0.5, 0.5);
+    t_hi = _amp_peak(amp, 4000.0, 0.2, fs);
+    if (t_hi <= t_lo) { putmsg("FAIL: treble knob did not change the highs"); return 7; }
+
+    amp_free(amp);
+    putmsg("PASS: stbamp — bounded, silent on silence, saturates harder with gain, and the tone knob works");
+    return 0;
+}

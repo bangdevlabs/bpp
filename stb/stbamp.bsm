@@ -1,0 +1,201 @@
+// stbamp.bsm — guitar-amp preamp topology (the Fender Bassman signal chain).
+//
+// Clean-room. This cartridge owns no new DSP math — it is the WIRING that
+// composes the Tier-1 audio primitives into a working amplifier model, in the
+// order a real Fender-derived preamp uses them (a public hardware architecture,
+// confirmed against the '59 Bassman schematic; no third-party code was read in):
+//
+//   in -> 2x oversample -> [tube stage 1] -> [tube stage 2]
+//                          -> tone stack -> [tube stage 3]
+//         -> 2x downsample -> speaker cab -> out
+//
+//   * A TUBE STAGE is `input filter -> saturation waveshaper -> coupling
+//     filter`: a one-pole lowpass rolls off the very top (the tube's Miller
+//     capacitance), stbdrive's asymmetric valve curve does the saturation, and a
+//     one-pole highpass (the coupling capacitor) blocks the DC that asymmetric
+//     clipping introduces before the next stage. Three stages cascade, gain
+//     escalating like a real preamp.
+//   * The tube stages run at DOUBLE rate (oversampled) so the saturation
+//     harmonics above Nyquist don't alias; the FMV tone stack sits between
+//     stages 2 and 3 (also at the doubled rate), exactly where the Bassman
+//     places its passive Treble/Mid/Bass network.
+//   * The CAB is the cheap stepping-stone approximation the plan calls for —
+//     one lowpass (~4 kHz, the speaker's top-end rolloff) and one highpass
+//     (~85 Hz, the cabinet's low-end limit). A real impulse-response convolution
+//     replaces it in a later increment.
+//
+// Tier-2 (genre cartridge): imports the Tier-1 primitives (stbfilter, stbdrive,
+// stboversample, stbtonestack) and composes them; it names the technique
+// (amp modelling), never a trademark. Everything runs in float (64-bit double).
+//
+// Canonical use (one amp insert):
+//   auto amp: Amp;
+//   amp = amp_new(44100.0);
+//   amp_set_gain(amp, 0.6);              // preamp drive 0..1
+//   amp_set_tone(amp, 0.7, 0.4, 0.6);    // treble, mid, bass 0..1
+//   ... per sample ...
+//   auto y: float;
+//   y = amp_process(amp, x);
+//   amp_reset(amp);                      // clear all filter memory
+//   amp_free(amp);
+
+import "stbfilter.bsm";
+import "stbdrive.bsm";
+import "stboversample.bsm";
+import "stbtonestack.bsm";
+
+// The amp's whole state: the two sub-cartridge handles, the six one-pole filter
+// memories the three tube stages need (an input-lowpass + a coupling-highpass
+// memory each), the two cab filter memories, all the precomputed one-pole
+// coefficients, the per-stage drive amounts, and the input/output trims.
+struct Amp {
+    os, ts,                                  // Oversampler2x*, ToneStack*
+    s1_in: float, s2_in: float, s3_in: float,   // per-stage input-lowpass memory (2x rate)
+    s1_cp: float, s2_cp: float, s3_cp: float,   // per-stage coupling-highpass memory (2x rate)
+    cab_lp: float, cab_hp: float,            // cab lowpass + highpass memory (base rate)
+    g_in: float, g_cp: float,                // input-lowpass / coupling-highpass coeffs (2x rate)
+    g_cab_lp: float, g_cab_hp: float,        // cab coeffs (base rate)
+    drive1: float, drive2: float, drive3: float,   // escalating per-stage saturation
+    bias: float,                             // valve asymmetry (even harmonics)
+    in_gain: float, out_level: float,        // input drive trim / output makeup
+    sr: float                                // base sample rate (2x for the internal stages)
+}
+
+// Init hook for symmetry with the other cartridges. Nothing global to set up.
+init_stbamp() { return 0; }
+
+// Allocate an amp bound to `sample_rate`. Fixed voicing (Miller/coupling/cab
+// corners) is baked in; the two knobs are gain and tone. The caller owns the
+// pointer and frees it with amp_free.
+amp_new(sample_rate: float) {
+    auto amp: Amp, os2: float;
+    amp = malloc(sizeof(Amp));
+    amp.sr = sample_rate;
+    os2 = sample_rate * 2.0;                 // the tube stages run oversampled
+
+    amp.os = oversample_new();
+    amp.ts = tonestack_new(os2);             // tone stack lives at the doubled rate
+
+    // Fixed voicing corners (clean-room, typical Fender-preamp values):
+    //   input Miller lowpass ~10 kHz, coupling highpass ~10 Hz (DC block only).
+    amp.g_in = flt_onepole_g(10000.0, os2);
+    amp.g_cp = flt_onepole_g(10.0, os2);
+    // Cheap cab: speaker top-end rolloff ~4 kHz, cabinet low-end limit ~85 Hz.
+    amp.g_cab_lp = flt_onepole_g(4000.0, sample_rate);
+    amp.g_cab_hp = flt_onepole_g(85.0, sample_rate);
+
+    amp.bias = 0.2;                          // mild valve asymmetry
+    amp.in_gain = 1.0;
+    amp.out_level = 1.0;
+
+    amp_reset(amp);
+    amp_set_gain(amp, 0.5);
+    amp_set_tone(amp, 0.5, 0.5, 0.5);
+    return amp;
+}
+
+// Set the preamp drive (0..1, clamped). Each stage is progressively hotter than
+// the last — the way a cascaded tube preamp builds gain — so a small knob move
+// near the top adds a lot of grit.
+void amp_set_gain(amp_p, gain: float) {
+    auto amp: Amp;
+    amp = amp_p;
+    if (gain < 0.0) { gain = 0.0; }
+    if (gain > 1.0) { gain = 1.0; }
+    amp.drive1 = 0.5 + gain * 3.0;
+    amp.drive2 = 0.7 + gain * 5.0;
+    amp.drive3 = 0.9 + gain * 8.0;
+}
+
+// Set the tone stack (treble, mid, bass — each 0..1). Reconfigures the FMV
+// network at the oversampled rate it runs at inside the chain.
+void amp_set_tone(amp_p, treble: float, mid: float, bass: float) {
+    auto amp: Amp;
+    amp = amp_p;
+    tonestack_set(amp.ts, treble, mid, bass, amp.sr * 2.0);
+}
+
+// One oversampled sample through the three cascaded tube stages with the tone
+// stack between stages 2 and 3. Each stage: roll off the top (input lowpass),
+// saturate (asymmetric valve curve), then block the DC the asymmetry made
+// (coupling highpass = signal minus its own lowpass). Updates every stage
+// memory in place.
+static _amp_stage_chain(amp_p, s: float) -> float {
+    auto amp: Amp, lp: float;
+    amp = amp_p;
+
+    // Stage 1.
+    amp.s1_in = flt_onepole_tick(amp.s1_in, s, amp.g_in);
+    s = amp.s1_in;
+    s = drive_tube(s, amp.drive1, amp.bias, 1.0);
+    lp = flt_onepole_tick(amp.s1_cp, s, amp.g_cp);
+    amp.s1_cp = lp;
+    s = s - lp;                              // coupling highpass
+
+    // Stage 2.
+    amp.s2_in = flt_onepole_tick(amp.s2_in, s, amp.g_in);
+    s = amp.s2_in;
+    s = drive_tube(s, amp.drive2, amp.bias, 1.0);
+    lp = flt_onepole_tick(amp.s2_cp, s, amp.g_cp);
+    amp.s2_cp = lp;
+    s = s - lp;
+
+    // Tone stack between stages 2 and 3 (the Bassman's passive network position).
+    s = tonestack_tick(amp.ts, s);
+
+    // Stage 3.
+    amp.s3_in = flt_onepole_tick(amp.s3_in, s, amp.g_in);
+    s = amp.s3_in;
+    s = drive_tube(s, amp.drive3, amp.bias, 1.0);
+    lp = flt_onepole_tick(amp.s3_cp, s, amp.g_cp);
+    amp.s3_cp = lp;
+    s = s - lp;
+
+    return s;
+}
+
+// Process one input sample through the whole amp and return the output. Trims
+// the input, oversamples 2x, runs both oversampled samples through the tube
+// chain, decimates back, then the cheap speaker cab, then the output makeup.
+amp_process(amp_p, x: float) -> float {
+    auto amp: Amp;
+    auto (a, b, y, lp): float;
+    amp = amp_p;
+
+    x = x * amp.in_gain;
+    a, b = oversample_up(amp.os, x);
+    a = _amp_stage_chain(amp, a);
+    b = _amp_stage_chain(amp, b);
+    y = oversample_down(amp.os, a, b);
+
+    // Cheap cab: speaker lowpass then cabinet highpass.
+    amp.cab_lp = flt_onepole_tick(amp.cab_lp, y, amp.g_cab_lp);
+    y = amp.cab_lp;
+    lp = flt_onepole_tick(amp.cab_hp, y, amp.g_cab_hp);
+    amp.cab_hp = lp;
+    y = y - lp;
+
+    return y * amp.out_level;
+}
+
+// Clear every filter memory in the amp back to silence (both sub-cartridges and
+// all the one-pole states). Use between render passes; the gain and tone
+// settings survive, only the signal history is wiped.
+void amp_reset(amp_p) {
+    auto amp: Amp;
+    amp = amp_p;
+    oversample_reset(amp.os);
+    tonestack_reset(amp.ts);
+    amp.s1_in = 0.0; amp.s2_in = 0.0; amp.s3_in = 0.0;
+    amp.s1_cp = 0.0; amp.s2_cp = 0.0; amp.s3_cp = 0.0;
+    amp.cab_lp = 0.0; amp.cab_hp = 0.0;
+}
+
+// Free an amp allocated by amp_new (both sub-cartridges and the struct).
+void amp_free(amp_p) {
+    auto amp: Amp;
+    amp = amp_p;
+    oversample_free(amp.os);
+    tonestack_free(amp.ts);
+    free(amp_p);
+}

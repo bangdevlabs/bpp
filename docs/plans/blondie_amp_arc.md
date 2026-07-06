@@ -1,6 +1,6 @@
 # Plan — blondie_amp: a Fender Bassman model (preamp + convolution cab)
 
-**Status:** OPEN (2026-07-03). Increments 1 (SVF) + 2 (stbdrive) + 3 (stboversample) + 4 (FMV tone stack) DONE. Next: 5 (stbamp topology).
+**Status:** OPEN (2026-07-03). Increments 1 (SVF) + 2 (stbdrive) + 3 (stboversample) + 4 (FMV tone stack) + 5 (stbamp topology) DONE. Next: 6 (blondie_amp plugin + wire into sound_fusion).
 
 **Increment 1 note — a compiler bug fell out of it.** The SVF's guard test (an
 explicit `x != x` NaN check) exposed that the **C emitter never implemented
@@ -99,7 +99,19 @@ IR convolution.
    Layer-1, no bootstrap.
 5. **`stbamp`** (new Tier-2): the topology — 3 tube stages + tone stack + the
    cheap 2-filter cab — composed from the primitives above. Named after the
-   technique (amp modelling).
+   technique (amp modelling). ← DONE. Signal chain: `in*in_gain -> up2x ->
+   [stage1][stage2] -> tonestack -> [stage3] -> down2x -> cab -> out*level`,
+   where a stage = one-pole input LP (Miller ~10kHz) -> `drive_tube` asymmetric
+   valve curve -> one-pole coupling HP (~10Hz, DC block); the tone stack sits
+   between stages 2 and 3 at the oversampled rate; cab = LP ~4kHz + HP ~85Hz at
+   base rate. `amp_set_gain(0..1)` escalates the three stage drives; `amp_set_
+   tone(t,m,b)`. Composes all four Tier-1 primitives (stbfilter/stbdrive/
+   stboversample/stbtonestack) — NO new DSP math, pure wiring. `test_stbamp`
+   pins: silence->silence, bounded/no-NaN at full drive, saturation increases
+   with gain, tone knob changes the highs. Reference-behaviour proof: at low
+   gain a 10x input grows 9.6x (near-linear); at high gain it grows 1.0x (full
+   tube saturation — level-independent, the cranked-amp sustain). Both backends
+   234/0/12 + 195/0/51; md5 unchanged; Layer-2, no bootstrap.
 6. **`blondie_amp`** plugin (`tools/blondie_amp/`) + wire into sound_fusion as a
    5th channel insert (mono stage, before the pan — an amp is a mono device, same
    as the spring). First playable Bassman tone.
