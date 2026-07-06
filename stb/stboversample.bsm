@@ -1,0 +1,168 @@
+// stboversample.bsm — 2x oversampling with an anti-alias half-band FIR.
+//
+// Clean-room implementation. A half-band FIR is textbook DSP (the coefficients
+// come from the ideal sinc lowpass windowed by a Hamming window — public,
+// decades-old math); nothing here derives from any third-party source.
+//
+// WHY oversampling exists: a hot nonlinearity (a tube-saturation waveshaper,
+// stbdrive) generates harmonics ABOVE the original Nyquist. At the base sample
+// rate those harmonics fold back down (alias) into the audible band as
+// inharmonic grit. The fix is to run the nonlinearity at DOUBLE the rate, where
+// there is headroom for the new harmonics, then band-limit and decimate back —
+// the folded content is filtered away before it can alias. This is mandatory
+// before the Bassman preamp's tube stages (blondie_amp) sound clean.
+//
+// The per-sample loop is a sandwich:
+//
+//     (a, b) = oversample_up(os, x);   // one input sample  -> two 2x-rate samples
+//     a = drive_tube(a, ...);          // shape BOTH at the doubled rate
+//     b = drive_tube(b, ...);
+//     y = oversample_down(os, a, b);   // two 2x-rate samples -> one output sample
+//
+// THE HALF-BAND FILTER. Its cutoff sits at exactly a quarter of the oversampled
+// rate (= half the base Nyquist), and its defining property is that every EVEN-
+// position tap except the centre is ZERO: h(n) = 0 for n = ±2, ±4, ... . That is
+// what makes it cheap — half the multiplies vanish — and it is why upsampling a
+// zero-stuffed stream passes the original samples straight through (the centre
+// tap) while only the interpolated samples between them cost a full FIR.
+//
+// Coefficients (11-tap, Hamming-windowed ideal half-band, normalised to unity
+// DC gain so a constant passes through unchanged):
+//   h(0)  = 0.5
+//   h(±1) = 0.28667     h(±2) = 0
+//   h(±3) = -0.04170    h(±4) = 0
+//   h(±5) = 0.005029
+// Symmetric (linear phase): the group delay is a constant 5 oversampled samples
+// each way, so a round trip (up then down) delays the signal by exactly 5 base
+// samples with no phase distortion in the passband.
+//
+// Everything runs in float (b++ `float` is a 64-bit double). Tier-1: depends on
+// nothing, names no genre — a resampling leaf of the audio graph.
+//
+// Canonical use (2x oversampled waveshaper):
+//   auto os: Oversampler2x;
+//   os = oversample_new();
+//   ... per sample ...
+//   auto (a, b): float;
+//   a, b = oversample_up(os, x);
+//   a = drive_soft(a, 4.0);          // shape at the doubled rate
+//   b = drive_soft(b, 4.0);
+//   auto y: float;
+//   y = oversample_down(os, a, b);
+//   oversample_reset(os);            // clear the filter memory between renders
+//   oversample_free(os);
+
+// Pure leaf: no imports.
+
+// Half-band tap magnitudes (see the header derivation). The four distinct
+// values the symmetric 11-tap filter needs; the even taps h(±2)/h(±4) are
+// exactly zero and simply never appear in the sum below.
+const _OS_H0 = 0.5;
+const _OS_H1 = 0.28667;
+const _OS_H3 = -0.04170;
+const _OS_H5 = 0.005029;
+
+// A 2x oversampler holds two independent 11-sample shift registers: `up`
+// filters the zero-stuffed input on the way to the doubled rate, `down`
+// filters the processed stream on the way back. They never share state — one
+// resamples up, the other resamples down.
+struct Oversampler2x { up, down }
+
+// The shift register is 11 float slots (8 bytes each), newest at slot 10,
+// oldest at slot 0, so the centre tap is slot 5.
+const _OS_LEN = 11;
+
+// Init hook for symmetry with the other cartridges. Nothing global to set up.
+init_stboversample() { return 0; }
+
+// Allocate a 2x oversampler with both filter memories cleared. The caller owns
+// the returned pointer and frees it with oversample_free.
+oversample_new() {
+    auto os: Oversampler2x;
+    os = malloc(sizeof(Oversampler2x));
+    os.up   = malloc(_OS_LEN * 8);
+    os.down = malloc(_OS_LEN * 8);
+    oversample_reset(os);
+    return os;
+}
+
+// Clear both filter memories back to silence. Use between render passes so a
+// filter does not carry a tail across runs (the same discipline delay_reset /
+// moog_reset already follow for their state).
+void oversample_reset(over) {
+    auto os: Oversampler2x, i;
+    os = over;
+    for (i = 0; i < _OS_LEN; i++) {
+        pokefloat(os.up + i * 8, 0.0);
+        pokefloat(os.down + i * 8, 0.0);
+    }
+}
+
+// Push one sample into a shift register (drop the oldest, newest lands at slot
+// 10) and return the half-band FIR over the register, scaled by `gain`. The FIR
+// is the symmetric sum of the four nonzero tap pairs — the even taps are zero,
+// so they contribute nothing and are simply absent. `gain` is 2.0 for the
+// upsampler (to compensate the energy the zero-stuffing removes) and 1.0 for
+// the downsampler.
+static _os_push_fir(buf, x: float, gain: float) -> float {
+    auto i;
+    auto (r0, r2, r4, r5, r6, r8, r10): float;
+    // Drop the oldest sample, slide everything down one slot, newest at 10.
+    for (i = 0; i < _OS_LEN - 1; i++) {
+        pokefloat(buf + i * 8, peekfloat(buf + (i + 1) * 8));
+    }
+    pokefloat(buf + (_OS_LEN - 1) * 8, x);
+    // Read the seven nonzero-tap slots (the centre plus the three symmetric
+    // pairs); slots 1/3/7/9 carry the zero taps and are skipped.
+    r0  = peekfloat(buf + 0 * 8);
+    r2  = peekfloat(buf + 2 * 8);
+    r4  = peekfloat(buf + 4 * 8);
+    r5  = peekfloat(buf + 5 * 8);
+    r6  = peekfloat(buf + 6 * 8);
+    r8  = peekfloat(buf + 8 * 8);
+    r10 = peekfloat(buf + 10 * 8);
+    // Symmetric half-band FIR: centre tap + the three mirrored pairs. This is
+    // the sum-of-products a real convolution is; keeping it explicit (not a
+    // coefficient-array loop) makes it a clean fused-multiply-add chain.
+    return (_OS_H0 * r5
+          + _OS_H1 * (r4 + r6)
+          + _OS_H3 * (r2 + r8)
+          + _OS_H5 * (r0 + r10)) * gain;
+}
+
+// Upsample one input sample to two samples at the doubled rate. The first
+// output is the (band-limited) original sample; the second is the interpolated
+// sample that falls between this input and the next. The gain of 2.0 undoes the
+// halving that zero-stuffing (feeding a 0 between real samples) causes, so a
+// constant input produces a constant pair.
+oversample_up(over, x: float) -> (float, float) {
+    auto os: Oversampler2x, a, b;
+    os = over;
+    a = _os_push_fir(os.up, x,   2.0);   // the real sample
+    b = _os_push_fir(os.up, 0.0, 2.0);   // the zero-stuffed slot -> interpolation
+    return a, b;
+}
+
+// Downsample two processed samples at the doubled rate back to one output
+// sample. Both are pushed through the anti-alias filter (so any content the
+// nonlinearity pushed above the base Nyquist is removed before it can fold),
+// and the second filtered result is kept — decimation by dropping every other
+// filtered sample. Because the filter already band-limited the stream, taking
+// one sample of two aliases nothing.
+oversample_down(over, a: float, b: float) -> float {
+    auto os: Oversampler2x, y;
+    os = over;
+    _os_push_fir(os.down, a, 1.0);        // filter, output discarded (decimated away)
+    y = _os_push_fir(os.down, b, 1.0);    // filter, keep this one
+    return y;
+}
+
+// Free a 2x oversampler allocated by oversample_new (both filter memories and
+// the struct).
+void oversample_free(over) {
+    auto os: Oversampler2x;
+    os = over;
+    free(os.up);
+    free(os.down);
+    free(over);
+}

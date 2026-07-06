@@ -1,0 +1,108 @@
+// test_stboversample.bpp — pin the 2x half-band oversampler by its defining
+// DSP properties and a hand-derivable reference case.
+//
+// The load-bearing property of a unity-DC half-band is that a CONSTANT passes
+// through untouched: upsampling a constant `c` must yield the pair (c, c) — the
+// centre tap carries one phase, the interpolation-of-a-constant yields the same
+// constant for the other — and a full round trip (up then down) returns `c`
+// exactly. The other checks are silence-preservation, linearity (the filter is
+// linear), and that a slow (in-passband) sine round-trips to a clean delayed
+// copy of itself with no distortion.
+
+import "stboversample.bsm";
+
+fabs_f(x: float) -> float {
+    if (x < 0.0) { return 0.0 - x; }
+    return x;
+}
+
+main() {
+    auto os: Oversampler2x, i;
+    auto (a, b, y, mx, err): float;
+
+    os = oversample_new();
+
+    // ── (1) silence in → silence out ─────────────────────────────────
+    a, b = oversample_up(os, 0.0);
+    y = oversample_down(os, a, b);
+    if (fabs_f(a) + fabs_f(b) + fabs_f(y) > 0.000001) { putmsg("FAIL: silence should stay silent"); return 1; }
+
+    // ── (2) constant in → constant pair out (the half-band signature) ─
+    // Feed 0.7 long enough to fill the 11-tap memory, then the up pair must be
+    // (0.7, 0.7): unity gain, no zero-stuff dip, no ripple.
+    oversample_reset(os);
+    for (i = 0; i < 40; i++) { a, b = oversample_up(os, 0.7); }
+    if (fabs_f(a - 0.7) > 0.0001) { putmsg("FAIL: up even sample of a constant != constant"); return 2; }
+    if (fabs_f(b - 0.7) > 0.0001) { putmsg("FAIL: up odd (interpolated) sample of a constant != constant"); return 3; }
+
+    // ── (3) constant round trip → the constant, exactly (unity DC gain) ─
+    oversample_reset(os);
+    for (i = 0; i < 40; i++) {
+        a, b = oversample_up(os, 0.7);
+        y = oversample_down(os, a, b);
+    }
+    if (fabs_f(y - 0.7) > 0.0001) { putmsg("FAIL: constant round trip changed the DC level"); return 4; }
+
+    // ── (4) slow sine round trip ≈ delayed identity ──────────────────
+    // A sine at period 64 sits well inside the passband, so up→down must return
+    // it undistorted, only delayed by the two filters' constant group delay.
+    // That delay is 4.5 base samples (each linear-phase half-band contributes a
+    // constant, and 2x resampling makes the total a half-integer) — comparing
+    // against a fractional-delayed copy is what isolates real distortion from
+    // the delay itself. The residual is the modest 11-tap filter's small
+    // passband ripple (~0.7%), not aliasing.
+    oversample_reset(os);
+    auto (xn, xd): float;
+    auto n;
+    mx = 0.0;
+    for (n = 0; n < 400; n++) {
+        xn = sin_f(6.2831853 * n / 64.0);
+        a, b = oversample_up(os, xn);
+        a = a;                                // identity "nonlinearity"
+        b = b;
+        y = oversample_down(os, a, b);
+        if (n >= 80) {                        // past warm-up
+            xd = sin_f(6.2831853 * (n - 4.5) / 64.0);   // input delayed by 4.5
+            err = fabs_f(y - xd);
+            if (err > mx) { mx = err; }
+        }
+    }
+    if (mx > 0.01) { putmsg("FAIL: slow sine round trip distorted or wrong delay"); return 5; }
+
+    // ── (5) linearity: round trip of 2*x is 2*(round trip of x) ──────
+    // Same slow sine at amplitude 2 must produce exactly double the output
+    // (twice the passband ripple, so twice the tolerance).
+    oversample_reset(os);
+    mx = 0.0;
+    for (n = 0; n < 200; n++) {
+        xn = 2.0 * sin_f(6.2831853 * n / 64.0);
+        a, b = oversample_up(os, xn);
+        y = oversample_down(os, a, b);
+        if (n >= 80) {
+            xd = 2.0 * sin_f(6.2831853 * (n - 4.5) / 64.0);
+            err = fabs_f(y - xd);
+            if (err > mx) { mx = err; }
+        }
+    }
+    if (mx > 0.02) { putmsg("FAIL: oversampler is not linear (2x input != 2x output)"); return 6; }
+
+    // ── (6) anti-alias stopband: oversampled-Nyquist content is killed ─
+    // The whole reason the oversampler exists: content above the base Nyquist
+    // (which a hot nonlinearity generates) must be removed before decimation or
+    // it aliases. Feeding the downsampler a stream alternating +1/-1 IS a signal
+    // at the oversampled Nyquist — the highest frequency the doubled rate can
+    // carry, deep in the stopband — so the filtered, decimated output must sit
+    // at ~0. (By the half-band design the odd taps sum to 0.5, so the response
+    // at this frequency is h(0) - 2*(h1+h3+h5) ≈ 0.5 - 0.5 = 0.)
+    oversample_reset(os);
+    mx = 0.0;
+    for (n = 0; n < 60; n++) {
+        y = oversample_down(os, 1.0, 0.0 - 1.0);
+        if (n >= 30) { if (fabs_f(y) > mx) { mx = fabs_f(y); } }
+    }
+    if (mx > 0.01) { putmsg("FAIL: oversampled-Nyquist content not rejected (would alias)"); return 7; }
+
+    oversample_free(os);
+    putmsg("PASS: stboversample — constant passes clean, slow sine round-trips delayed, filter is linear");
+    return 0;
+}
