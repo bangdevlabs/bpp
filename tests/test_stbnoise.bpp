@@ -1,0 +1,62 @@
+// test_stbnoise.bpp — pin the white/pink noise generators by their defining
+// statistical properties: both stay in range and average to ~0, and pink is
+// SMOOTHER than white (its successive samples change less), which is the
+// time-domain signature of pink's -3 dB/octave tilt — more low-frequency energy
+// means the waveform wanders slowly instead of jumping every sample. No
+// spectrum analysis needed: the mean step size captures the tilt directly.
+
+import "stbnoise.bsm";
+
+fabs_f(x: float) -> float {
+    if (x < 0.0) { return 0.0 - x; }
+    return x;
+}
+
+main() {
+    auto n: Noise, i;
+    auto (w, p, wprev, pprev): float;
+    auto (wsum, psum, wstep, pstep, wmax, pmax): float;
+
+    n = noise_new();
+
+    // ── (1) white noise: in range, zero-mean, and actually varying ───
+    wsum = 0.0; wmax = 0.0; wstep = 0.0; wprev = 0.0;
+    for (i = 0; i < 20000; i++) {
+        w = noise_white(n);
+        if (w != w)         { putmsg("FAIL: white produced NaN"); return 1; }
+        if (fabs_f(w) > 1.0) { putmsg("FAIL: white left the [-1,1] range"); return 2; }
+        wsum = wsum + w;
+        if (fabs_f(w) > wmax) { wmax = fabs_f(w); }
+        if (i > 0) { wstep = wstep + fabs_f(w - wprev); }
+        wprev = w;
+    }
+    if (fabs_f(wsum / 20000.0) > 0.05) { putmsg("FAIL: white is not zero-mean (biased PRNG?)"); return 3; }
+    if (wmax < 0.5)                    { putmsg("FAIL: white barely moves (dead generator)"); return 4; }
+    wstep = wstep / 19999.0;
+
+    // ── (2) pink noise: in range and zero-mean ───────────────────────
+    noise_reset(n);
+    psum = 0.0; pmax = 0.0; pstep = 0.0; pprev = 0.0;
+    for (i = 0; i < 20000; i++) {
+        p = noise_pink(n);
+        if (p != p)          { putmsg("FAIL: pink produced NaN"); return 5; }
+        if (fabs_f(p) > 1.5) { putmsg("FAIL: pink ran far out of range"); return 6; }
+        psum = psum + p;
+        if (fabs_f(p) > pmax) { pmax = fabs_f(p); }
+        if (i > 0) { pstep = pstep + fabs_f(p - pprev); }
+        pprev = p;
+    }
+    if (fabs_f(psum / 20000.0) > 0.05) { putmsg("FAIL: pink is not zero-mean"); return 7; }
+    if (pmax < 0.1)                    { putmsg("FAIL: pink barely moves (dead generator)"); return 8; }
+    pstep = pstep / 19999.0;
+
+    // ── (3) the tilt: pink changes far LESS per sample than white ────
+    // White's successive samples are independent (big average step); pink's are
+    // correlated by its low-pass integration (small average step). If pink's
+    // mean step is not clearly below white's, the -3 dB/oct shaping isn't there.
+    if (pstep >= wstep * 0.5) { putmsg("FAIL: pink is not smoother than white (no spectral tilt)"); return 9; }
+
+    noise_free(n);
+    putmsg("PASS: stbnoise — white is flat + zero-mean, pink is bounded + smoother (the pink tilt)");
+    return 0;
+}

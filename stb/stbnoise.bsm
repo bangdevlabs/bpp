@@ -1,0 +1,97 @@
+// stbnoise.bsm — white and pink noise generators for b++ audio.
+//
+// Clean-room. White noise (equal energy at every frequency) comes from a
+// standard xorshift PRNG mapped to [-1, 1]. Pink noise (equal energy per
+// OCTAVE, a -3 dB/octave tilt — the spectrum that sounds "even" to the ear and
+// is the correct signal for exciting every band of an EQ or amp at once) is the
+// well-known Paul Kellet economy filter: three one-pole lowpasses summed over
+// the white source. Both are decades-old public DSP; nothing here derives from
+// any third-party code.
+//
+// WHY IT EXISTS: a single sine wave carries energy at ONE frequency, so it can
+// never reveal what a broadband tone control (a tone stack, a shelving EQ, a
+// cab) does across the spectrum — turning "treble" on a 220 Hz sine does almost
+// nothing because there is no treble in the signal to move. Pink noise excites
+// every octave equally, so a tone control's effect is immediately audible and
+// measurable. This is the test signal for the blondie_amp tone stack.
+//
+// Everything runs in float (b++ `float` is a 64-bit double). Tier-1: depends on
+// nothing, names no genre — a source leaf of the audio graph.
+//
+// Canonical use:
+//   auto n: Noise;
+//   n = noise_new();
+//   ... per sample ...
+//   auto w: float; w = noise_white(n);   // flat spectrum, [-1, 1]
+//   auto p: float; p = noise_pink(n);    // -3 dB/oct, roughly [-1, 1]
+//   noise_free(n);
+
+// Pure leaf: no imports.
+
+// Generator state: the PRNG seed plus the three one-pole memories the pink
+// filter integrates the white source through.
+struct Noise { seed, b0: float, b1: float, b2: float }
+
+// Init hook for symmetry with the other cartridges. Nothing global to set up.
+init_stbnoise() { return 0; }
+
+// Allocate a noise generator with a fixed nonzero seed (so a given run is
+// reproducible) and a cleared pink filter. The caller owns the pointer and
+// frees it with noise_free.
+noise_new() {
+    auto n: Noise;
+    n = malloc(sizeof(Noise));
+    n.seed = 0x2545F4914F6CDD1D;   // any nonzero constant seeds the xorshift
+    n.b0 = 0.0;
+    n.b1 = 0.0;
+    n.b2 = 0.0;
+    return n;
+}
+
+// One white-noise sample in [-1, 1): xorshift64 advances the seed, then the low
+// 24 bits map linearly onto the range. Flat spectrum — equal energy at every
+// frequency. `: u_word` makes the right shift logical (zero-fill), which the
+// xorshift needs to mix the high bits down correctly.
+noise_white(noise) -> float {
+    auto n: Noise, s: u_word, r;
+    n = noise;
+    s = n.seed;
+    s = s ^ (s << 13);
+    s = s ^ (s >> 7);
+    s = s ^ (s << 17);
+    n.seed = s;
+    r = s & 0xFFFFFF;                 // 0 .. 16777215
+    return r / 8388608.0 - 1.0;       // / 2^23 -> [0, 2) -> [-1, 1)
+}
+
+// One pink-noise sample (Paul Kellet economy filter). Three one-pole lowpasses
+// with widely-spaced corners, summed with a little of the raw white, give the
+// -3 dB/octave tilt — equal energy per octave. The 0.2 scale keeps the sum
+// roughly inside [-1, 1] (occasional peaks can exceed it; a caller writing to a
+// fixed-range format should clamp).
+noise_pink(noise) -> float {
+    auto n: Noise;
+    auto (white, pink): float;
+    n = noise;
+    white = noise_white(noise);
+    n.b0 = 0.99765 * n.b0 + white * 0.0990460;
+    n.b1 = 0.96300 * n.b1 + white * 0.2965164;
+    n.b2 = 0.57000 * n.b2 + white * 1.0526913;
+    pink = n.b0 + n.b1 + n.b2 + white * 0.1848;
+    return pink * 0.2;
+}
+
+// Clear the pink filter memory (the white source is stateless beyond its seed,
+// which is deliberately NOT reset so noise keeps varying across renders).
+void noise_reset(noise) {
+    auto n: Noise;
+    n = noise;
+    n.b0 = 0.0;
+    n.b1 = 0.0;
+    n.b2 = 0.0;
+}
+
+// Free a generator allocated by noise_new.
+void noise_free(noise) {
+    free(noise);
+}

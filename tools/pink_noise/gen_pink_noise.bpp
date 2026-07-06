@@ -1,0 +1,71 @@
+// gen_pink_noise.bpp — write a pink-noise test WAV for sound_fusion.
+//
+// Pink noise excites every octave equally, so it is the right signal for
+// hearing what a tone control does across the whole spectrum (a sine only
+// carries one frequency, so an EQ on it moves almost nothing). Load the output
+// onto a channel, engage the Blondie amp, and sweep treble / mid / bass — each
+// knob's band is now clearly audible.
+//
+// Writes an 8-second mono-into-stereo pink-noise WAV (s16, 44100 Hz), the exact
+// format sf_import_clip reads. Usage:
+//   bpp tools/pink_noise/gen_pink_noise.bpp -o /tmp/genpink
+//   /tmp/genpink [out_path]          # default: pink_noise.wav in the cwd
+
+import "stbnoise.bsm";
+import "stbsound.bsm";
+
+fabs_f(x: float) -> float {
+    if (x < 0.0) { return 0.0 - x; }
+    return x;
+}
+
+main(argc, argv) {
+    auto path, frames, buf, fbuf, i, n: Noise;
+    auto (p, peak, scale, sf): float;
+    auto sw: word;
+
+    path = "pink_noise.wav";
+    if (argc >= 2) { path = argv[1]; }
+
+    frames = 44100 * 8;                       // 8 seconds
+    n = noise_new();
+
+    // Pass 1: generate the pink samples into a float buffer and find the peak,
+    // so we can normalise to a healthy, consistent level (pink's crest factor
+    // is high, so a fixed scale would either clip or come out quiet).
+    fbuf = malloc(frames * 8);                // one double per frame
+    peak = 0.0001;
+    for (i = 0; i < frames; i++) {
+        p = noise_pink(n);
+        pokefloat(fbuf + i * 8, p);
+        if (fabs_f(p) > peak) { peak = fabs_f(p); }
+    }
+    scale = 30000.0 / peak;                   // normalise peak to ~-0.7 dBFS
+
+    // Pass 2: scale, convert to s16, write the SAME sample to L and R (a mono
+    // source the amp insert processes; the channel pans it into the field).
+    buf = malloc(frames * 4);                 // stereo s16, 4 bytes/frame
+    for (i = 0; i < frames; i++) {
+        sf = peekfloat(fbuf + i * 8) * scale;
+        if (sf > 32000.0)      { sf = 32000.0; }
+        if (sf < 0.0 - 32000.0) { sf = 0.0 - 32000.0; }
+        sw = sf;                              // float -> s16 (fcvtzs)
+        write_u16(buf, i * 4 + 0, sw);        // left
+        write_u16(buf, i * 4 + 2, sw);        // right
+    }
+
+    if (sound_save_wav(path, buf, frames) != 0) {
+        put_err("gen_pink_noise: failed to write ");
+        put_err(path);
+        put_err("\n");
+        return 1;
+    }
+    put("wrote 8 s of pink noise to ");
+    put(path);
+    put("\n");
+
+    free(fbuf);
+    free(buf);
+    noise_free(n);
+    return 0;
+}
