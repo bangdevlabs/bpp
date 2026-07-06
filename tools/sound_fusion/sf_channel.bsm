@@ -1,13 +1,15 @@
 // sf_channel.bsm — the mixer channels.
 //
 // sound_fusion has SF_NTRACKS channels. Each channel is a volume fader plus a
-// fixed FOUR-slot insert chain: a moon_filter (the Moog ladder), then a
+// fixed FIVE-slot insert chain: a blondie_amp (the Fender Bassman preamp + cab)
+// FIRST as the sound source, then a moon_filter (the Moog ladder), then a
 // zener_comp (the TG12345-style channel compressor), then a morricone_spring
 // (the spring reverb), then a rotary (Leslie) — docs/plans/sound_fusion.md
-// slice 5a/5b/8/9. Four concrete plugin kinds, in a fixed natural channel-strip
-// order (shape the tone, tame the dynamics, add the room, then spin the stereo
-// field — the same order a real console drives filter -> compressor -> reverb
-// -> modulation), so this stays named slots rather than a generic N-deep
+// slice 5a/5b/8/9 + blondie_amp_arc.md Inc 6. Five concrete plugin kinds, in a
+// fixed natural channel-strip order (the amp makes the sound, then shape the
+// tone, tame the dynamics, add the room, then spin the stereo field — the same
+// order a real rig drives amp -> filter -> compressor -> reverb -> modulation),
+// so this stays named slots rather than a generic N-deep
 // polymorphic chain. The original two-slot comment here said "a third insert
 // kind is the trigger to generalize" — the trigger fired, and the answer is
 // still a concrete named slot, not a dynamic chain. Rule 20's bar is about HOW
@@ -46,7 +48,7 @@
 // nearly silent on a typical signal). `muted`/`solo` are the mixer's per-channel
 // flags, read by sf_render's mix loop: a muted channel is skipped, and when ANY
 // channel is soloed only soloed channels play.
-struct Track { vol: float, flt_on, flt, pan: float, stereo, gain_l: float, gain_r: float, rot_on, rot, comp_on, comp, cutoff: float, reso: float, slope, comp_mode, comp_rel, rot_mode, comp_thr: float, muted, solo, spring_on, spring, spring_decay: float, spring_damp: float, spring_mix: float }
+struct Track { vol: float, flt_on, flt, pan: float, stereo, gain_l: float, gain_r: float, rot_on, rot, comp_on, comp, cutoff: float, reso: float, slope, comp_mode, comp_rel, rot_mode, comp_thr: float, muted, solo, spring_on, spring, spring_decay: float, spring_damp: float, spring_mix: float, amp_on, amp, amp_gain: float, amp_treble: float, amp_mid: float, amp_bass: float }
 
 static auto _sf_tracks;     // malloc(SF_NTRACKS * sizeof(Track))
 
@@ -78,6 +80,8 @@ void sf_channel_init() {
         tk.rot    = rotary_new(44100.0);
         tk.spring_on = 0;
         tk.spring    = morricone_new(44100.0);
+        tk.amp_on = 0;
+        tk.amp    = blondie_new(44100.0);
         tk.stereo = 0;     // mono source (panned into the stereo field)
         // Cached insert parameters with musical defaults, applied the first
         // time the user engages each insert from the GUI. These never touch
@@ -102,6 +106,12 @@ void sf_channel_init() {
         tk.spring_decay = 0.84;
         tk.spring_damp  = 0.2;
         tk.spring_mix   = 0.3;
+        // Blondie amp (Fender Bassman) defaults: a crunchy-but-clear lead voice,
+        // inert until amp_on is set from the GUI.
+        tk.amp_gain   = 0.5;
+        tk.amp_treble = 0.6;
+        tk.amp_mid    = 0.5;
+        tk.amp_bass   = 0.6;
         tk.muted     = 0;
         tk.solo      = 0;
         _sf_apply_pan(tk, 0.0);   // centre
@@ -237,6 +247,22 @@ void sf_track_set_spring(tr, spring_on, decay: float, damping: float, mix: float
     if (spring_on != 0) { morricone_set(tk.spring, decay, damping, mix); }
 }
 
+// Configure one channel's Blondie amp insert. `gain` is the preamp drive (0..1);
+// `treble`/`mid`/`bass` are the FMV tone-stack knobs (0..1). Applied to the live
+// plugin only while engaged, the same on-flag guard the other inserts use. A
+// focused setter so each of the GUI's four drag-bars can re-supply the group
+// (reading the other three back) without disturbing the other inserts.
+void sf_track_set_amp(tr, amp_on, gain: float, treble: float, mid: float, bass: float) {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    tk.amp_on     = amp_on;
+    tk.amp_gain   = gain;
+    tk.amp_treble = treble;
+    tk.amp_mid    = mid;
+    tk.amp_bass   = bass;
+    if (amp_on != 0) { blondie_set(tk.amp, gain, treble, mid, bass); }
+}
+
 // Clear every channel's insert state. The render calls this before a pass so
 // neither insert carries memory across renders.
 void sf_channel_reset_filters() {
@@ -246,6 +272,7 @@ void sf_channel_reset_filters() {
         moon_reset(tk.flt);
         zener_reset(tk.comp);
         morricone_reset(tk.spring);
+        blondie_reset(tk.amp);
         rotary_reset(tk.rot);
     }
 }
@@ -347,6 +374,31 @@ sf_channel_spring_mix(tr) -> float {
     tk = _sf_tracks + tr * sizeof(Track);
     return tk.spring_mix;
 }
+sf_channel_amp_on(tr) {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    return tk.amp_on;
+}
+sf_channel_amp_gain(tr) -> float {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    return tk.amp_gain;
+}
+sf_channel_amp_treble(tr) -> float {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    return tk.amp_treble;
+}
+sf_channel_amp_mid(tr) -> float {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    return tk.amp_mid;
+}
+sf_channel_amp_bass(tr) -> float {
+    auto tk: Track;
+    tk = _sf_tracks + tr * sizeof(Track);
+    return tk.amp_bass;
+}
 
 // 1 if ANY channel is soloed — the render asks this once per pass to decide
 // whether solo gating is in effect (when nothing is soloed, every unmuted
@@ -383,6 +435,10 @@ sf_channel_process(tr, dry: float) -> (float, float) {
     auto tk: Track, wet, l, r;
     tk  = _sf_tracks + tr * sizeof(Track);
     wet = dry;
+    // The amp is FIRST — it is the sound source the rest of the strip shapes
+    // (a guitar goes INTO the amp; the filter/compressor/reverb are post-amp
+    // effects). Its own tone stack + cab live inside it.
+    if (tk.amp_on != 0) { wet = blondie_process(tk.amp, wet); }
     if (tk.flt_on != 0) { wet = moon_process(tk.flt, wet); }
     if (tk.comp_on != 0) { wet = zener_process(tk.comp, wet); }
     // Spring reverb sits in the MONO stage (before the pan): a real spring tank

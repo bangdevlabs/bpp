@@ -1,6 +1,6 @@
 # Plan — blondie_amp: a Fender Bassman model (preamp + convolution cab)
 
-**Status:** OPEN (2026-07-03). Increments 1 (SVF) + 2 (stbdrive) + 3 (stboversample) + 4 (FMV tone stack) + 5 (stbamp topology) DONE. Next: 6 (blondie_amp plugin + wire into sound_fusion).
+**Status:** OPEN (2026-07-03). Increments 1 (SVF) + 2 (stbdrive) + 3 (stboversample) + 4 (FMV tone stack) + 5 (stbamp topology) + 6 (blondie_amp plugin + sound_fusion insert) DONE. Next: 7 (stbconv + real speaker IR — the Stage-F consumer).
 
 **Increment 1 note — a compiler bug fell out of it.** The SVF's guard test (an
 explicit `x != x` NaN check) exposed that the **C emitter never implemented
@@ -114,7 +114,19 @@ IR convolution.
    234/0/12 + 195/0/51; md5 unchanged; Layer-2, no bootstrap.
 6. **`blondie_amp`** plugin (`tools/blondie_amp/`) + wire into sound_fusion as a
    5th channel insert (mono stage, before the pan — an amp is a mono device, same
-   as the spring). First playable Bassman tone.
+   as the spring). First playable Bassman tone. ← DONE. `blondie_amp.bsm` is the
+   thin plugin wrapper over stbamp (new/set/process/reset/free, homage name like
+   morricone_spring). Wired as the FIRST insert in `sf_channel_process` (the amp
+   is the sound source; filter/comp/spring/rotary are post-amp effects) with its
+   own Track fields (amp_on + amp handle + gain/treble/mid/bass cache), setter
+   `sf_track_set_amp`, reset, and five GUI accessors. The GUI grew a 5th lane-
+   header toggle (AMP, first; all five now 17px to fit the 150px header) and an
+   AMP rack block (gain + treble/mid/bass drag-bars); GUI_H 600→680 for the room.
+   Off by default → sound_fusion render md5 UNCHANGED (`f61fac72…`). Headless
+   probe confirmed the amp is live in the render path (channel energy 902 off →
+   2151 on, no NaN). Native suite 234/0/12; zero warnings; tools-only, no
+   bootstrap. NOTE: the demo project doesn't engage it — this is a playtest ship
+   (toggle AMP on a channel and drive it).
 7. **`stbconv` + a real speaker IR** (the endgame): direct short-FIR convolution
    (reuses `stbdelay`'s ring buffer) for a real Bassman cab. This is the Stage-F
    consumer — measure the FP scheduler here; reassociation of the FIR dot-product
