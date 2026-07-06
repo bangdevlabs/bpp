@@ -1,6 +1,6 @@
 # Plan — blondie_amp: a Fender Bassman model (preamp + convolution cab)
 
-**Status:** OPEN (2026-07-03). Increments 1 (SVF) + 2 (stbdrive) + 3 (stboversample) DONE. Next: 4 (FMV tone stack).
+**Status:** OPEN (2026-07-03). Increments 1 (SVF) + 2 (stbdrive) + 3 (stboversample) + 4 (FMV tone stack) DONE. Next: 5 (stbamp topology).
 
 **Increment 1 note — a compiler bug fell out of it.** The SVF's guard test (an
 explicit `x != x` NaN check) exposed that the **C emitter never implemented
@@ -80,8 +80,23 @@ IR convolution.
    anti-alias stopband null, hand-derived as h0 - 2*(h1+h3+h5) = 0). Green on
    both backends; sound_fusion md5 unchanged (no consumer yet); no bootstrap
    (Layer-2, wildcard-installed).
-4. **FMV tone stack** (`stbfilter` or `stbamp`): port the Fender Bass/Mid/Treble
-   passive network coefficients from `FMVTonestack.cpp`.
+4. **FMV tone stack** (`stbtonestack`, new Tier-1): the Fender Bass/Mid/Treble
+   passive network. ← DONE. Clean-room from the PUBLIC academic result — Yeh &
+   Smith, "Discretization of the '59 Fender Bassman Tone Stack" (DAFx-06): the
+   3rd-order analog H(s) coefficients (multi-term polynomials in the three pot
+   positions, with the m²/l·m/t·m cross terms that make the controls interact)
+   transcribed verbatim from the paper, then the paper's own bilinear transform
+   (s = c·(1−z⁻¹)/(1+z⁻¹), c = 2·fs) to a digital 3rd-order IIR. NOT the GPL
+   reference code (only the paper's equations, a mathematical fact). '59 Bassman
+   5F6-A values baked in (250k/1M/25k/56k, 250pF/.02µF/.02µF), swappable for
+   Marshall/Vox. `tonestack_set(ts, treble, mid, bass, fs)` recomputes the seven
+   coefficients; `tonestack_tick(ts, x)` runs the difference equation.
+   `test_stbtonestack` pins: exact DC block (numerator coeffs sum to 0 — the
+   series input cap), passive (never amplifies), and each control moves its own
+   band. Verified against the reference BEHAVIOUR — the flat-setting response
+   shows the textbook Fender mid-scoop (bass 0.83 → scoop bottom 0.24 @ 640 Hz →
+   treble 0.60). Green both backends (233/0/12 + 194/0/51); md5 unchanged;
+   Layer-1, no bootstrap.
 5. **`stbamp`** (new Tier-2): the topology — 3 tube stages + tone stack + the
    cheap 2-filter cab — composed from the primitives above. Named after the
    technique (amp modelling).

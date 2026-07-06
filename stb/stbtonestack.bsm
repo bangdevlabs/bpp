@@ -1,0 +1,201 @@
+// stbtonestack.bsm — the FMV (Fender/Marshall/Vox) passive tone stack.
+//
+// Clean-room implementation. The tone stack is a passive RC network on public
+// hardware (the Fender schematic); its transfer function is the published
+// academic result of Yeh & Smith, "Discretization of the '59 Fender Bassman
+// Tone Stack" (DAFx-06, ccrma.stanford.edu/~dtyeh/papers/yeh06_dafx.pdf). Only
+// that public math is used here — no third-party (GPL or other) code was read
+// into this implementation.
+//
+// WHAT MAKES IT SPECIAL: the Treble / Middle / Bass controls are NOT
+// orthogonal. They share the same three-capacitor network, so turning one knob
+// shifts what the others do — that interaction (and the famous Fender "mid
+// scoop" you get with everything at noon) is the whole character. Three
+// independent shelving filters can never reproduce it; the real interacting
+// network can, which is why this is a single 3rd-order filter whose seven
+// coefficients are recomputed from the three pot positions together.
+//
+// HOW IT WORKS: Yeh & Smith give the analog transfer function
+//   H(s) = (b1*s + b2*s^2 + b3*s^3) / (a0 + a1*s + a2*s^2 + a3*s^3)
+// where b1..b3, a0..a3 are closed-form polynomials in the pot positions
+// (t=treble, m=middle, l=bass, each 0..1 as a fraction of pot travel) and the
+// component values. `tonestack_set` evaluates those polynomials, then applies
+// the bilinear transform (s = c*(1-z^-1)/(1+z^-1), c = 2*fs) — the exact
+// substitution the paper uses — to get a digital 3rd-order IIR. `tonestack_tick`
+// then runs the difference equation, one multiply-add chain per sample.
+//
+// Because the numerator has no constant term (b0 = 0), H(0) = 0: the series
+// input capacitor blocks DC, exactly like the real circuit. Bass frequencies
+// still pass; only true 0 Hz is removed.
+//
+// The component values below are the '59 Bassman 5F6-A (early .02/.02/250pF/56k
+// version). The SAME topology with different values is a Marshall or a Vox tone
+// stack — swap the _TS_* constants to revoice it. Everything runs in float
+// (b++ `float` is a 64-bit double). Tier-1: depends on nothing, names no genre.
+//
+// Canonical use (one tone stack):
+//   auto ts: ToneStack;
+//   ts = tonestack_new(44100.0);
+//   tonestack_set(ts, 0.7, 0.4, 0.6, 44100.0);   // treble, mid, bass (0..1)
+//   ... per sample ...
+//   auto y: float;
+//   y = tonestack_tick(ts, x);
+//   tonestack_reset(ts);                          // clear filter memory
+//   tonestack_free(ts);
+
+// Pure leaf: no imports.
+
+// '59 Bassman 5F6-A component values (public schematic). Pots are modelled as
+// parameterized resistors, following Yeh & Smith: t/m/l scale R1/R3/R2.
+const _TS_R1 = 250000.0;     // Treble pot (250 k)
+const _TS_R2 = 1000000.0;    // Bass pot (1 M)
+const _TS_R3 = 25000.0;      // Middle pot (25 k)
+const _TS_R4 = 56000.0;      // Slope resistor (56 k, fixed)
+const _TS_C1 = 2.5e-10;      // Treble cap (250 pF)
+const _TS_C2 = 2.0e-8;       // Bass cap (0.02 uF)
+const _TS_C3 = 2.0e-8;       // Middle cap (0.02 uF)
+
+// A tone stack: six samples of Direct-Form-I history (three past inputs, three
+// past outputs) plus the seven normalised digital coefficients recomputed by
+// tonestack_set whenever a knob moves.
+struct ToneStack {
+    x1: float, x2: float, x3: float,   // x[n-1], x[n-2], x[n-3]
+    y1: float, y2: float, y3: float,   // y[n-1], y[n-2], y[n-3]
+    nb0: float, nb1: float, nb2: float, nb3: float,   // numerator / A0
+    na1: float, na2: float, na3: float                // denominator / A0
+}
+
+// Init hook for symmetry with the other cartridges. Nothing global to set up.
+init_stbtonestack() { return 0; }
+
+// Allocate a tone stack bound to `sample_rate`, knobs at noon (0.5/0.5/0.5).
+// The caller owns the pointer and frees it with tonestack_free.
+tonestack_new(sample_rate: float) {
+    auto ts: ToneStack;
+    ts = malloc(sizeof(ToneStack));
+    tonestack_reset(ts);
+    tonestack_set(ts, 0.5, 0.5, 0.5, sample_rate);
+    return ts;
+}
+
+// Recompute the filter for a new knob setting. `treble`, `mid`, `bass` are pot
+// positions in 0..1 (clamped — a pot cannot leave its track, and an out-of-range
+// value would only distort the coefficients, never usefully). Evaluates the
+// Yeh & Smith analog coefficients, then the bilinear transform, then normalises
+// by A0 so tonestack_tick can use the coefficients directly. Runs once per knob
+// change, never per sample.
+void tonestack_set(tstack, treble: float, mid: float, bass: float, sample_rate: float) {
+    auto ts: ToneStack;
+    auto (t, m, l): float;
+    auto (r1, r2, r3, r4, c1, c2, c3, r3s): float;
+    auto (b1, b2, b3, a0, a1, a2, a3): float;
+    auto (c, cc, ccc): float;
+    auto (bb0, bb1, bb2, bb3, aa0, aa1, aa2, aa3): float;
+    ts = tstack;
+
+    if (treble < 0.0) { treble = 0.0; }
+    if (treble > 1.0) { treble = 1.0; }
+    if (mid < 0.0)    { mid = 0.0; }
+    if (mid > 1.0)    { mid = 1.0; }
+    if (bass < 0.0)   { bass = 0.0; }
+    if (bass > 1.0)   { bass = 1.0; }
+    t = treble; m = mid; l = bass;
+
+    r1 = _TS_R1; r2 = _TS_R2; r3 = _TS_R3; r4 = _TS_R4;
+    c1 = _TS_C1; c2 = _TS_C2; c3 = _TS_C3;
+    r3s = r3 * r3;   // R3^2, appears in the middle-control terms
+
+    // Analog transfer-function coefficients (Yeh & Smith, Eqn. 1). The controls
+    // interact, so each coefficient mixes t, m, l (and the m^2 / l*m / t*m cross
+    // terms) — that coupling is the tone stack's whole character.
+    b1 = t * c1 * r1
+       + m * c3 * r3
+       + l * (c1 * r2 + c2 * r2)
+       + (c1 * r3 + c2 * r3);
+
+    b2 = t * (c1 * c2 * r1 * r4 + c1 * c3 * r1 * r4)
+       - m * m * (c1 * c3 * r3s + c2 * c3 * r3s)
+       + m * (c1 * c3 * r1 * r3 + c1 * c3 * r3s + c2 * c3 * r3s)
+       + l * (c1 * c2 * r1 * r2 + c1 * c2 * r2 * r4 + c1 * c3 * r2 * r4)
+       + l * m * (c1 * c3 * r2 * r3 + c2 * c3 * r2 * r3)
+       + (c1 * c2 * r1 * r3 + c1 * c2 * r3 * r4 + c1 * c3 * r3 * r4);
+
+    b3 = l * m * (c1 * c2 * c3 * r1 * r2 * r3 + c1 * c2 * c3 * r2 * r3 * r4)
+       - m * m * (c1 * c2 * c3 * r1 * r3s + c1 * c2 * c3 * r3s * r4)
+       + m * (c1 * c2 * c3 * r1 * r3s + c1 * c2 * c3 * r3s * r4)
+       + t * c1 * c2 * c3 * r1 * r3 * r4
+       - t * m * c1 * c2 * c3 * r1 * r3 * r4
+       + t * l * c1 * c2 * c3 * r1 * r2 * r4;
+
+    a0 = 1.0;
+
+    a1 = (c1 * r1 + c1 * r3 + c2 * r3 + c2 * r4 + c3 * r4)
+       + m * c3 * r3
+       + l * (c1 * r2 + c2 * r2);
+
+    a2 = m * (c1 * c3 * r1 * r3 - c2 * c3 * r3 * r4 + c1 * c3 * r3s + c2 * c3 * r3s)
+       + l * m * (c1 * c3 * r2 * r3 + c2 * c3 * r2 * r3)
+       - m * m * (c1 * c3 * r3s + c2 * c3 * r3s)
+       + l * (c1 * c2 * r2 * r4 + c1 * c2 * r1 * r2 + c1 * c3 * r2 * r4 + c2 * c3 * r2 * r4)
+       + (c1 * c2 * r1 * r4 + c1 * c3 * r1 * r4 + c1 * c2 * r3 * r4 + c1 * c2 * r1 * r3 + c1 * c3 * r3 * r4 + c2 * c3 * r3 * r4);
+
+    a3 = l * m * (c1 * c2 * c3 * r1 * r2 * r3 + c1 * c2 * c3 * r2 * r3 * r4)
+       - m * m * (c1 * c2 * c3 * r1 * r3s + c1 * c2 * c3 * r3s * r4)
+       + m * (c1 * c2 * c3 * r3s * r4 + c1 * c2 * c3 * r1 * r3s - c1 * c2 * c3 * r1 * r3 * r4)
+       + l * c1 * c2 * c3 * r1 * r2 * r4
+       + c1 * c2 * c3 * r1 * r3 * r4;
+
+    // Bilinear transform, s = c*(1-z^-1)/(1+z^-1) with c = 2*fs (Yeh & Smith,
+    // Eqn. 2). The overall sign the paper carries on both numerator and
+    // denominator cancels in the ratio, so it is kept verbatim.
+    c = 2.0 * sample_rate;
+    cc = c * c;
+    ccc = cc * c;
+
+    bb0 = 0.0 - b1 * c - b2 * cc - b3 * ccc;
+    bb1 = 0.0 - b1 * c + b2 * cc + 3.0 * b3 * ccc;
+    bb2 = b1 * c + b2 * cc - 3.0 * b3 * ccc;
+    bb3 = b1 * c - b2 * cc + b3 * ccc;
+
+    aa0 = 0.0 - a0 - a1 * c - a2 * cc - a3 * ccc;
+    aa1 = 0.0 - 3.0 * a0 - a1 * c + a2 * cc + 3.0 * a3 * ccc;
+    aa2 = 0.0 - 3.0 * a0 + a1 * c + a2 * cc - 3.0 * a3 * ccc;
+    aa3 = 0.0 - a0 + a1 * c - a2 * cc + a3 * ccc;
+
+    // Normalise by A0 so the difference equation needs no divide per sample.
+    ts.nb0 = bb0 / aa0;
+    ts.nb1 = bb1 / aa0;
+    ts.nb2 = bb2 / aa0;
+    ts.nb3 = bb3 / aa0;
+    ts.na1 = aa1 / aa0;
+    ts.na2 = aa2 / aa0;
+    ts.na3 = aa3 / aa0;
+}
+
+// Process one sample through the tone stack (Direct Form I, 3rd order) and
+// return the filtered output. The per-sample cost is a seven-term multiply-add
+// plus a six-slot history shift — no divide, no transcendental.
+tonestack_tick(tstack, x: float) -> float {
+    auto ts: ToneStack, y;
+    ts = tstack;
+    y = ts.nb0 * x + ts.nb1 * ts.x1 + ts.nb2 * ts.x2 + ts.nb3 * ts.x3
+      - ts.na1 * ts.y1 - ts.na2 * ts.y2 - ts.na3 * ts.y3;
+    ts.x3 = ts.x2; ts.x2 = ts.x1; ts.x1 = x;
+    ts.y3 = ts.y2; ts.y2 = ts.y1; ts.y1 = y;
+    return y;
+}
+
+// Clear the filter memory (the six history slots) back to silence. Use between
+// render passes so the tone stack does not carry a transient across runs; the
+// coefficients are untouched, so the knob setting survives.
+void tonestack_reset(tstack) {
+    auto ts: ToneStack;
+    ts = tstack;
+    ts.x1 = 0.0; ts.x2 = 0.0; ts.x3 = 0.0;
+    ts.y1 = 0.0; ts.y2 = 0.0; ts.y3 = 0.0;
+}
+
+// Free a tone stack allocated by tonestack_new.
+void tonestack_free(tstack) {
+    free(tstack);
+}
