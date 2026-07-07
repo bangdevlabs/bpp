@@ -914,3 +914,32 @@ bootstrap gen2==gen3 (1-cycle, expected — the compiler re-emits its own
 (Stage F is a64-only — `_x64_regalloc_apply` discards the scan's output,
 so x64 codegen is inert to this change; x64 spring acc bit-identical);
 zero warnings; binary +64 bytes.
+
+### 2026-07-07 — pre-S1 baseline cut (after the storage + annotation cleanup)
+
+Re-ran the full catalog before opening the FP-scheduler S1, to confirm the
+storage/annotation cleanup (a large parser+dispatch churn) was truly
+codegen-neutral and to fix the baseline S1 is measured against.
+
+| kernel (20M) | ours (min) | gcc -O2 | ratio |
+|---|---|---|---|
+| xform (int throughput) | 6.85 ms | 6.16 ms | 1.11× |
+| lcg (int serial) | 18.69 ms | 20.09 ms | 0.93× (faster than gcc) |
+| biquad (FP serial) | 44.48 ms | 45.84 ms | 0.97× (parity) |
+| manylive (many-live) | 103.4 ms | 80.8 ms | 1.28× |
+| conv (1024-tap FIR, 100k) | 292 ms | 85 ms | **3.4×** |
+
+Bootstrap self-compile (`bench_compile.sh`) 0.33 ms min — unchanged from the
+Stage-F state (the cleanup removed dead branches but is byte-identical, so
+this is within noise). The whole point: **the cleanup changed nothing here** —
+biquad is still at parity and conv is still 3.4×, so the storage system was NOT
+limiting codegen.
+
+This baseline sharpens S1's target. The biquad (FP serial) is already at parity
+because its float leaves are PROMOTED VARS (T_VAR), which the float
+compute-in-place + fmadd fusion already handle. The convolution is the lone
+3.4× outlier precisely because its float leaves are `peekfloat(ptr)` loads,
+which fall off the CIP path (cg_float_tree_need does not accept them) and pay
+the generic value-stack. So S1 — teaching cg_float_tree_need / cg_emit_float_into
+to accept `peekfloat` as a float leaf — is not a new lever; it extends the
+already-parity machinery to the one leaf shape a pointer-walking FIR uses.
