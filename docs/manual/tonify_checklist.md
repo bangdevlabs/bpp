@@ -56,17 +56,15 @@ main) or because you want the intent on the page.
 
 **On `static` for data (2026-07-07 storage cleanup — read this):** `static`
 marks a top-level variable **module-private**, the same contract it has
-always carried for functions. The parser records it (`glob_static[]`) and the
-compiler ENFORCES it as far as it currently can: a `static` global that would
-alias a same-named global in another module is rejected with **E271** (today
-same-named globals share one data slot, so `static` cannot yet give it a
-private slot — the alias is refused instead of silently allowed). What
-`static` does NOT yet do is give each same-named module-private global its own
-distinct slot — that is the deferred *module-private-data* arc, justified only
-when static-name collisions become a real problem (as of this writing the
-whole tree has zero). So: use `static` to state "private to this module" and
-to get the E271 guard; do not rely on two modules each having a private
-`static x` with the same name (E271 will stop you until the slots arc lands).
+always carried for functions, and the compiler now makes it REAL. The parser
+records it (`glob_static[]`); a `static` global whose name collides with a
+different-module global is given its own distinct data slot via a mangled
+internal name (`<name>__mp<module>`), and references within its module are
+rewritten to it — so two modules can each hold a private `static x` and they
+will NOT alias. Non-colliding statics are untouched (a program with no
+collisions compiles byte-for-byte the same), so this costs nothing until you
+actually reuse a name. A `static` global is invisible to another module's
+`extrn` (privacy is enforced by the distinct slot, not merely intended).
 
 Two forms that USED to parse and no longer do (both were no-ops the cleanup
 removed): `auto x: serial;` (the "never promote" pin — zero uses; explicit
@@ -89,14 +87,11 @@ different module — typically because the consumer is upstream of the
 declaration in the call graph and cannot inline.
 
 `static const X = value;` is the same shape as `global const` — a real
-read-only `.data` slot, E263-enforced against writes — declared with the
-module-private *intent*. Honest caveat (2026-07-07): the privacy is enforced
-by E271 (a same-named collision across modules is refused), NOT yet by a
-distinct per-module symbol; two modules cannot both hold a private
-`static const X` with the same name until the module-private-data arc gives
-them separate slots. In practice this is a non-issue — pick a module-scoped
-name (the `_mx_` / `_bugviz_` prefix convention already does) and it never
-arises.
+read-only `.data` slot, E263-enforced against writes — but **module-private**:
+its symbol is local to the declaring module, so another module's `extrn X;`
+cannot resolve to it, and a same-named `static const` in a different module
+gets its own distinct slot (2026-07-07). Use it for an addressable constant
+that should not leak across modules.
 
 The trap that motivated the dedicated slot variants (sidequest 2026-05-14):
 `stb/stbrender.bsm` declares `extrn SCREEN_W;` and dereferences it inside

@@ -1499,6 +1499,11 @@ static _cgb_walk(nd) {
         if (p.ntype == T_VAR) {
             name_p = p.a;
             if (dsp_is_local(name_p) == 0) {
+                // Module-private data: rewrite a colliding static's write target
+                // to its mangled name (no-op when the program has no collisions).
+                auto _wrp;
+                _wrp = _mpg_resolve(name_p);
+                if (_wrp != name_p) { p.a = _wrp; name_p = _wrp; }
                 if (is_strided(name_p) == 0) {
                     _cgb_impure = 1;
                 }
@@ -1541,6 +1546,11 @@ static _cgb_walk(nd) {
     if (t == T_VAR) {
         name_p = n.a;
         if (dsp_is_local(name_p) == 0) {
+            // Module-private data: rewrite a colliding static's read to its
+            // mangled name (no-op when the program has no collisions).
+            auto _rrp;
+            _rrp = _mpg_resolve(name_p);
+            if (_rrp != name_p) { n.a = _rrp; name_p = _rrp; }
             auto _gi;
             _gi = dsp_find_global(name_p);
             if (_gi >= 0) {
@@ -2570,50 +2580,107 @@ promote_globals() {
     // The show_promotions diagnostic already shows pre/post counts so the
     // programmer can manually verify freeze violations for now.
 
-    check_static_global_collisions();
     return _pg_promoted;
 }
 
-// E271 — a `static` global aliasing a same-named global in another module.
+// ── Module-private data: distinct slots for same-named `static` globals ──
 //
-// `static` on a data declaration promises "private to my module". But until
-// the module-private-data arc gives each such global its OWN data slot, the
-// codegen dedups globals by NAME repo-wide (cg_bridge_data), so two same-named
-// globals in different modules share ONE slot — a silent alias. When one of
-// them is `static`, that alias breaks the privacy promise: another module can
-// read or clobber what was meant to be private. Rather than silently alias (the
-// class of bug that hid cross-target constant collisions in the past), reject
-// it, so the contract the parser now records (glob_static) is actually enforced
-// even before distinct slots exist.
+// `static` on a top-level variable promises "private to my module". The
+// codegen resolves and dedups globals BY NAME (cg_bridge_data, emit_*_global),
+// so two same-named globals in different modules would otherwise share one data
+// slot — a silent alias, the shape of the cross-target constant bug of the past.
+// To honour the privacy promise, a `static` global whose name COLLIDES with a
+// different-module global is given a unique mangled name, and every reference to
+// it WITHIN its own module is rewritten to that name (references from other
+// modules cannot see it — that is the privacy). Non-colliding statics are left
+// untouched, so a program with no collisions is byte-identical.
 //
-// The scan is over the ONE merged program: the per-OS backend files resolve by
-// target suffix (only one is ever parsed), so their same-named statics never
-// coexist here. O(n^2) over globals, but it runs once and only compares against
-// the static ones.
-check_static_global_collisions() {
-    auto i, j, name_i, name_j, mod_i, mod_j;
-    for (i = 0; i < glob_cnt; i++) {
-        if (arr_get(glob_static, i) == 0) { continue; }   // only static promises privacy
-        name_i = arr_get(globals, i);
-        mod_i  = arr_get(glob_mods, i);
-        for (j = 0; j < i; j++) {
-            name_j = arr_get(globals, j);
-            if (packed_eq(name_i, name_j) == 0) { continue; }
-            mod_j = arr_get(glob_mods, j);
-            if (mod_i == mod_j) { continue; }              // same module: not an alias across the boundary
-            diag_error(271);
-            diag_str("static global '");
-            diag_packed(name_i);
-            diag_str("' aliases a same-named global in another module");
-            diag_newline();
-            diag_str("  = help: same-named globals share one data slot today, so `static` cannot");
-            diag_newline();
-            diag_str("          keep this private — rename it, or drop `static` if sharing is intended");
-            diag_newline();
-            break;                                          // one report per static global is enough
+// Parallel map over the colliding statics only: original name, defining module,
+// the globals[] index, and the mangled unique name.
+static auto _mpg_orig;      // arr: original packed name
+static auto _mpg_mod;       // arr: defining module index
+static auto _mpg_idx;       // arr: index into globals[]
+static auto _mpg_mangled;   // arr: mangled packed name
+
+// Build a mangled packed name `<orig>__mp<mod>` in vbuf. C-safe (only
+// [A-Za-z0-9_]) so the C emitter can use it as an identifier, and the `__mp`
+// infix keeps it out of hand-written namespaces (like `__synth_`).
+static _mpg_make_name(orig, mod) {
+    auto start, olen, osrc, i, tmp, digits;
+    start = vbuf_pos;
+    olen = unpack_l(orig);
+    osrc = vbuf + unpack_s(orig);
+    for (i = 0; i < olen; i++) { poke(vbuf + vbuf_pos, peek(osrc + i)); vbuf_pos++; }
+    poke(vbuf + vbuf_pos, '_'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, '_'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, 'm'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, 'p'); vbuf_pos++;
+    tmp = mod;
+    if (tmp == 0) {
+        poke(vbuf + vbuf_pos, '0'); vbuf_pos++;
+    } else {
+        digits = 0;
+        while (tmp > 0) { digits++; tmp /= 10; }
+        vbuf_pos += digits;
+        tmp = mod;
+        for (i = 0; i < digits; i++) {
+            poke(vbuf + vbuf_pos - 1 - i, '0' + tmp % 10);
+            tmp /= 10;
         }
     }
+    return pack(start, vbuf_pos - start);
+}
+
+// Detect module-private globals whose name collides with a different-module
+// global, mangle their DEFINITIONS, and record the mapping for reference
+// rewriting. Runs once BEFORE call_graph_build (which rewrites the references
+// as it walks). Two phases so collisions are detected on the ORIGINAL names
+// before any name is mutated: both sides of a static-vs-static collision get
+// mangled. O(n^2) but one-shot; the common case (no collisions) exits with
+// three empty arrays and the resolver below short-circuits.
+mangle_private_globals() {
+    auto i, j, collides;
+    _mpg_orig = arr_new(); _mpg_mod = arr_new();
+    _mpg_idx = arr_new();  _mpg_mangled = arr_new();
+    // Phase 1: detect (on original names, no mutation yet).
+    for (i = 0; i < glob_cnt; i++) {
+        if (arr_get(glob_static, i) == 0) { continue; }
+        collides = 0;
+        for (j = 0; j < glob_cnt; j++) {
+            if (j == i) { continue; }
+            if (packed_eq(arr_get(globals, i), arr_get(globals, j)) == 0) { continue; }
+            if (arr_get(glob_mods, j) == arr_get(glob_mods, i)) { continue; }
+            collides = 1;
+            break;
+        }
+        if (collides == 0) { continue; }
+        _mpg_orig    = arr_push(_mpg_orig,    arr_get(globals, i));
+        _mpg_mod     = arr_push(_mpg_mod,     arr_get(glob_mods, i));
+        _mpg_idx     = arr_push(_mpg_idx,     i);
+        _mpg_mangled = arr_push(_mpg_mangled, _mpg_make_name(arr_get(globals, i), arr_get(glob_mods, i)));
+    }
+    // Phase 2: rewrite the definitions to the mangled names.
+    for (i = 0; i < arr_len(_mpg_idx); i++) {
+        arr_set(globals, arr_get(_mpg_idx, i), arr_get(_mpg_mangled, i));
+    }
     return 0;
+}
+
+// Reference resolver, called from _cgb_walk at each global-reference site. If
+// `name_p` names a colliding module-private global DEFINED in the current
+// function's module, return its mangled name (the caller rewrites the AST node);
+// otherwise return `name_p` unchanged. The fast path (no collisions in the whole
+// program) is a single length check.
+_mpg_resolve(name_p) {
+    auto k, mod;
+    if (_mpg_orig == 0) { return name_p; }
+    if (arr_len(_mpg_orig) == 0) { return name_p; }
+    mod = arr_get(func_mods, _cgb_current_fn_idx);
+    for (k = 0; k < arr_len(_mpg_orig); k++) {
+        if (arr_get(_mpg_mod, k) != mod) { continue; }
+        if (packed_eq(arr_get(_mpg_orig, k), name_p)) { return arr_get(_mpg_mangled, k); }
+    }
+    return name_p;
 }
 
 // Print a human-readable summary of the auto-promotion decisions to stderr.

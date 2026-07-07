@@ -15450,3 +15450,50 @@ The through-line with the same day's `@fast`/`@seq` correction: b++'s surface
 should never claim to do something it doesn't. A swallowed prefix, a
 write-only module index, a parse-but-ignore hint — all the same rot, and all
 now either real or gone.
+
+## 2026-07-07 (F2b) — module-private data made real: distinct per-module slots for same-named statics
+
+The user wanted the complete design, not the deferred half — so the expensive
+piece F2a had banked got built, and it turned out far smaller and safer than
+its "3-backend codegen rework" billing, because the whole compiler resolves
+globals BY NAME. `emit_load_global(name_p)` / `emit_store_global` / the
+relocation resolvers all match on the packed name, so making `static` real
+needed no backend change at all — only a unique NAME for a colliding private
+global, and the reference rewrite to match.
+
+**The mechanism.** A new pre-pass, `mangle_private_globals()`, runs before
+call_graph_build. It finds every `static` global whose name collides with a
+different-module global, gives it a mangled internal name (`<name>__mp<module>`
+— C-safe, so the C emitter uses it verbatim), and records the mapping.
+Reference rewriting rides the existing dispatch walker: `_cgb_walk` already
+visits every global read and write with correct local-vs-global discrimination
+(the analysis that builds glob_readers/writers), so a two-line hook at the read
+site and the write site — `_mpg_resolve(name_p)` returns the mangled name for a
+colliding static in the current function's module — rewrites the AST node in
+place. Codegen, running later over the same nodes, emits the mangled symbol and
+the distinct slot falls out of the existing by-name dedup for free.
+Non-colliding statics are never touched; the resolver's fast path is a single
+`arr_len == 0` check, so a program with no name collisions is byte-identical.
+
+**E271 lived one commit and died.** F2a's stopgap — REJECT a static that would
+alias — was the honest thing while separation didn't exist. Once F2b makes the
+separation real, the rejection is simply wrong (the two statics are now
+independent), so the check and the error were removed and the xfail gate became
+a POSITIVE test: two modules each declare `static auto _shared_scratch`, write
+different values, and prove neither disturbs the other. Number 271 burned.
+
+**Verification — all three backends, byte-identical where it must be.** The
+positive test passes on a64 native, on x64 ELF run under Docker/Rosetta, and
+through the C emitter (cc-compiled) — three independent proofs the mangled slot
+is genuinely distinct. And the whole compiler cross-compiled to x64 is
+BYTE-IDENTICAL between the F2a and F2b compilers, as is every native binary
+(bench_conv, sound_fusion) — the collision-free tree is provably unchanged.
+Bootstrap gen2==gen3 + 5x determinism PASS; suites 240/0/12 native + 198/0/54
+C-emit; zero warnings.
+
+**The whole storage arc, closed.** `static` on data went from a swallowed
+no-op (F0 diagnosis) → a recorded contract (F1) → an E271-guarded promise (F2a)
+→ a real distinct-slot enforcement (F2b), with the dead surface (`: serial`,
+bare `x;`, `static extrn`) gone and the docs telling the truth (F3). The
+three-axis storage model — dispatch/lifetime × visibility × mutability — now
+has all three axes actually implemented, functions and data alike.

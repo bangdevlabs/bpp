@@ -568,12 +568,11 @@ const PI   = 3.14159;          // float bits preserved via SHAPE_DECIMAL
 // writes (E263 — "cannot assign to const slot 'X'").
 global const SCREEN_W = 320;
 
-// Module-private immutable slot. Same shape as `global const`, declared
-// with module-private intent (`static`). The compiler enforces that
-// intent with E271 — a same-named `static` in another module is rejected
-// rather than aliased — but does NOT yet emit a distinct per-module
-// symbol (the deferred module-private-data arc). Use a module-scoped name
-// and it is moot.
+// Module-private immutable slot. Same shape as `global const`, but the
+// symbol is local to the declaring module: another module's `extrn` cannot
+// resolve to it, and a same-named `static` elsewhere gets its own distinct
+// slot (mangled internally). Use when a constant needs an addressable slot
+// but must not leak across modules.
 static const _MX_MAX_VOICES = 10;
 ```
 
