@@ -114,6 +114,26 @@ To implement:
    regions) is more work for diminishing return — **low priority**: the SysV
    register pressure caps the win.
 
+**ATTEMPTED + REVERTED 2026-07-07 — the 1-temp pool is not enough; a wider
+pool is a HARD prerequisite, not an optimisation.** Filling the four stubs and
+flipping `int_temp_count` to a real count (r11, 1 deep) passed the arithmetic
+benchmarks but MISCOMPILED the compiler's own struct-lookup on the x64
+self-host (`E101 unknown type 'FieldRec'` — packed-name / registry code hit the
+register-pressure hole). Two real bugs surfaced and were fixed en route, worth
+recording for the next attempt: (a) the spine's **integer madd fusion**
+(`(a*b)+c` → `emit_imadd`) needs up to 2 temps for the multiplicands, but
+`cg_int_tree_need` under-counts that peak, so the second `int_temp_alloc`
+returned −1 (garbage) on the 1-deep pool — the fusion is also USELESS on x64
+(no integer FMA), so gate it off via a `has_int_madd` chip predicate (a64=1,
+x64=0) and let the CIP decompose to imul+add; (b) an idiv/imadd that placed the
+product/quotient in **rax must not blind-save/restore rax** — `dreg` CAN be rax
+(the return register), so the restore overwrites the result (save rax/rdx only
+when they are NOT the destination). Even with both fixed, more shapes broke —
+the 1-deep freelist is genuinely too tight for the compiler's own code. So the
+gate is confirmed: reliable x64 int-CIP needs the **wider pool FIRST**, and the
+whole feature stays **low-value** (integer serial code has ample headroom).
+Docker caught every one of these; a64 was byte-identical throughout.
+
 ### Constant promotion (Stage 2a) — ✅ SHIPPED on x64 (no longer deferred)
 
 Closed since this section was written: `_x64_b3_select_prim()` now chains
