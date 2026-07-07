@@ -9,8 +9,9 @@ disasm the reference before naming the gap) is decisive: it is NOT vectorized
 (0 packed ops); it is scalar, unrolled 4× with independent `fmul`s that fill the
 FP units and shorten the critical path, then a serial `fadd` chain in the SAME
 order (no reassociation). So the gap is instruction SCHEDULING, and because gcc
-stays bit-exact, a b++ scheduler can match it WITHOUT the FP-non-associativity
-`@fast` opt-in — the unroll + mul/add separation alone recovers most of the 3.46×.
+stays bit-exact, a b++ scheduler can match it WITHOUT any FP-reassociation
+opt-in (no such mechanism exists in b++ anyway — see the correction note in
+Phase 2) — the unroll + mul/add separation alone recovers most of the 3.46×.
 This is the measured, scheduling-bound audio gap that moves Phase 2 from
 "deferred/speculative" to "the next compiler arc." See
 `docs/manual/benchmarks.md` (the 2026-07-06 FIR-convolution entry) for the full
@@ -109,11 +110,22 @@ mutually independent; only the feedback (`a1*y1, a2*y2`) is loop-carried.
   shows a gap.
 - **Correctness caveat:** floating-point addition is **not associative** —
   reassociating `a + b + c` changes rounding. gcc only does this under
-  `-ffast-math`. So Phase 2 must be **opt-in** (a `@fast` / `: fast` annotation
+  `-ffast-math`. So Phase 2 must be **opt-in** (a hypothetical `@fast` annotation
   on the function or expression, or a compiler flag), never the default, and the
   checksums for a reassociated kernel will legitimately differ in the last bits.
   This is the one place "byte-identical to the scalar path" cannot be the gate;
   use an epsilon comparison + a documented tolerance.
+  **(CORRECTION 2026-07-07: `@fast` was only ever THIS plan's sketch for a
+  mechanism that would have to be designed — no such annotation exists in b++.
+  The language's real annotation surface is `@safe` (the only function
+  annotation, bpp_parser.bsm ~2039), statement-level `@profile("zone")`, and
+  the `@seq`/`@par`/`@gpu` dispatch hints before a `while`; the old phase
+  keywords are E260-deprecated. Later docs repeated "`@fast` opt-in" as if it
+  were an established mechanism — it is not. Per the 2026-07-07 addendum below,
+  the conv arc needs NO reassociation at all, so no such mechanism needs to be
+  designed for it; if a multiple-accumulator S4 is ever justified, designing
+  the opt-in is part of that increment's work, and `@safe`'s parser path is the
+  pattern to follow.)**
 
 ## Gate + measurement
 
@@ -132,3 +144,63 @@ Phase 1 is the integer levers' float twin — cheap, low-risk, and it removes th
 associativity correctness question, so it earns the opt-in gate and a real audio
 benchmark before it ships. Measure after Phase 1 before deciding how far Phase 2
 needs to go.
+
+---
+
+## ADDENDUM (2026-07-07) — the pre-arc disasm decomposes the 3.46×, and it is NOT (mostly) scheduling
+
+Before writing any scheduler, the house discipline (disasm OUR OWN kernel the
+way the CIP arc disasm'd gcc's) was applied to `conv_tick`'s inner loop as the
+Stage-F compiler emits it today. The finding restructures the arc: the bulk of
+the 3.46× is the **float value-stack**, not instruction order. Per tap we emit
+~16 instructions including **two full stack round-trips**:
+
+```
+fmov d0, d8               ; acc (promoted d8!) funneled into d0
+str  d0, [sp, #-0x10]!    ; PUSH acc to the fpush value-stack (memory!)
+ldr  d0, [x21]            ; load ir[k]           (ip promoted x21 — good)
+str  d0, [sp, #-0x10]!    ; PUSH it (memory again)
+ldr  d0, [x22]            ; load hist            (bp promoted x22 — good)
+ldr  d1, [sp], #0x10      ; POP the ir value back
+fmul d0, d1, d0
+ldr  d1, [sp], #0x10      ; POP acc back
+fadd d0, d1, d0           ; no fmadd fusion
+fmov d8, d0               ; funnel back out to acc
+add  x21, x21, #8 ; sub x22, x22, #8 ; add x23, x23, #1
+b    (top-tested while: cmp+b.ge at top, unconditional b at bottom)
+```
+
+RegAlloc already did its job (acc→d8, ip/bp/k→x21-x23). What failed is the
+**float compute-in-place**: `cg_float_tree_need` accepts T_VAR/T_LIT/T_MEMLD
+leaves but NOT `peekfloat(addr)` — which is exactly how a pointer-walking FIR
+reads its operands — so `acc = acc + peekfloat(ip)*peekfloat(bp)` falls off the
+CIP path entirely, losing the fmadd fusion (which the CIP already has,
+line ~3716) and paying the generic accumulator stack. This is the float twin of
+the integer CIP memory-leaf bug (2026-06-17: "checked n.b!=8 but subscripts
+carry hint 0" — the lever existed, the leaf test starved it).
+
+**Corrected attack order** (cheapest first, measure between, all bit-exact
+until S3):
+
+- **S1 — peekfloat as a float-CIP leaf.** Extend `cg_float_tree_need` /
+  `cg_emit_float_into` to accept `peekfloat(addrTree)` where the address tree
+  fits the INTEGER temp budget (the same cross-pool validation the T_MEMLD case
+  already does). Expected per-tap: `ldr, ldr, fmadd d8,dA,dB,d8` + loop control
+  — kills both stack round-trips, the d0 funnel, and un-starves the existing
+  fmadd fusion in one move. Bit-exact (pure copy/traffic elimination).
+- **S2 — while-loop bottom-test fusion**, if the disasm after S1 still shows
+  `cmp+b.ge` at top plus unconditional `b` at bottom (the for-loop fusion lever
+  may not cover `while`). Two branches per tap → one. Bit-exact.
+- **S3 — unroll ×4 + mul/add separation** (the genuine scheduling residual,
+  gcc's shape: batched independent `fmul`s + the `fadd` chain in SOURCE order).
+  NOTE: gcc's own kernel proves this form is bit-exact — the accumulator adds
+  stay serially ordered; only the loads/muls are hoisted. NO reassociation
+  opt-in is needed for this step; one would only be needed for
+  multiple-accumulator splitting, a possible S4 that current numbers may never
+  justify — and no such opt-in mechanism exists in b++ today (see the
+  correction note in Phase 2: `@fast` was a sketch, never a language feature).
+
+Estimate: S1 alone should cut the 284 ms hot loop to near the fmadd-serial
+bound; measure `bench_conv` after each stage and stop when the residual vs
+82 ms stops paying (per the "when to STOP" doctrine that closed the integer
+arc).

@@ -2,7 +2,7 @@
 
 **Status:** FUNCTIONALLY COMPLETE (2026-07-06). Increments 1 (SVF) + 2 (stbdrive) + 3 (stboversample) + 4 (FMV tone stack) + 5 (stbamp topology) + 6 (blondie_amp plugin + sound_fusion insert) + 7 (stbconv convolution cab + the Stage-F measurement) DONE. The arc delivered its two goals: a playable Bassman AND the FIR workload that measures the FP scheduler.
 
-**Inc 7 verdict (`61d0ae1`):** `stb/stbconv.bsm` = direct FIR convolution (double-length ring → branchless two-pointer MAC); `amp_set_cab_ir` swaps the cheap cab for a real IR (off by default; caller supplies license-clean IR data). **The measurement (the arc's real payoff):** `bench_conv` 1024-tap FIR is **3.46× gcc -O2** (284 vs 82 ms, bit-identical checksums), and disassembling gcc proves the gap is **instruction scheduling, NOT SIMD** (scalar, unrolled 4× with independent fmuls filling the FP units; no reassociation). This **justifies Alavanca 3 (the FP scheduler)** with a real audio workload, and — because gcc stays bit-exact — a b++ scheduler can match it WITHOUT the `@fast` opt-in. See `docs/plans/fp_serial_scheduler.md` (Phase 2 un-deferred) + `docs/manual/benchmarks.md` (2026-07-06 FIR entry).
+**Inc 7 verdict (`61d0ae1`):** `stb/stbconv.bsm` = direct FIR convolution (double-length ring → branchless two-pointer MAC); `amp_set_cab_ir` swaps the cheap cab for a real IR (off by default; caller supplies license-clean IR data). **The measurement (the arc's real payoff):** `bench_conv` 1024-tap FIR is **3.46× gcc -O2** (284 vs 82 ms, bit-identical checksums), and disassembling gcc proves the gap is **instruction scheduling, NOT SIMD** (scalar, unrolled 4× with independent fmuls filling the FP units; no reassociation). This **justifies Alavanca 3 (the FP scheduler)** with a real audio workload, and — because gcc stays bit-exact — a b++ scheduler can match it WITHOUT any FP-reassociation opt-in (no such mechanism exists in b++; `@fast` was only ever the plan's sketch — see the correction note in `fp_serial_scheduler.md`). See `docs/plans/fp_serial_scheduler.md` (Phase 2 un-deferred) + `docs/manual/benchmarks.md` (2026-07-06 FIR entry).
 
 **Optional follow-ons (not blockers):** (a) source a real license-clean cab IR .wav — the engine + wiring are done, only the data is missing; (b) the sound_fusion GUI rework the five inserts are asking for; (c) partitioned FFT convolution if a very long IR is ever needed. **The named next COMPILER arc is the FP scheduler**, now with `bench_conv` as its target.
 
@@ -133,8 +133,9 @@ IR convolution.
    (toggle AMP on a channel and drive it).
 7. **`stbconv` + a real speaker IR** (the endgame): direct short-FIR convolution
    (reuses `stbdelay`'s ring buffer) for a real Bassman cab. This is the Stage-F
-   consumer — measure the FP scheduler here; reassociation of the FIR dot-product
-   is `@fast`-opt-in (FP add is not associative). If the IR is long, partitioned
+   consumer — measure the FP scheduler here; any reassociation of the FIR
+   dot-product needs an opt-in mechanism (FP add is not associative — and per
+   the 2026-07-06 disasm, none is needed: gcc's transform is bit-exact). If the IR is long, partitioned
    FFT convolution is the follow-on (a further FFT/Stage-F consumer).
 
 ## Discipline

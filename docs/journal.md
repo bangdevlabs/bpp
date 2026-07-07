@@ -15250,8 +15250,8 @@ not a test hack. The pink-noise WAV is gitignored (MBs, reproducible).
 **Named next + a flagged debt.** Inc 7 (stbconv + a real speaker IR) is the
 endgame AND the primary Stage-F consumer — a genuine FIR dot-product to
 finally measure the FP scheduler against gcc -O2 (build the scheduler ONLY
-if that shows a scheduling-bound gap; reassociation is `@fast`-opt-in
-because FP add isn't associative). And the user flagged the GUI is getting
+if that shows a scheduling-bound gap; any reassociation would need an opt-in
+mechanism because FP add isn't associative). And the user flagged the GUI is getting
 cramped with five inserts — a rework is due; the proposal on the table is
 "edit one insert at a time" (a channel-strip with a fixed-height selected-
 insert param panel) so it scales past N plugins and frees room for the
@@ -15303,11 +15303,15 @@ loop overhead.
 scheduling-bound audio gap justifying it — `fp_serial_scheduler.md` Phase 2
 moves from "deferred, speculative" to "the next compiler arc," exactly the
 trigger the 2026-06-17 note asked for. (2) Because gcc stays BIT-EXACT while
-getting 3.46×, a b++ scheduler can match it WITHOUT the FP-non-associativity
-`@fast` opt-in — the unroll + multiply/add separation recovers most of the gap
+getting 3.46×, a b++ scheduler can match it WITHOUT any FP-reassociation
+opt-in — the unroll + multiply/add separation recovers most of the gap
 before multiple-accumulator reassociation (which changes rounding) is even on
 the table. That removes the single scariest piece of complexity the deferral
-was worried about.
+was worried about. (Correction, 2026-07-07: earlier phrasings called that
+opt-in "`@fast`" as if it existed — it never did; it was only the plan's
+sketch for a mechanism to be designed. b++'s real annotations are `@safe`,
+`@profile("zone")`, and the `@seq/@par/@gpu` loop hints. The user caught the
+drift; the plan carries the correction note.)
 
 **Where the arc stands.** The blondie_amp arc is functionally complete: a
 playable Bassman (preamp + tone stack + a cab that can now be a real IR), every
