@@ -965,3 +965,38 @@ bench_codegen + sound_fusion binaries byte-identical pre/post (the other kernels
 don't use peekfloat), so zero regression; md5 f61fac72 intact. The residual
 1.74× is now the genuine scheduling gap (gcc unrolls ×4 with independent fmuls)
 — S3 — plus one `fmov d8,d0`/tap (S2).
+
+### 2026-07-07 (S2) — FP scheduler S2: accumulator fmadds into the destination — conv reaches parity
+
+S1 left a `fmov d8,d0` per tap: the float assign-into-dest lever's blanket
+"RHS must not use the target" gate rejected the accumulator `acc = acc + a*b`
+(it uses acc), forcing a compute-in-d0-then-copy. But the accumulator is safe to
+compute into its own register (the target is read as the fmadd addend before the
+single write). S2 (`cg_float_acc_into_ok`) admits the `<promoted target> +|- expr`
+shape.
+
+| bench_conv (1024-tap, 100k) | ours | gcc -O2 | ratio |
+|---|---|---|---|
+| pre-S1 | 292 ms | 85 ms | 3.4× |
+| S1 (peekfloat leaf) | 148 ms | 85 ms | 1.74× |
+| **S2 (acc fmadd-into-dest)** | **90–92 ms** | 90 ms | **1.02× (parity)** |
+
+Interleaved 8-run min: ours 92, gcc 90. Inner loop is now
+`ldr d2,[x21]; ldr d3,[x22]; fmadd d8,d2,d3,d8; ip++; bp--; k++; cmp; branch` —
+removing the fmov also shortened the loop-carried critical path (it had been in
+the fmadd→fmov→next-fmadd chain). Every bench_codegen checksum unchanged
+(bit-exact; the relaxation also fires on the biquad accumulator, neutral);
+sound_fusion md5 f61fac72 intact.
+
+**S3 assessment — the gap is gone; STOP.** The convolution is now at parity
+(1.02×). gcc's ×4 unroll (the S3 target) buys nothing here because the
+loop-carried critical path is the fmadd-chain LATENCY (~4 cycles/tap), which
+dominates both our clean chain and gcc's unrolled-but-serial-add version; the
+loop overhead already hides in the fmadd's shadow. So S3 (cross-iteration
+scheduling, the "PhD lever" with the FP-associativity opt-in question) is
+**deferred as unjustified** — the same measure-first stop that closed the
+integer arc at parity and deferred this very scheduler in 2026-06-17. Building it
+now would chase a gap the measurement says does not exist. The FP-serial arc is
+**closed at parity** (biquad 0.97× since Phase 1, conv 1.02× after S1+S2), with
+S3 available if a future workload (an FFT butterfly bank) ever shows a real
+scheduling-bound gap the fmadd chain cannot cover.

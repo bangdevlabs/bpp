@@ -201,19 +201,29 @@ until S3):
   Native-only (C emitter has its own path); verified a64 + x64 (Docker) + C-emit;
   bench_codegen + sound_fusion byte-identical (no regression). Residual: the
   genuine ×4-unroll scheduling gap (S3) + one `fmov d8,d0`/tap (S2).
-- **S2 — while-loop bottom-test fusion**, if the disasm after S1 still shows
-  `cmp+b.ge` at top plus unconditional `b` at bottom (the for-loop fusion lever
-  may not cover `while`). Two branches per tap → one. Bit-exact.
-- **S3 — unroll ×4 + mul/add separation** (the genuine scheduling residual,
-  gcc's shape: batched independent `fmul`s + the `fadd` chain in SOURCE order).
-  NOTE: gcc's own kernel proves this form is bit-exact — the accumulator adds
-  stay serially ordered; only the loads/muls are hoisted. NO reassociation
-  opt-in is needed for this step; one would only be needed for
-  multiple-accumulator splitting, a possible S4 that current numbers may never
-  justify — and no such opt-in mechanism exists in b++ today (see the
-  correction note in Phase 2: `@fast` was a sketch, never a language feature).
+- **S2 — accumulator fmadd-into-destination. DONE (`ac7d4a6`, 2026-07-07).**
+  Turned out to be the bigger win, not a while-loop tweak. S1 left a `fmov d8,d0`
+  per tap because the float assign-into-dest lever's blanket "RHS must not use
+  the target" gate rejected `acc = acc + a*b`. `cg_float_acc_into_ok` admits the
+  `<promoted target> +|- expr` accumulator shape (safe: target read as the fmadd
+  addend before the single write). Inner loop → `ldr; ldr; fmadd d8,…,d8; bumps;
+  branch`; removing the fmov also shortened the loop-carried critical path.
+  **bench_conv 148 → 90 ms, 1.74× → 1.02× gcc -O2 (parity), bit-exact.** (The
+  `cmp+b.ge`-at-top-plus-`b`-at-bottom the original S2 targeted turned out not to
+  matter — the branches hide in the fmadd latency shadow.)
+- **S3 — cross-iteration scheduling (×4 unroll). DEFERRED — UNJUSTIFIED.** After
+  S1+S2 the convolution is at parity (1.02×, interleaved 8-run min 92 vs 90).
+  gcc's ×4 unroll buys nothing here: the loop-carried critical path is the
+  fmadd-chain LATENCY (~4 cycles/tap), which dominates both our clean chain and
+  gcc's unrolled-but-serial-add kernel, and the loop overhead already hides in
+  the fmadd's shadow. So S3 (the "PhD lever" carrying the FP-associativity
+  opt-in question) would chase a gap the measurement says is gone — the same
+  measure-first STOP that closed the integer arc at parity and deferred this
+  scheduler in 2026-06-17. Available if a future workload (an FFT butterfly bank,
+  a multi-accumulator reduction) ever shows a real scheduling-bound gap the
+  fmadd chain cannot cover.
 
-Estimate: S1 alone should cut the 284 ms hot loop to near the fmadd-serial
-bound; measure `bench_conv` after each stage and stop when the residual vs
-82 ms stops paying (per the "when to STOP" doctrine that closed the integer
-arc).
+**Arc closed at parity.** biquad 0.97× (Phase 1), conv 1.02× (S1+S2). S1 (the
+peekfloat leaf) removed the value-stack; S2 (accumulator fmadd-into-dest)
+removed the copy funnel. The residual is fmadd-serial latency, which is the same
+for gcc — there is no scheduling gap left to close on this workload.
