@@ -280,6 +280,158 @@ constant does). When the EQ slice of the channel-strip arc opens
 that existing technique, not `exp_f` — picking the RIGHT existing
 primitive for the job is itself part of this manual's point.
 
+## Cap 7 — Oversampling a nonlinearity (the anti-alias half-band FIR)
+
+A memoryless nonlinearity — a tube waveshaper, a hard clip — generates
+harmonics the input did not have. Any of those harmonics above the Nyquist
+frequency **fold back** (alias) into the audible band as inharmonic,
+metallic grit that no filter downstream can remove, because after aliasing
+the garbage sits at legitimate low frequencies. The fix is not a better
+clipper; it is running the clipper at a HIGHER sample rate where there is
+headroom for the new harmonics, then band-limiting and decimating back:
+
+```
+(a, b) = oversample_up(os, x);   // 1 sample -> 2 at 2x rate
+a = drive_tube(a, ...);          // shape BOTH at the doubled rate
+b = drive_tube(b, ...);
+y = oversample_down(os, a, b);   // filter out the folded content, decimate
+```
+
+`stb/stboversample.bsm` is the b++ implementation. The band-limiting filter
+is a **half-band FIR**: cutoff at exactly a quarter of the oversampled rate
+(= half the base Nyquist), and its defining property is that every EVEN tap
+except the centre is ZERO — `h(n) = 0` for `n = ±2, ±4, …`. That halves the
+multiplies AND makes the upsampler's job cheap: a zero-stuffed input passes
+straight through the centre tap on even output phases, and only the
+interpolated (odd) samples cost a full FIR. The taps come from the textbook
+ideal-sinc-times-a-window recipe (11-tap Hamming), normalised to unity DC
+gain so a constant passes unchanged — clean-room, no third-party source.
+
+Three testable properties nail the correctness (`tests/test_stboversample.bpp`):
+1. **Constant → clean (c, c) pair.** Upsampling a constant must yield the
+   constant on BOTH phases (unity gain, no zero-stuff dip). This is the
+   half-band signature and the strongest single check.
+2. **Slow sine round-trips delayed.** A passband sine comes back undistorted
+   with a constant group delay — **4.5 base samples** for a 2× half-band
+   (non-integer: each linear-phase filter contributes a constant and the 2×
+   resampling makes the total a half-integer). Comparing against an
+   INTEGER-delayed copy misreads the half-sample as ~5% distortion — measure
+   the delay empirically (or use the fractional value) before believing a
+   "distortion" number.
+3. **Stopband null.** A ±1 stream at the oversampled Nyquist (the highest
+   frequency the doubled rate carries) must be rejected to ~0. By the
+   half-band design the odd taps sum to 0.5, so the response there is
+   `h(0) − 2·(h1+h3+h5) ≈ 0.5 − 0.5 = 0`, hand-derivable.
+
+The half-band's summed-products form is also the intended small consumer for
+the deferred FP instruction scheduler (`fp_serial_scheduler.md`), the same
+"a real FIR to schedule" role the convolution cab fills at full scale.
+
+## Cap 8 — The FMV tone stack (an interacting passive network, from a paper)
+
+The Fender/Marshall/Vox Treble-Middle-Bass tone stack is the classic guitar
+tone control, and its character is that the three knobs are **not
+orthogonal**: they share one three-capacitor network, so turning one shifts
+what the others do, and the famous "mid scoop" at noon is the emergent shape
+of that coupling. Three independent shelving filters can never reproduce it;
+the real interacting network can, which is why `stb/stbtonestack.bsm` is a
+single 3rd-order IIR whose seven coefficients are recomputed from the three
+pot positions together, not three separate filters.
+
+**The clean-room path when the reference is GPL.** The obvious reference
+implementation is GPL-3.0 and Apache-2.0 b++ cannot pull it in — so the DSP
+math had to come from a PUBLIC, non-copyrightable source: the *equations*,
+not the code. The authoritative one is Yeh & Smith, "Discretization of the
+'59 Fender Bassman Tone Stack" (DAFx-06, `ccrma.stanford.edu/~dtyeh/papers/
+yeh06_dafx.pdf`). It gives the analog transfer function
+`H(s) = (b1·s + b2·s² + b3·s³)/(a0 + a1·s + a2·s² + a3·s³)` with the seven
+coefficients as multi-term polynomials in the pot positions (t, m, l) and
+the component values — the m²/l·m/t·m cross terms ARE the control
+interaction — and the bilinear transform (`s = c·(1−z⁻¹)/(1+z⁻¹)`, `c =
+2·fs`) to a digital 3rd-order filter. Transcribe the equations, implement,
+test; do NOT read the GPL code.
+
+**A method note worth keeping.** The paper's coefficient formulas are only
+in the PDF (its Figure 1 component values are an image). When the box has no
+`pdftotext`/`poppler`, the text is still recoverable by zlib-decompressing
+the PDF's own FlateDecode streams (a ~20-line python script) — the formulas
+came out verbatim. `'59 Bassman 5F6-A` values: R1/R2/R3/R4 =
+250k/1M/25k/56k, C1/C2/C3 = 250pF/.02µF/.02µF — swap them for a Marshall or
+Vox, same topology.
+
+The tests (`tests/test_stbtonestack.bpp`) pin the properties, not a
+reference implementation: **exact DC block** (the digital numerator
+coefficients sum to 0 — the series input cap gives `H(0)=0`, exact up to
+rounding), **passivity** (a unit sine never comes out larger), and each
+control moving its own band. The reference-behaviour proof is the flat-
+setting frequency response — it must be the textbook Fender mid-scoop (bass
+~0.83 → scoop bottom ~0.24 @ 640 Hz → treble ~0.60), which no coefficient
+typo would reproduce by accident.
+
+## Cap 9 — Amp topology (composing primitives is its own increment)
+
+A guitar-amp model is not one algorithm; it is a WIRING of the primitives
+above in the order the hardware uses them. `stb/stbamp.bsm` (Tier-2) owns no
+new DSP — it composes stboversample + three tube stages + the tone stack +
+a cab, in the '59 Bassman signal-chain order (a public hardware fact):
+
+```
+in·gain → up2x → [stage1][stage2] → tonestack → [stage3] → down2x → cab → out·level
+```
+
+A tube stage = one-pole input lowpass (the tube's Miller capacitance rolls
+off the top) → `drive_tube` asymmetric valve curve (the saturation) →
+one-pole coupling highpass (the coupling cap blocks the DC the asymmetric
+clip introduces before the next stage). Three cascade with escalating drive;
+the tone stack sits between stages 2 and 3 at the OVERSAMPLED rate (where the
+Bassman places its passive network); the cheap cab is one lowpass (~4 kHz
+speaker rolloff) + one highpass (~85 Hz cabinet limit) at base rate, the
+stepping stone a real impulse-response convolution (`stbconv`, later)
+replaces.
+
+The value test (`tests/test_stbamp.bpp`) verifies the composed behaviour, not
+the pieces (each has its own test): silence→silence, bounded/no-NaN at full
+drive, and — the defining nonlinear signature — **saturation that rises with
+gain**. The reference-behaviour proof measured how much the output grows when
+the input grows 10×: at low gain **9.6×** (near-linear), at high gain
+**1.0×** — full tube saturation, the level-independent "singing sustain" of a
+cranked amp. That single number is the difference between a working amp model
+and a fancy EQ.
+
+**The playtest lesson (the manual's real point here).** When the amp was
+first auditioned, its tone controls sounded flat and indistinct — and the
+temptation was to declare the DSP broken and start changing coefficients.
+The discipline (Tonify Rule 28 / measure-don't-believe, applied to one's OWN
+work) said measure first: a low-drive frequency sweep showed the controls DO
+move distinct, correct bands, and a level probe showed the amp is not quiet.
+The real cause was the **test signal** — a sine carries energy at one
+frequency, so no broadband EQ can sound distinct on it, and a passive Fender
+stack is authentically subtle. Nothing was broken; nothing was changed. The
+right test signal (Cap 10) revealed the controls working. Reach for the
+correct measurement before "fixing" a DSP block that a bad test made look
+wrong.
+
+## Cap 10 — Test signals: pink noise for a broadband EQ
+
+To hear (or measure) what a tone control does across the spectrum, the input
+must HAVE energy across the spectrum. A sine has it at one frequency only, so
+an EQ on a sine moves almost nothing — the wrong tool for auditioning a tone
+stack. **Pink noise** (`stb/stbnoise.bsm`, `noise_pink`) carries equal energy
+per OCTAVE (a −3 dB/octave tilt), which is what sounds "even" to the ear and
+excites every band of an EQ at once, so a knob's effect is immediately
+audible. White noise (`noise_white`, xorshift, flat spectrum) is the source
+the pink filter shapes; pink comes from the standard Paul Kellet economy
+filter (three one-pole lowpasses summed over the white — public-domain DSP).
+
+The time-domain signature that tests the tilt without a spectrum analyser:
+pink noise is **smoother** than white (its successive samples change less,
+because the low-pass integration correlates them). `tests/test_stbnoise.bpp`
+checks both are bounded and zero-mean and that pink's mean per-sample step is
+well below white's — the tilt captured directly. `tools/pink_noise/
+gen_pink_noise.bpp` writes a normalised pink-noise WAV; load it into
+sound_fusion (`--import`) to audition the Blondie amp on real broadband
+material.
+
 ## Cross-references
 
 - `docs/manual/bootstrap_manual.md` — the portability tiers, the

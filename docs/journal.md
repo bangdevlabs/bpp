@@ -15156,3 +15156,103 @@ spring acc bit-identical); zero warnings; binary +64 bytes. F.2's Stage
 F row added to compiler_boost_roadmap.md; the spill-cost lever the last
 two sessions kept pointing at is now spent — the remaining manylive gap
 is honestly relabelled as budget-overflow, not spill-victim, territory.
+
+## 2026-07-06 — the blondie_amp arc lands whole (Inc 3-6): oversampling, the FMV tone stack, the amp topology, a playable Bassman, and pink noise to test it
+
+The audio pivot the roadmap had been building toward. After nested-VI and
+Stage F closed the compiler levers 1+2, the user's call was to attack the
+blondie_amp arc "até o fim pra estressar a engine" before returning to
+lever 3 (the FP scheduler) — precisely because lever 3 is DEFERRED BY
+DOCTRINE until a real FIR consumer (the convolution cab, Inc 7) exists.
+So the arc IS the path to being able to measure whether the scheduler is
+even needed. Four increments shipped in a row, each a clean-room DSP
+cartridge with a hand-derived value test, all Layer 1-2 (no bootstrap),
+render md5 `f61fac72…` unchanged throughout.
+
+**Inc 3 — stboversample (`cc60079`).** 2× oversampling with an anti-alias
+half-band FIR (11-tap Hamming-windowed sinc, unity DC gain, clean-room
+from the textbook formula). Mandatory before the tube stages: a hot
+nonlinearity makes harmonics above Nyquist that fold back as aliasing, so
+you shape at double rate and band-limit before decimating. The FIR is an
+explicit symmetric sum-of-products with the even taps structurally zero
+(the intended small Stage-F consumer). The test pins a beautiful half-band
+property — a constant passes as a clean (c, c) pair (unity gain, no
+zero-stuff dip) — plus slow-sine round-trip at a 4.5-sample group delay
+(sondado empiricamente; my first guess of 5 was off by the half-sample
+the 2× half-band inherently carries), linearity, and the stopband null
+(oversampled-Nyquist ±1 → 0, hand-derived as h0−2(h1+h3+h5)=0).
+
+**Inc 4 — stbtonestack (`3322aec`).** The Fender FMV Treble/Mid/Bass
+network, a 3rd-order IIR. This is where the arc's clean-room discipline
+mattered most: the reference repo is GPL-3.0, so the DSP math had to come
+from a PUBLIC source, not their code. The authoritative source is Yeh &
+Smith, "Discretization of the '59 Fender Bassman Tone Stack" (DAFx-06). I
+could not read the PDF (no poppler/pdftotext on the box), so I extracted
+the coefficient formulas by zlib-decompressing the PDF's own FlateDecode
+streams in python (80/81 streams, the seven multi-term analog polynomials
+verbatim + the bilinear transform, which satisfyingly matched a derivation
+I'd done by hand first). '59 Bassman values (250k/1M/25k/56k,
+250pF/.02µF/.02µF, confirmed via a second search). The test pins the exact
+DC block (numerator coeffs sum to 0 — the series input cap) + passivity +
+each control moving its own band, and the reference-behaviour check was the
+clincher: the flat-setting response is the textbook Fender mid-scoop (bass
+0.83 → scoop bottom 0.24 @ 640 Hz → treble 0.60).
+
+**Inc 5 — stbamp (`c949227`).** The first COMPOSITION increment — no new
+DSP, pure wiring of the four Tier-1 primitives (stbfilter/stbdrive/
+stboversample/stbtonestack) into the Bassman chain: `in → up2x →
+[tube1][tube2] → tonestack → [tube3] → down2x → cab`, each tube stage =
+one-pole input LP (Miller) → drive_tube valve curve → one-pole coupling HP
+(DC block), the tone stack between stages 2-3 at the oversampled rate, cab
+= LP ~4kHz + HP ~85Hz. The reference-behaviour proof of REAL tube
+compression: at low gain a 10× input grows 9.6× (near-linear); at high gain
+it grows 1.0× — full saturation, the level-independent cranked-amp sustain.
+
+**Inc 6 — the blondie_amp plugin + sound_fusion insert (`c92cc0f`).** The
+first playable Bassman tone. A thin plugin wrapper over stbamp (homage
+name, like morricone_spring), wired as the FIRST channel insert (the amp
+is the sound source; filter/comp/spring/rotary are post-amp). Off by
+default → demo md5 unchanged; a headless probe confirmed it live in the
+render path (channel energy 902 off → 2151 on). The GUI grew a 5th
+lane-header toggle (all five shrunk 21→17px) + an AMP rack block; GUI_H
+600→680 for the room — which is where the GUI started visibly straining.
+
+**The playtest, and the discipline it demanded.** The user playtested and
+reported: treble ≈ mid (hard to tell apart), bass "doesn't come through,"
+and — crucially — flagged "posso estar equivocado pelos samples e pelo
+teste, então pensa bem antes de dizer que tá errado e mexer em tudo porque
+a priori funcionou." Exactly the measure-don't-believe rule pointed at my
+OWN work. I measured before touching anything, and BOTH my initial
+suspicions were wrong: a low-drive frequency sweep showed the controls DO
+move distinct, correct bands (bass 50-100Hz, mid 400-800, treble
+1.6-6.4kHz), and a level probe showed the amp is NOT quiet (unity+ at
+playing gains). The real explanation was the TEST SIGNAL: a sine carries
+one frequency, so no EQ can sound distinct on it, and a 220 Hz sine has
+nothing for the bass/treble bands to grab. Nothing was "fixed" because
+nothing was broken — the honest verdict, backed by numbers, was "it works;
+the sine is the confound; the Fender passive stack is authentically
+subtle."
+
+**stbnoise + the agnostic import (`cff1ec1`).** The broadband test signal
+the diagnosis called for: stbnoise (Tier-1, xorshift white + Paul Kellet
+economy pink, clean-room) + a generator that writes a pink-noise WAV +
+`sound_fusion --import <path>`. Two architecture notes the user pressed and
+that shaped this: (1) import must be BACKEND-AGNOSTIC, not macOS-only — so
+the import path decodes through stbsound (pure b++) and is driven by the
+CLI (argv, every backend), NOT the native file dialog (macOS-only, which
+would have been the lazy choice); the interactive in-window importer is
+deferred to the GUI rework, and when it lands it will be agnostic-first
+(a typed path field, keyboard being universal, with the native dialog as a
+macOS convenience). (2) "não ter medo de evoluir o sound_fusion conforme a
+demanda" — audio import is fundamental to any DAW, so it's a real feature,
+not a test hack. The pink-noise WAV is gitignored (MBs, reproducible).
+
+**Named next + a flagged debt.** Inc 7 (stbconv + a real speaker IR) is the
+endgame AND the primary Stage-F consumer — a genuine FIR dot-product to
+finally measure the FP scheduler against gcc -O2 (build the scheduler ONLY
+if that shows a scheduling-bound gap; reassociation is `@fast`-opt-in
+because FP add isn't associative). And the user flagged the GUI is getting
+cramped with five inserts — a rework is due; the proposal on the table is
+"edit one insert at a time" (a channel-strip with a fixed-height selected-
+insert param panel) so it scales past N plugins and frees room for the
+interactive importer.

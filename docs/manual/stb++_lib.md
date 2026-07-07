@@ -4594,6 +4594,154 @@ static on_arrow_impact(slot) {
 
 ---
 
+## Cap 60 — 2× oversampling (stboversample)
+
+*Depends on: nothing (Tier-1 leaf)*
+*Source: new — 2026-07-06 (blondie_amp arc Inc 3)*
+*Status: SHIPPED — 2026-07-06*
+
+`stboversample.bsm` is the **anti-alias resampler** a hot nonlinearity
+needs. A waveshaper (tube saturation, hard clip) makes harmonics above
+Nyquist that fold back as aliasing; the fix is to shape at 2× the rate
+and band-limit before decimating. Clean-room 11-tap Hamming-windowed
+half-band FIR (unity DC gain). The full DSP rationale is in
+`docs/manual/audio_specs.md` Cap 7.
+
+```c
+auto os: Oversampler2x;
+os = oversample_new();
+auto (a, b): float;
+a, b = oversample_up(os, x);   // 1 sample -> two 2x-rate samples
+a = drive_soft(a, 4.0);        // shape BOTH at the doubled rate
+b = drive_soft(b, 4.0);
+auto y: float;
+y = oversample_down(os, a, b); // filter + decimate back to 1x
+oversample_reset(os);
+oversample_free(os);
+```
+
+| Function | Signature | Notes |
+|----------|-----------|-------|
+| `oversample_new()` | `→ ptr` | Both filter memories cleared |
+| `oversample_up(os, x)` | `→ (float, float)` | One sample → two 2x-rate (multi-return) |
+| `oversample_down(os, a, b)` | `→ float` | Two 2x-rate → one, filtered + decimated |
+| `oversample_reset(os)` | `void` | Clear filter memory between renders |
+| `oversample_free(os)` | `void` | — |
+
+Group delay of a round trip is a constant **4.5 base samples** (the half-
+band is linear-phase; 2× resampling makes it a half-integer). Even taps
+are structurally zero — the FIR is a clean symmetric sum-of-products, the
+intended small consumer for the deferred FP scheduler.
+
+## Cap 61 — FMV tone stack (stbtonestack)
+
+*Depends on: nothing (Tier-1 leaf)*
+*Source: new — 2026-07-06 (blondie_amp arc Inc 4)*
+*Status: SHIPPED — 2026-07-06*
+
+`stbtonestack.bsm` is the Fender/Marshall/Vox passive **Treble/Middle/Bass
+tone stack** — a 3rd-order IIR whose three controls INTERACT (they share
+one capacitor network; the famous "mid scoop" is the emergent shape).
+Clean-room from the PUBLIC academic result (Yeh & Smith, DAFx-06), NOT the
+GPL reference code — the coefficient polynomials + bilinear transform are
+transcribed from the paper's equations. `'59 Bassman 5F6-A` component
+values baked in, swappable for Marshall/Vox. Full derivation in
+`docs/manual/audio_specs.md` Cap 8.
+
+```c
+auto ts: ToneStack;
+ts = tonestack_new(44100.0);
+tonestack_set(ts, 0.7, 0.4, 0.6, 44100.0);   // treble, mid, bass (0..1)
+auto y: float;
+y = tonestack_tick(ts, x);                     // 7-term multiply-add / sample
+tonestack_reset(ts);
+tonestack_free(ts);
+```
+
+| Function | Signature | Notes |
+|----------|-----------|-------|
+| `tonestack_new(sr)` | `→ ptr` | Knobs at noon (0.5/0.5/0.5) |
+| `tonestack_set(ts, treble, mid, bass, sr)` | `void` | Recompute the 7 coeffs (per knob change, never per sample) |
+| `tonestack_tick(ts, x)` | `→ float` | Direct-Form-I 3rd-order step |
+| `tonestack_reset(ts)` | `void` | Clear filter memory (keeps the knob setting) |
+| `tonestack_free(ts)` | `void` | — |
+
+`H(0) = 0` by construction (series input cap blocks DC — the digital
+numerator coefficients sum to exactly 0). The flat-setting response is the
+textbook Fender mid-scoop.
+
+## Cap 62 — Amp topology (stbamp)
+
+*Depends on: stbfilter, stbdrive, stboversample, stbtonestack (Tier-2)*
+*Source: new — 2026-07-06 (blondie_amp arc Inc 5)*
+*Status: SHIPPED — 2026-07-06*
+
+`stbamp.bsm` is a **guitar-amp preamp model** — the Fender Bassman signal
+chain, composed from the Tier-1 primitives (no new DSP, pure wiring):
+`in → up2x → [tube×2] → tonestack → [tube×3] → down2x → cab`. A tube stage
+= one-pole input LP (Miller) → `drive_tube` valve curve → one-pole coupling
+HP (DC block); tone stack between stages 2-3 at the oversampled rate; cheap
+cab = LP ~4kHz + HP ~85Hz. See `docs/manual/audio_specs.md` Cap 9.
+
+```c
+auto amp: Amp;
+amp = amp_new(44100.0);
+amp_set_gain(amp, 0.6);              // preamp drive 0..1 (escalates 3 stages)
+amp_set_tone(amp, 0.7, 0.4, 0.6);    // treble, mid, bass 0..1
+auto y: float;
+y = amp_process(amp, x);
+amp_reset(amp);
+amp_free(amp);
+```
+
+| Function | Signature | Notes |
+|----------|-----------|-------|
+| `amp_new(sr)` | `→ ptr` | Fixed voicing; gain + tone are the knobs |
+| `amp_set_gain(amp, g)` | `void` | 0..1 preamp drive, escalating per stage |
+| `amp_set_tone(amp, t, m, b)` | `void` | Tone stack (0..1 each) |
+| `amp_process(amp, x)` | `→ float` | One sample through the whole chain |
+| `amp_reset(amp)` | `void` | Clear all filter memory |
+| `amp_free(amp)` | `void` | — |
+
+Real tube compression: at low gain a 10× input grows ~9.6× (near-linear);
+at high gain ~1.0× (full saturation, the cranked-amp sustain). The named
+product wrapper is `tools/blondie_amp/blondie_amp.bsm`, wired as
+sound_fusion's first channel insert.
+
+## Cap 63 — Noise generators (stbnoise)
+
+*Depends on: nothing (Tier-1 leaf)*
+*Source: new — 2026-07-06*
+*Status: SHIPPED — 2026-07-06*
+
+`stbnoise.bsm` generates **white** (flat spectrum, xorshift) and **pink**
+(−3 dB/octave, Paul Kellet economy filter) noise. Pink is the right signal
+for auditioning or measuring a broadband EQ/tone control: a sine carries
+one frequency so an EQ barely moves it, while pink excites every octave
+equally. Clean-room, public-domain DSP.
+
+```c
+auto n: Noise;
+n = noise_new();
+auto w: float; w = noise_white(n);   // flat, [-1, 1)
+auto p: float; p = noise_pink(n);    // -3 dB/oct, roughly [-1, 1]
+noise_free(n);
+```
+
+| Function | Signature | Notes |
+|----------|-----------|-------|
+| `noise_new()` | `→ ptr` | Fixed seed (reproducible run) |
+| `noise_white(n)` | `→ float` | Uniform white in [-1, 1) |
+| `noise_pink(n)` | `→ float` | Pink, ~[-1, 1] (clamp for a fixed-range format) |
+| `noise_reset(n)` | `void` | Clear the pink filter (seed keeps advancing) |
+| `noise_free(n)` | `void` | — |
+
+`tools/pink_noise/gen_pink_noise.bpp` writes a normalised pink-noise WAV;
+`sound_fusion --import <path>` loads it (the backend-agnostic import path —
+decodes through stbsound, no native dialog needed).
+
+---
+
 # Appendices
 
 ## Appendix A — Compiler Flags Reference
@@ -4649,6 +4797,7 @@ Use xfail tests to lock in rejection behavior: they catch regressions where a pr
 | 2026-05-18 | stbgrid arc closed (`2b7c8d4` → `cfa1e77`). Cap 57 new (stbgrid). Cap 44 rewritten (was stale "color math" boilerplate; now documents the actual `stbcol.bsm` collision-geometry API + adds `rect_center_x/y`). Layout table grew an "Engine plumbing" row entry for stbgrid + corrected stbcol's description. Tier-intro paragraph added in Layout section pointing at Tonify Rule 33. | Cap 44 + Cap 57 + Layout |
 | 2026-05-18 | stbcharsheet shipped (`43a7641`). Cap 58 new. Layout row VII (Game systems) grew an stbcharsheet entry. SC1-style reference example included in the chapter, grounding the upcoming WC1 + SC1 mechanical crossover. | Cap 58 + Layout |
 | 2026-05-18 | stbprojectile shipped end of S7. Cap 59 new — pool-based projectile motion + lifecycle (genre-generic Tier-2 built on stbpool). Designed with three consumers in view: rts1 wc1_missiles (first), fps Doom-mode (Phase 4+), rpg Game 4. Industry precedent: Doom mobj_t / SC1 Bullet / Stratagus Missile. Layout row VII grew an stbprojectile entry. | Cap 59 + Layout |
+| 2026-07-06 | blondie_amp arc Inc 3-6 (`cc60079` → `c92cc0f`) + stbnoise (`cff1ec1`). Caps 60-63 new: stboversample (2× half-band FIR anti-alias), stbtonestack (FMV Fender tone stack, clean-room from Yeh & Smith DAFx-06), stbamp (Tier-2 amp topology composing the four Tier-1 audio primitives), stbnoise (white/pink test signals). The DSP rationale for each lives in `audio_specs.md` Caps 7-10. The named product wrapper `tools/blondie_amp/` wires stbamp as sound_fusion's first channel insert; `sound_fusion --import` is the backend-agnostic WAV import. | Caps 60-63 + audio_specs 7-10 |
 
 When a new stb cartridge ships, add a row here describing the
 sweep that wrote its chapter — same pattern Tonify uses for its
