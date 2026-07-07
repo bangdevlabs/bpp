@@ -681,8 +681,9 @@ is_int_lit_node(node_p) {
 
 // Read the Excalibur Arc shape annotation from a literal node.
 // Returns SHAPE_INT, SHAPE_DECIMAL, or 0 (not set / non-numeric).
-// Pure read — `@base` so callers in dispatchable contexts compose
-// without phase friction.
+// Pure read — effect-free by INFERENCE (purity is never annotated;
+// the effect lattice classifies it), so callers in dispatchable
+// contexts compose without phase friction.
 lit_shape(node_p) {
     auto n: Node;
     n = node_p;
@@ -2482,9 +2483,13 @@ static parse_if() {
     return node;
 }
 
-// Parse a while loop, with optional dispatch hint (@seq, @par, @gpu).
+// Parse a while loop. (A dispatch-hint parameter lived here until the
+// 2026-07-07 faxina — vestigial: the `@seq`/`@par`/`@gpu` hints were
+// never wired end-to-end, so the hint token was stored and never read;
+// loop dispatch is automatic via classify_loop. Unknown statement
+// annotations are E268 now.)
 // node.e (offset 40) is left at 0 — only for-loops use it for the step.
-static parse_while(hint_p) {
+static parse_while() {
     auto cond, body_arr, body_cnt, node: Node;
     consume();
     consume();
@@ -2507,7 +2512,7 @@ static parse_while(hint_p) {
     node.a = cond;
     node.b = body_arr;
     node.c = body_cnt;
-    node.d = hint_p;
+    node.d = 0;                 // reserved; no while-level annotation exists
     node.e = 0;
     return node;
 }
@@ -2848,15 +2853,18 @@ static _is_put_name(nm) {
 }
 
 static parse_statement() {
-    auto node: Node, var_p, hint_p, decl_hint, dh_arr, dh_has, kw_hint;
-    // `@`-prefixed annotations come in two flavours at statement level:
-    //   1. Phase 6.3 scoped zones — `@profile("name") { ... }`. Captured
-    //      and lowered to a synthesized T_BLOCK with prologue / epilogue
-    //      calls into the stbprofile runtime.
-    //   2. Dispatch hints — `@seq` / `@par` / `@gpu` immediately
-    //      before a `while`. Captured into hint_p and consumed; the
-    //      while-parser picks the hint up.
-    hint_p = 0;
+    auto node: Node, var_p, decl_hint, dh_arr, dh_has, kw_hint;
+    // The ONLY `@`-prefixed form at statement level is the scoped profile
+    // zone — `@profile("name") { ... }` — captured and lowered to a
+    // synthesized T_BLOCK with prologue / epilogue calls into the
+    // stbprofile runtime. Anything else is E268. Until the 2026-07-07
+    // faxina the parser silently swallowed any other `@word` here as a
+    // vestigial "dispatch hint" (`@seq`/`@par`/`@gpu`) that nothing ever
+    // read — classify_loop compared the stored packed token against
+    // 1/2/3, which never matched — so a typo'd annotation vanished
+    // without a trace. Loop dispatch is AUTOMATIC (classify_loop, gated
+    // on `@safe`); there is no hint surface, and an unknown annotation
+    // must be heard, not eaten.
     if (peek_type() == TK_PUNCT && val_is_ch('@')) {
         consume();
         auto annot_p, annot_l, annot_s;
@@ -2872,7 +2880,19 @@ static parse_statement() {
             consume();              // ")"
             return _build_profile_zone(zone_name_p);
         }
-        hint_p = annot_p;
+        diag_error(268);
+        diag_str("unknown statement annotation '@");
+        diag_packed(annot_p);
+        diag_str("'");
+        diag_newline();
+        diag_loc(tok_pos);
+        diag_show_line(tok_pos);
+        diag_str("  = help: the only statement-level annotation is `@profile(...)` around a block");
+        diag_newline();
+        diag_str("  = help: `@safe` goes on a function signature; loop dispatch is automatic —");
+        diag_newline();
+        diag_str("          there are no `@seq` / `@par` / `@gpu` hints");
+        diag_newline();
         consume();
     }
     if (peek_type() == TK_KW) {
@@ -2993,7 +3013,7 @@ static parse_statement() {
         }
         if (val_is("if", 2)) { return parse_if(); }
         if (val_is("for", 3)) { return parse_for(); }
-        if (val_is("while", 5)) { return parse_while(hint_p); }
+        if (val_is("while", 5)) { return parse_while(); }
         if (val_is("switch", 6)) { return parse_switch(); }
         if (val_is("return", 6)) { return parse_return(); }
         if (val_is("break", 5)) {

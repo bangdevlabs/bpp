@@ -36,10 +36,10 @@ const PHASE_HEAP = 6; const PHASE_PANIC = 7;
 // but named for the broader use case: audio callbacks, worker entry
 // points, and any bounded path that must stay bounded. The enforcement
 // path treats SAFE and REALTIME identically; SAFE is the new name.
-// `@time` and `@safe` annotations both end up at PHASE_REALTIME during
-// the migration window — `@safe` is the preferred spelling for new
-// code. Sidequest "Phase annotation collapse" tracks the eventual
-// drop of the redundant codes once the codebase has migrated.
+// `@safe` is the ONLY annotation the parser still accepts and it lands
+// at PHASE_REALTIME here; the legacy spellings (`@time` included) have
+// been E260-rejected since the 2026-05-11 phase collapse — no migration
+// window remains.
 const PHASE_SAFE = 8;
 
 // Per-function arrays parallel to funcs[]. Built by call_graph_build()
@@ -745,12 +745,13 @@ classify_loop(wh) {
     auto i, pure_cnt, impure_cnt, dsp;
     w = wh;
 
-    // Check for programmer dispatch hint (@seq, @par, @gpu).
-    if (w.d > 0) {
-        if (w.d == 1) { w.dispatch = DSP_SEQ; return DSP_SEQ; }
-        if (w.d == 2) { w.dispatch = DSP_PAR; return DSP_PAR; }
-        if (w.d == 3) { w.dispatch = DSP_GPU; return DSP_GPU; }
-    }
+    // Dispatch is decided HERE, automatically, from what the body does —
+    // there is no programmer hint surface. (A dead hint check lived here
+    // until the 2026-07-07 faxina: it compared w.d against 1/2/3, but the
+    // parser stored the raw packed annotation token there, which never
+    // equals a small int, so no `@seq`/`@par`/`@gpu` ever matched. The
+    // parser now rejects unknown statement annotations with E268 and
+    // always writes w.d = 0.)
 
     body_arr = w.b;
     body_cnt = w.c;
@@ -2107,23 +2108,12 @@ call_graph_build() {
         arr_set(fn_calls, i, _cgb_calls);
         arr_set(fn_locally_impure, i, _cgb_impure);
 
-        // Annotation-driven seed (Option B). When the programmer
-        // asserts @gpu, propagate that as a baseline effect so the
-        // fixpoint can catch sibling-cross violations (e.g., @io
-        // reaching @gpu through a B++ call chain). Without this,
-        // only effects coming from registered extern names propagate,
-        // and @gpu has no extern seed — Cocoa/Metal go through
-        // objc_msgSend which is polymorphic and intentionally
-        // unclassified. The annotation IS the only honest signal.
-        // @time / @io / @base do not need seeding: @time is absorbed
-        // by anything stricter than itself; @io is already seeded by
-        // sys_write / sys_open / etc.; @base just describes "no
-        // effect" and is the join identity.
-        auto _ann;
-        _ann = arr_get(fn_phase_hint, i);
-        if (_ann == PHASE_GPU) {
-            _cgb_ext_eff = _dsp_eff_join(_cgb_ext_eff, PHASE_GPU);
-        }
+        // (A dead "annotation-driven GPU seed" lived here until the
+        // 2026-07-07 faxina: it read fn_phase_hint looking for
+        // PHASE_GPU, but since the 2026-05-11 phase collapse the parser
+        // only ever produces 0 or the `@safe` hint, so the branch could
+        // not fire. GPU effects remain internal lattice values seeded by
+        // registered extern names, never by annotation.)
         arr_set(fn_effect, i, _cgb_ext_eff);
     }
 

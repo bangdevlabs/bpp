@@ -1593,10 +1593,15 @@ skipped.
   no-op. Same overflow contract as the v1 zone stack.
 
 **Naming:** the original spec called it `@profile_zone(...)`
-but `_zone` was redundant — the annotation IS the zone. Other
-`@`-annotations in the language read as adjectives on the
-following construct (`@base func`, `@gpu func`, `@seq while`);
-`@profile { ... }` reads as "profile this".
+but `_zone` was redundant — the annotation IS the zone. The other
+surviving `@`-annotation reads as an adjective on the following
+construct (`@safe func`); `@profile { ... }` reads as "profile
+this". (This note once cited `@base func` / `@gpu func` /
+`@seq while` as further examples — all three are gone: the phase
+keywords were E260-collapsed on 2026-05-11, and the `@seq` loop
+hint never worked at all; the 2026-07-07 faxina removed its dead
+plumbing and made unknown statement annotations E268. The whole
+surface is `@safe` + `@profile`.)
 
 ---
 

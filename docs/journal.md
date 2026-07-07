@@ -15325,3 +15325,63 @@ scheduler, and it now has a benchmark (`bench_conv`) and a disassembled target
 to build against. Two smaller follow-ons remain optional — sourcing a real
 license-clean cab IR (the engine and the wiring are done; only the data is
 missing), and the sound_fusion GUI rework the five inserts have been asking for.
+
+## 2026-07-07 — the annotation faxina: the surface is @safe + @profile, everything else stops pretending
+
+Born from the user catching me twice in one conversation. First: my docs
+cited a "`@fast` opt-in" for FP reassociation as if it were a language
+mechanism — it was only ever `fp_serial_scheduler.md`'s 2026-06-17 sketch
+for something to be designed. Second, worse: while CORRECTING that, I
+cited the `@seq`/`@par`/`@gpu` "while dispatch hints" as real surface —
+sourced from a parser comment, not from verified behaviour. "até onde sei
+só tem @profile e @safe, da onde que veio esse @fast?" — and the user was
+exactly right, both times. The faxina makes the codebase stop lying about
+its own surface, in code comments, in behaviour, and in docs.
+
+**The vestigial plumbing, verified then removed.** The parser swallowed
+ANY `@word` before a statement into `hint_p`, stored it raw (a packed
+token) in the while node's `.d`; `classify_loop` compared `.d` against
+1/2/3 — values a packed token can never take — so no hint ever matched
+and dispatch stayed automatic. No `buf_eq("seq"/"par"/"gpu")` exists
+anywhere in the compiler; the repo has zero uses. Worse than dead: the
+swallow meant `@profle` (a typo), `@par` (a hope), or any other stray
+annotation VANISHED silently and the program compiled as if nothing had
+been written. Removed: the parser swallow + `parse_while`'s hint
+parameter (node.d now always 0), classify_loop's dead branch, and a
+second dead limb the sweep found — the "annotation-driven GPU seed" in
+the effect pass, which read `fn_phase_hint` looking for `PHASE_GPU`, a
+value the parser has been unable to produce since the 2026-05-11 phase
+collapse (only 0 or the @safe hint exist).
+
+**E268 — unknown statement annotation.** In place of the swallow, a
+focused diagnostic in the E260 mold: names the offender, then states the
+whole truth in two help lines — `@profile(...)` is the only statement
+annotation, `@safe` lives on function signatures, loop dispatch is
+automatic, there are no `@seq`/`@par`/`@gpu` hints. Gate:
+`tests/test_e268_unknown_stmt_annotation.bpp` (xfail), registry row in
+`warning_error_log.md`.
+
+**The comment sweep.** Five stale comments that described the dead world
+as current, rewritten to describe the real one: the two parser hint
+comments, classify_loop's, dispatch's "`@time` and `@safe` both land at
+PHASE_REALTIME during the migration window" (there is no migration
+window; @time is E260), and three comments that spoke of functions being
+"tagged @io" / "`@base`" (effects are INFERRED by the lattice, never
+annotated — bpp_array, bpp_json, bpp_parser reworded). Docs:
+tonify_checklist's @profile naming note cited `@base func` / `@gpu func` /
+`@seq while` as live examples — fixed; stb++_lib and how_to_dev turned
+out to be already correct (they document the collapse properly — the rot
+was in newer strata, which is the lesson).
+
+**Proof the faxina changes nothing for accepted programs.** Old vs new
+compiler, `BPP_BUILD_ID` pinned: bench_conv and the whole sound_fusion
+binary are BYTE-IDENTICAL — which also settles the benchmark-catalog
+question definitively (identical binaries cannot regress). Bootstrap:
+gen2==gen3 pinned + the 5× unpinned determinism script PASS. Suites
+237/0/12 native (+1: the E268 gate) and 197/0/52 C-emit, zero warnings.
+
+**The durable rule (memory + reference):** before claiming any language
+surface exists, grep the parser AND the consumer — a comment, and even a
+parse path, is not a feature. The parse-but-ignore shape is the most
+dangerous kind of stale: it half-exists, so every layer above it can
+honestly believe it works.
