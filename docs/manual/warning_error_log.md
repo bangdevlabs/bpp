@@ -57,7 +57,7 @@ noise.
 | E002 | import/load not found | bpp_import.bsm | 977 | ❌ | File not found in search paths |
 | E050 | struct field type mismatch | bpp_validate.bsm | 218 | ❌ | Struct field with wrong type |
 | E053 | type annotation error | bpp_validate.bsm | 232 | ❌ | Invalid type annotation |
-| E101 | unknown type | bpp_parser.bsm | 569 | ✅ | `: UnknownType` after variable |
+| E101 | unknown type annotation | bpp_parser.bsm | parse_type_expr else-branch | ✅ | The catch-all for any `: X` annotation that is not a real type — a mistyped primitive (`: wrod`), a removed hint (`: serial`), or an undeclared/misspelled struct (`: Nde`). Works because the type vocabulary is fully known at annotation time (primitives are keywords; structs must be declared before use per Rule 27), so anything else is genuinely not a type. 2026-07-07: message generalized from the struct-only "define it with 'struct'" to teach the whole annotation surface (size primitive / struct name / `Fn(...)->T`), so a typo'd primitive or a removed hint gets pointed at the right place, not just told to declare a struct. |
 | E102 | unexpected token in primary | bpp_parser.bsm | 1609 | ✅ | Invalid start of expression |
 | E103 | unexpected keyword | bpp_parser.bsm | 1712 | ✅ | Keyword used as expression |
 | E104 | unexpected token | bpp_parser.bsm | 1788 | ❌ | Parser fallthrough error |
