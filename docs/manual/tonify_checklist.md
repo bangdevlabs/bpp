@@ -36,15 +36,44 @@ For EVERY callback function in engine modules (e.g. stbgame.bsm):
 
 For EVERY `auto x;` at file scope, decide:
 
-| Pattern | Change to | Example |
+A note before the table: `auto x;` at file scope is NOT wrong — the
+smart-dispatch pass **auto-promotes** it (to `extrn` when it is set once in
+main and never written after, to `global` when a worker touches it), so
+plain `auto` is a fine default and the compiler picks the class from usage.
+The table is for the cases where you want to state the class explicitly —
+because the promoter is conservative (it misses init helpers called from
+main) or because you want the intent on the page.
+
+| Pattern | Write | Example |
 |---------|-----------|---------|
-| Set once in init, never written again | `extrn x;` | `extrn _ARR_HDR;` |
-| Read/written by worker functions | `global x;` | `global _last_dt;` |
+| Set once in init, never written again | `extrn x;` (or leave `auto` — promoter finds it) | `extrn _ARR_HDR;` |
+| Read/written by worker functions | `global x;` (or leave `auto`) | `global _last_dt;` |
 | Compile-time literal (inline, no slot) | `const X = value;` | `const CELL = 10;` |
 | Cross-module immutable, **needs a slot** | `global const X = value;` | `global const SCREEN_W = 320;` |
+| Module-private mutable | `static auto x;` / `static global x;` | `static auto _bugviz_scratch;` |
 | Module-private immutable, **needs a slot** | `static const X = value;` | `static const _MX_MAX_VOICES = 10;` |
-| Intentionally serial, don't promote | `auto x: serial;` | `auto _temp: serial;` |
 | Mutable per-frame state | `auto x;` (keep) | `auto head_x;` |
+
+**On `static` for data (2026-07-07 storage cleanup — read this):** `static`
+marks a top-level variable **module-private**, the same contract it has
+always carried for functions. The parser records it (`glob_static[]`) and the
+compiler ENFORCES it as far as it currently can: a `static` global that would
+alias a same-named global in another module is rejected with **E271** (today
+same-named globals share one data slot, so `static` cannot yet give it a
+private slot — the alias is refused instead of silently allowed). What
+`static` does NOT yet do is give each same-named module-private global its own
+distinct slot — that is the deferred *module-private-data* arc, justified only
+when static-name collisions become a real problem (as of this writing the
+whole tree has zero). So: use `static` to state "private to this module" and
+to get the E271 guard; do not rely on two modules each having a private
+`static x` with the same name (E271 will stop you until the slots arc lands).
+
+Two forms that USED to parse and no longer do (both were no-ops the cleanup
+removed): `auto x: serial;` (the "never promote" pin — zero uses; explicit
+`global`/`extrn` already opt out of promotion) and bare `x;` at file scope
+(the legacy-B shorthand that turned any stray identifier into a global — now
+**E269**). And `static extrn x;` is **E270**: an extrn is a reference, not a
+definition, so module-privacy does not apply — write plain `extrn x;`.
 
 **`const` vs `global const` vs `static const` — when does each apply.**
 
@@ -59,9 +88,15 @@ rejects writes (E263). Use when a constant has to be addressable from a
 different module — typically because the consumer is upstream of the
 declaration in the call graph and cannot inline.
 
-`static const X = value;` is the same shape as `global const` but the
-symbol stays module-private. Use when a constant needs an addressable
-slot but should not leak across modules.
+`static const X = value;` is the same shape as `global const` — a real
+read-only `.data` slot, E263-enforced against writes — declared with the
+module-private *intent*. Honest caveat (2026-07-07): the privacy is enforced
+by E271 (a same-named collision across modules is refused), NOT yet by a
+distinct per-module symbol; two modules cannot both hold a private
+`static const X` with the same name until the module-private-data arc gives
+them separate slots. In practice this is a non-issue — pick a module-scoped
+name (the `_mx_` / `_bugviz_` prefix convention already does) and it never
+arises.
 
 The trap that motivated the dedicated slot variants (sidequest 2026-05-14):
 `stb/stbrender.bsm` declares `extrn SCREEN_W;` and dereferences it inside

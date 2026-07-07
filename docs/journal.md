@@ -15385,3 +15385,68 @@ surface exists, grep the parser AND the consumer — a comment, and even a
 parse path, is not a feature. The parse-but-ignore shape is the most
 dangerous kind of stale: it half-exists, so every layer above it can
 honestly believe it works.
+
+## 2026-07-07 (later) — the storage cleanup: honesty over a three-axis system where one axis was never built
+
+The user asked to reassess the storage-class system — "meu medo é
+Overengineering" — before starting the FP scheduler's S1. The reassessment
+found the opposite of overengineering: a coherent three-axis design
+(dispatch/lifetime × visibility × mutability) where the VISIBILITY axis was
+real for functions and a placebo for data, plus a scatter of dead and
+illusory surface. The user's instinct to look was right; the fix was to make
+the system tell the truth, not to redesign it.
+
+**The map (what a live grep of parser + consumers actually showed).** Real and
+load-bearing: `auto x;` (the promoter picks extrn/global from usage),
+`global`/`extrn` (241/397 uses, explicit overrides + FFI), `const` inline
+substitution (512), `global const` (real E263-guarded slot). Dead or illusory:
+`static` on DATA was swallowed and never recorded, so `static auto` (407) /
+`static global` (6) / `static const` (3) were byte-identical to their
+unprefixed forms and the manual's "invisible to extrn" claim was fiction;
+`static extrn` (301) was a no-op on a no-op (privacy of a reference means
+nothing); `: serial` had ZERO uses; and bare `x;` at file scope declared a
+global out of ANY stray identifier, semicolon optional — a typo-eater. And the
+underlying `glob_mods` (per-global module index) was write-only: data name
+resolution was first-match-by-name repo-wide, so two modules' same-named
+globals silently ALIASED (the shape of the old cross-target BSYS constant bug).
+
+**F1 — remove the dead, hear the strays (byte-identical).** Deleted `: serial`
+/ glob_pinned and `parse_global_simple`; bare `x;` is now E269, `static extrn`
+is E270 (301 swept to plain `extrn`). The new strictness immediately flushed a
+latent bug the old swallow had hidden for months: `stbgame.bsm:2` was
+`/f/ Initializes…` — a mistyped `//` eaten as a bare global — which had been
+silently dropping a doc line and only surfaced when E269 refused it. The
+parser now RECORDS `static` on data (`glob_static[]`), written here for F2 to
+read. Proof: old-vs-new compiler byte-identical on bench_conv + the whole
+sound_fusion binary.
+
+**The measurement that reshaped F2 (and honored the anti-overengineering
+goal).** Before building "make static real via distinct per-module slots," the
+blast radius was measured: across the whole tree, exactly ONE same-name global
+collision actually co-compiles (`_viz_float_scratch`, static scratch in the
+bug tool's two modules) — every other apparent duplicate is a per-OS pair
+that never co-parses (target-suffix resolution picks one). So the expensive
+half of F2 — module-scoped resolution + distinct-slot mangling across three
+backends — would change the behaviour of exactly one benign global. Building
+it now would be speculation against a non-problem, the same discipline that
+kept the FP scheduler deferred until the convolution justified it. It is
+deferred as the named *module-private-data* arc.
+
+**F2a — make `static` honest cheaply.** Renamed the one real collision so the
+tree is collision-free, then added E271: a `static` global that would alias a
+same-named global in another module is REJECTED rather than silently aliased.
+`static` on data goes from a swallowed no-op to a checked promise — the
+recorded contract enforced as far as one shared slot allows — without the
+codegen rework a blast radius of one cannot justify. Byte-identical for every
+accepted program; codegen-neutral, so x64 is unchanged by construction.
+
+**F3 — the docs stop lying.** Tonify Rule 1's table dropped `: serial`, added
+the honest note that `auto` is a fine default the promoter classifies, and
+documents `static`-on-data as intent-plus-E271-guard with the distinct-slot
+part flagged as the deferred arc; how_to_dev §4.5's "invisible to extrn"
+fiction corrected the same way. Registry rows for E269/E270/E271.
+
+The through-line with the same day's `@fast`/`@seq` correction: b++'s surface
+should never claim to do something it doesn't. A swallowed prefix, a
+write-only module index, a parse-but-ignore hint — all the same rot, and all
+now either real or gone.
