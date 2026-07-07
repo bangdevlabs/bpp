@@ -902,9 +902,8 @@ that justifies Phase 2 (Alavanca 3) — it is no longer speculative; (2)
 because gcc stays bit-exact, a b++ scheduler can match it WITHOUT any
 FP-reassociation opt-in (multiple-accumulator reassociation would be a
 further step needing an opt-in mechanism to be DESIGNED — none exists in
-b++ today; the only annotations are `@safe`, `@profile("zone")` and the
-`@seq/@par/@gpu` loop hints — and it is not required to recover most of
-the 3.46×).
+b++ today; the only working annotations are `@safe` and `@profile("zone")`
+— and it is not required to recover most of the 3.46×).
 
 Verified the full way: bench_codegen all four checksums exact (biquad
 -0.2285 / lcg 8843630203987260673 / xform -231170789772321 / manylive

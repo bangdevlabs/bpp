@@ -117,15 +117,23 @@ mutually independent; only the feedback (`a1*y1, a2*y2`) is loop-carried.
   use an epsilon comparison + a documented tolerance.
   **(CORRECTION 2026-07-07: `@fast` was only ever THIS plan's sketch for a
   mechanism that would have to be designed — no such annotation exists in b++.
-  The language's real annotation surface is `@safe` (the only function
-  annotation, bpp_parser.bsm ~2039), statement-level `@profile("zone")`, and
-  the `@seq`/`@par`/`@gpu` dispatch hints before a `while`; the old phase
-  keywords are E260-deprecated. Later docs repeated "`@fast` opt-in" as if it
-  were an established mechanism — it is not. Per the 2026-07-07 addendum below,
-  the conv arc needs NO reassociation at all, so no such mechanism needs to be
-  designed for it; if a multiple-accumulator S4 is ever justified, designing
-  the opt-in is part of that increment's work, and `@safe`'s parser path is the
-  pattern to follow.)**
+  The language's real annotation surface is exactly TWO working forms: `@safe`
+  (the only function annotation, bpp_parser.bsm ~2039) and statement-level
+  `@profile("zone")` (~2866, consumed by codegen's profile zones). The
+  `@seq`/`@par`/`@gpu` "dispatch hints" a parser comment (~2856) mentions are
+  VESTIGIAL, not surface: the parser swallows ANY `@word` before a `while`
+  into node.d as a packed token, `classify_loop` compares node.d against
+  1/2/3 which a packed token never equals, no `buf_eq("seq"/"par"/"gpu")`
+  exists anywhere, and the repo has zero uses — the hint is silently ignored
+  and dispatch stays automatic (the smart-dispatch arc's actual design). The
+  old phase keywords are E260-deprecated. Later docs repeated "`@fast` opt-in"
+  as if it were an established mechanism — it is not. Per the 2026-07-07
+  addendum below, the conv arc needs NO reassociation at all; if a
+  multiple-accumulator S4 is ever justified, designing the opt-in is part of
+  that increment's work, and `@safe`'s parser path is the pattern to follow.
+  Hygiene note spun off this check: `@typo while(...)` today parses and is
+  silently ignored — worth a diagnostic or removing the dead plumbing in some
+  future faxina.)**
 
 ## Gate + measurement
 

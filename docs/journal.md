@@ -15309,9 +15309,13 @@ before multiple-accumulator reassociation (which changes rounding) is even on
 the table. That removes the single scariest piece of complexity the deferral
 was worried about. (Correction, 2026-07-07: earlier phrasings called that
 opt-in "`@fast`" as if it existed — it never did; it was only the plan's
-sketch for a mechanism to be designed. b++'s real annotations are `@safe`,
-`@profile("zone")`, and the `@seq/@par/@gpu` loop hints. The user caught the
-drift; the plan carries the correction note.)
+sketch for a mechanism to be designed. b++'s real annotation surface is
+exactly `@safe` + `@profile("zone")` — and the `@seq/@par/@gpu` "while
+hints" a stale parser comment mentions are vestigial dead plumbing (packed
+token vs 1/2/3 mismatch, no keyword validation, zero uses, silently
+ignored). The user caught BOTH drifts — first `@fast`, then the hints I
+cited while correcting `@fast`; the plan carries the full correction note
+plus a hygiene flag: `@typo while(...)` is silently swallowed today.)
 
 **Where the arc stands.** The blondie_amp arc is functionally complete: a
 playable Bassman (preamp + tone stack + a cab that can now be a real IR), every
