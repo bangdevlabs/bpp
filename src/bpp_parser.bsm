@@ -32,6 +32,11 @@ extrn globals, glob_cnt;
 // needs initialised data emitted.
 global glob_class;
 
+// Visibility per global: 1 when declared with the `static` prefix
+// (module-private — references from other modules are rejected, the
+// same contract fn_static enforces for functions). 0 = public.
+global glob_static;
+
 // Parallel arrays carrying the initial value for `global const` and
 // `static const` declarations. For all other storage classes the slot
 // at index i is left at 0 and ignored. `glob_init_is_float` tags
@@ -205,6 +210,7 @@ void init_parser() {
     globals = arr_new();
     glob_cnt = 0;
     glob_class = arr_new();
+    glob_static = arr_new();
     glob_init_val = arr_new();
     glob_init_is_float = arr_new();
     _parser_is_entry = 0;
@@ -964,21 +970,22 @@ tok_mod(tidx) { return diag_mod_idx(tok_src_off[tidx]); }
 //   GLOB_EXTRN  — `extrn x;`, write-once-after-init
 // Cached globals loaded from .bo files round-trip the class via the
 // extended .bo format (BO_VERSION 4+).
-static void add_global(p, gclass) {
+static void add_global(p, gclass, is_static) {
     globals = arr_push(globals, p);
     glob_cnt = arr_len(globals);
     glob_mods = arr_push(glob_mods, tok_mod(tok_pos));
     glob_class = arr_push(glob_class, gclass);
+    // Visibility: 1 when the declaration carried the `static` prefix
+    // (module-private contract — enforced by the validate/dispatch
+    // pass the same way fn_static is for functions). Recorded for
+    // every global so the arrays stay in lockstep.
+    glob_static = arr_push(glob_static, is_static);
     // Reserve init-value slots so codegen can index in lockstep.
     // For non-CONST classes these stay at 0 (ignored). For
     // GLOB_*_CONST, parse_global_const overwrites the last entry
     // with the actual compile-time value.
     glob_init_val = arr_push(glob_init_val, 0);
     glob_init_is_float = arr_push(glob_init_is_float, 0);
-    // Grow glob_pinned alongside — parser may set it via `: serial` hint.
-    while (arr_len(glob_pinned) < glob_cnt) {
-        glob_pinned = arr_push(glob_pinned, 0);
-    }
 }
 
 // Resolve a global symbol's data-section initial value by packed
@@ -1051,11 +1058,9 @@ static _glob_const_slot_idx(name_p) {
     return -1;
 }
 
-// Flag set by try_type_annotation when it encounters `: serial`.
-// Read by parse_global to mark the variable as promotion-pinned
-// (glob_pinned[i] = 1). Prevents auto smart promotion from changing
-// the storage class. Only meaningful at file scope; ignored in functions.
-static auto _serial_hint;
+// (The `_serial_hint` flag and its `: serial` annotation were removed
+// in the 2026-07-07 storage cleanup — zero uses, one consumer. Explicit
+// `global` / `extrn` remain the ways to opt out of auto-promotion.)
 
 // Parse an optional ": TypeName" annotation after a variable name.
 // Recognizes primitive types and struct types. Supports compound annotations:
@@ -1321,23 +1326,13 @@ static void try_type_annotation(var_p) {
     auto tl, ts, type_p;
     _prim_hint = 0;
     _struct_hint = 0 - 1;
-    _serial_hint = 0;
     if (val_is_ch(':') == 0) { return; }
     consume();
-
-    // Storage class hint: `: serial` prevents auto smart promotion.
-    // Only meaningful at file scope (parse_global reads _serial_hint).
-    // Lives outside parse_type_expr because it is not a type expression
-    // and must not appear inside func-type recursion.
-    type_p = cur_packed();
-    tl = unpack_l(type_p);
-    ts = vbuf + unpack_s(type_p);
-    if (tl == 6 && buf_eq(ts, "serial", 6)) {
-        _serial_hint = 1;
-        consume();
-        return;
-    }
-
+    // (The `: serial` storage hint — "never auto-promote this global" —
+    // lived here until the 2026-07-07 storage cleanup. It had ZERO uses
+    // in the entire repo and one consumer, so it was removed along with
+    // glob_pinned. If a pin is ever needed again, the explicit classes
+    // `global x;` / `extrn x;` already opt out of promotion.)
     _fn_type_depth = 0;
     parse_type_expr(var_p);
 }
@@ -1351,12 +1346,11 @@ static void try_type_annotation(var_p) {
 //   GLOB_EXTRN  — `extrn`  (write-once-after-init, frozen after maestro_run)
 // The class flows to add_global so the smart-dispatch pass and codegen
 // can decide how to handle loops that touch the variable.
-static void parse_global(gclass) {
-    auto var_p, gi;
+static void parse_global(gclass, is_static) {
+    auto var_p;
     consume();
     var_p = cur_packed();
-    add_global(var_p, gclass);
-    gi = glob_cnt - 1;
+    add_global(var_p, gclass, is_static);
     consume();
     try_type_annotation(var_p);
     // Register any non-zero hint, not just float. The unsigned
@@ -1365,29 +1359,23 @@ static void parse_global(gclass) {
     // Float remains the only auto-promoted type; other hints are
     // strict opt-in just like local annotations.
     if (_prim_hint != 0) { ty_set_global_type(var_p, _prim_hint); }
-    if (_serial_hint) { arr_set(glob_pinned, gi, 1); }
     while (val_is_ch(';') == 0) {
         if (val_is_ch(',')) { consume(); }
         var_p = cur_packed();
-        add_global(var_p, gclass);
-        gi = glob_cnt - 1;
+        add_global(var_p, gclass, is_static);
         consume();
         try_type_annotation(var_p);
         if (_prim_hint != 0) { ty_set_global_type(var_p, _prim_hint); }
-        if (_serial_hint) { arr_set(glob_pinned, gi, 1); }
     }
     consume();
 }
 
-// Parse a bare global identifier followed by optional semicolon.
-static void parse_global_simple() {
-    // Shorthand "x;" at file scope. No keyword, no type annotation.
-    // Treated as legacy/serialized — the explicit `global` or `extrn`
-    // keywords are the only paths that opt into worker-aware behavior.
-    add_global(cur_packed(), GLOB_AUTO);
-    consume();
-    if (val_is_ch(';')) { consume(); }
-}
+// (parse_global_simple — the bare `x;` file-scope shorthand — was
+// removed in the 2026-07-07 storage cleanup. It declared a global out
+// of ANY stray identifier at file scope, semicolon optional, so a
+// typo'd keyword or leftover word silently became a variable. Zero
+// uses existed in the repo. A stray identifier at file scope is now
+// E269 — see parse_program / parse_module.)
 
 // Parse an import block: either a file import or an FFI library import.
 static void parse_import() {
@@ -1796,7 +1784,7 @@ static void parse_global_const(gclass) {
         val = const_eval_node(expr_node);
     }
 
-    add_global(name_p, gclass);
+    add_global(name_p, gclass, gclass == GLOB_STATIC_CONST);
     // glob_cnt is now 1 past the newly-pushed entry; index it back.
     arr_set_at(glob_init_val, glob_cnt - 1, val);
     if (is_float != 0) {
@@ -2253,6 +2241,47 @@ static void parse_function(is_stub, is_static, is_void) {
     }
 }
 
+// E269 — a bare identifier at file scope. Until the 2026-07-07 storage
+// cleanup this silently became a global (the legacy-B `x;` shorthand,
+// semicolon optional!), so any stray word — a typo'd keyword, leftover
+// edit garbage — was eaten as a declaration. Zero uses existed; the
+// shorthand is gone and the stray must be heard.
+static void _diag_stray_ident() {
+    diag_error(269);
+    diag_str("stray identifier '");
+    diag_packed(cur_packed());
+    diag_str("' at file scope");
+    diag_newline();
+    diag_loc(tok_pos);
+    diag_show_line(tok_pos);
+    diag_str("  = help: declare a global with `auto x;`, `global x;`, or `extrn x;`");
+    diag_newline();
+    diag_str("  = help: or check for a misspelled keyword — bare `x;` no longer declares");
+    diag_newline();
+    consume();
+    if (val_is_ch(';')) { consume(); }
+}
+
+// E270 — `static extrn x;`. An extrn is a REFERENCE to a definition that
+// lives elsewhere; module-privacy applies to definitions, so `static` on
+// an extrn asserts nothing. It parsed silently for months (the static was
+// swallowed) and 301 declarations wore it — swept to plain `extrn` in the
+// same cleanup that added this diagnostic.
+static void _diag_static_extrn() {
+    diag_error(270);
+    diag_str("'static extrn' is meaningless — extrn declares a reference, not a definition");
+    diag_newline();
+    diag_loc(tok_pos);
+    diag_show_line(tok_pos);
+    diag_str("  = help: use plain `extrn x;` — visibility belongs to the DEFINING module");
+    diag_newline();
+    diag_str("  = help: `static` marks module-private definitions (static auto / global / const)");
+    diag_newline();
+    // Recover: parse the declaration as a plain extrn so later diagnostics
+    // stay sane; the error above already fails the compile.
+    parse_global(GLOB_EXTRN, 0);
+}
+
 // Top-level parse loop: dispatch imports, globals, structs, and functions.
 void parse_program() {
     while (tok_pos < tok_cnt) {
@@ -2260,7 +2289,7 @@ void parse_program() {
             parse_import();
         } else if (peek_type() == TK_KW) {
             if (val_is("auto", 4)) {
-                parse_global(GLOB_AUTO);
+                parse_global(GLOB_AUTO, 0);
             } else if (val_is("global", 6)) {
                 // `global const X = expr;` is the storage-class
                 // sidequest path (slot in .data with global symbol).
@@ -2273,10 +2302,10 @@ void parse_program() {
                     consume();   // const
                     parse_global_const(GLOB_GLOBAL_CONST);
                 } else {
-                    parse_global(GLOB_GLOBAL);
+                    parse_global(GLOB_GLOBAL, 0);
                 }
             } else if (val_is("extrn", 5)) {
-                parse_global(GLOB_EXTRN);
+                parse_global(GLOB_EXTRN, 0);
             } else if (val_is("struct", 6)) {
                 parse_struct();
             } else if (val_is("enum", 4)) {
@@ -2294,9 +2323,9 @@ void parse_program() {
             } else if (val_is("static", 6)) {
                 consume();
                 if (peek_type() == TK_KW) {
-                    if (val_is("auto", 4)) { parse_global(GLOB_AUTO); }
-                    else if (val_is("global", 6)) { parse_global(GLOB_GLOBAL); }
-                    else if (val_is("extrn", 5)) { parse_global(GLOB_EXTRN); }
+                    if (val_is("auto", 4)) { parse_global(GLOB_AUTO, 1); }
+                    else if (val_is("global", 6)) { parse_global(GLOB_GLOBAL, 1); }
+                    else if (val_is("extrn", 5)) { _diag_static_extrn(); }
                     else if (val_is("void", 4)) {
                         consume();
                         if (peek_type() == TK_ID) {
@@ -2313,7 +2342,7 @@ void parse_program() {
                     else { consume(); }
                 } else if (peek_type() == TK_ID) {
                     if (val_at_ch(1, '(')) { parse_function(0, 1, 0); }
-                    else { parse_global_simple(); }
+                    else { _diag_stray_ident(); }
                 }
             } else {
                 consume();
@@ -2322,7 +2351,7 @@ void parse_program() {
             if (val_at_ch(1, '(')) {
                 parse_function(0, 0, 0);
             } else {
-                parse_global_simple();
+                _diag_stray_ident();
             }
         } else {
             consume();
@@ -2338,17 +2367,17 @@ void parse_module(tok_end) {
             parse_import();
         } else if (peek_type() == TK_KW) {
             if (val_is("auto", 4)) {
-                parse_global(GLOB_AUTO);
+                parse_global(GLOB_AUTO, 0);
             } else if (val_is("global", 6)) {
                 if (_kw_at_offset(1, "const", 5)) {
                     consume();   // global
                     consume();   // const
                     parse_global_const(GLOB_GLOBAL_CONST);
                 } else {
-                    parse_global(GLOB_GLOBAL);
+                    parse_global(GLOB_GLOBAL, 0);
                 }
             } else if (val_is("extrn", 5)) {
-                parse_global(GLOB_EXTRN);
+                parse_global(GLOB_EXTRN, 0);
             } else if (val_is("struct", 6)) {
                 parse_struct();
             } else if (val_is("enum", 4)) {
@@ -2366,9 +2395,9 @@ void parse_module(tok_end) {
             } else if (val_is("static", 6)) {
                 consume();
                 if (peek_type() == TK_KW) {
-                    if (val_is("auto", 4)) { parse_global(GLOB_AUTO); }
-                    else if (val_is("global", 6)) { parse_global(GLOB_GLOBAL); }
-                    else if (val_is("extrn", 5)) { parse_global(GLOB_EXTRN); }
+                    if (val_is("auto", 4)) { parse_global(GLOB_AUTO, 1); }
+                    else if (val_is("global", 6)) { parse_global(GLOB_GLOBAL, 1); }
+                    else if (val_is("extrn", 5)) { _diag_static_extrn(); }
                     else if (val_is("void", 4)) {
                         consume();
                         if (peek_type() == TK_ID) {
@@ -2382,7 +2411,7 @@ void parse_module(tok_end) {
                     else { consume(); }
                 } else if (peek_type() == TK_ID) {
                     if (val_at_ch(1, '(')) { parse_function(0, 1, 0); }
-                    else { parse_global_simple(); }
+                    else { _diag_stray_ident(); }
                 }
             } else {
                 consume();
@@ -2391,7 +2420,7 @@ void parse_module(tok_end) {
             if (val_at_ch(1, '(')) {
                 parse_function(0, 0, 0);
             } else {
-                parse_global_simple();
+                _diag_stray_ident();
             }
         } else {
             consume();
@@ -2484,7 +2513,7 @@ static parse_if() {
 }
 
 // Parse a while loop. (A dispatch-hint parameter lived here until the
-// 2026-07-07 faxina — vestigial: the `@seq`/`@par`/`@gpu` hints were
+// 2026-07-07 cleanup — vestigial: the `@seq`/`@par`/`@gpu` hints were
 // never wired end-to-end, so the hint token was stored and never read;
 // loop dispatch is automatic via classify_loop. Unknown statement
 // annotations are E268 now.)
@@ -2858,7 +2887,7 @@ static parse_statement() {
     // zone — `@profile("name") { ... }` — captured and lowered to a
     // synthesized T_BLOCK with prologue / epilogue calls into the
     // stbprofile runtime. Anything else is E268. Until the 2026-07-07
-    // faxina the parser silently swallowed any other `@word` here as a
+    // cleanup the parser silently swallowed any other `@word` here as a
     // vestigial "dispatch hint" (`@seq`/`@par`/`@gpu`) that nothing ever
     // read — classify_loop compared the stored packed token against
     // 1/2/3, which never matched — so a typo'd annotation vanished

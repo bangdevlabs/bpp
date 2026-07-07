@@ -166,13 +166,11 @@ extrn cg_cur_fn_idx;       // funcs[] index of the function pre_reg_vars is curr
 //
 // glob_writers[i]   — arr<int> of function indices that assign to global i
 // glob_readers[i]   — arr<int> of function indices that read global i
-// glob_pinned[i]    — 1 if user wrote `auto x: serial;` (never promote)
 // glob_writes_pre[i]  — count of writes to global i in main() BEFORE
 //                       the first call to maestro_run/job_init/maestro_configure
 // glob_writes_post[i] — count of writes to global i in main() AFTER the freeze
 static auto glob_writers;
 static auto glob_readers;
-global glob_pinned;
 static auto glob_writes_pre;
 static auto glob_writes_post;
 
@@ -286,7 +284,6 @@ void init_dispatch() {
     _lazy_emit_ready = 0;
     glob_writers = arr_new();
     glob_readers = arr_new();
-    glob_pinned = arr_new();
     glob_writes_pre = arr_new();
     glob_writes_post = arr_new();
     glob_promote_reason = arr_new();
@@ -747,7 +744,7 @@ classify_loop(wh) {
 
     // Dispatch is decided HERE, automatically, from what the body does —
     // there is no programmer hint surface. (A dead hint check lived here
-    // until the 2026-07-07 faxina: it compared w.d against 1/2/3, but the
+    // until the 2026-07-07 cleanup: it compared w.d against 1/2/3, but the
     // parser stored the raw packed annotation token there, which never
     // equals a small int, so no `@seq`/`@par`/`@gpu` ever matched. The
     // parser now rejects unknown statement annotations with E268 and
@@ -2023,7 +2020,6 @@ call_graph_build() {
     while (arr_len(glob_writers) < glob_cnt) {
         glob_writers = arr_push(glob_writers, arr_new());
         glob_readers = arr_push(glob_readers, arr_new());
-        glob_pinned = arr_push(glob_pinned, 0);
         glob_writes_pre = arr_push(glob_writes_pre, 0);
         glob_writes_post = arr_push(glob_writes_post, 0);
         glob_promote_reason = arr_push(glob_promote_reason, 0);
@@ -2109,7 +2105,7 @@ call_graph_build() {
         arr_set(fn_locally_impure, i, _cgb_impure);
 
         // (A dead "annotation-driven GPU seed" lived here until the
-        // 2026-07-07 faxina: it read fn_phase_hint looking for
+        // 2026-07-07 cleanup: it read fn_phase_hint looking for
         // PHASE_GPU, but since the 2026-05-11 phase collapse the parser
         // only ever produces 0 or the `@safe` hint, so the branch could
         // not fire. GPU effects remain internal lattice values seeded by
@@ -2475,19 +2471,18 @@ mark_reachable() {
 // is conservative: any uncertainty falls back to legacy serialized auto.
 //
 // Promotion rules:
-//   1. Skip if user pinned the variable with `auto x: serial;` (glob_pinned[i] == 1).
-//   2. Skip if user already wrote `global x;` or `extrn x;` (glob_class[i] != GLOB_AUTO).
-//   3. Promote to GLOB_EXTRN when:
+//   1. Skip if user already wrote `global x;` or `extrn x;` (glob_class[i] != GLOB_AUTO).
+//   2. Promote to GLOB_EXTRN when:
 //      - All writers are inside main() (no helper writes), AND
 //      - There is at least one write before the freeze point in main(), AND
 //      - There are zero writes after the freeze point.
 //      Conservative: misses init helpers like `init_world()` called from main.
 //      The user can always fall back to explicit `extrn x;` for those.
-//   4. Promote to GLOB_GLOBAL when:
+//   3. Promote to GLOB_GLOBAL when:
 //      - Any writer or reader is inside a function classified as PHASE_BASE
 //        (the function runs on a worker thread), AND
 //      - The variable was not eligible for extrn (mutually exclusive choice).
-//   5. Otherwise: leave as GLOB_AUTO.
+//   4. Otherwise: leave as GLOB_AUTO.
 //
 // The promoter writes a string code into glob_promote_reason[i] for the
 // --show-promotions flag to print. Empty string means no promotion.
@@ -2500,9 +2495,10 @@ promote_globals() {
 
 
     for (i = 0; i < glob_cnt; i++) {
-        // Rule 1: skip pinned (auto x: serial;).
-        if (arr_get(glob_pinned, i) != 0) { continue; }
-        // Rule 2: skip already-explicit storage classes.
+        // Rule 1: skip already-explicit storage classes. (The old
+        // `: serial` pin — Rule 1 until the 2026-07-07 storage
+        // cleanup — had zero uses and was removed; explicit `global`
+        // / `extrn` are the ways to opt out of promotion.)
         if (arr_get(glob_class, i) != GLOB_AUTO) { continue; }
 
         writers = arr_get(glob_writers, i);
@@ -4809,11 +4805,11 @@ static auto _synth_counter;
 // vbuf does not balloon when many reductions land in one program.
 // Written exactly once by `_dsp_red_lazy_init` — write-once-after-init
 // matches Rule 1's `extrn` storage class.
-static extrn _dsp_disp_chunk_start_p;
-static extrn _dsp_disp_chunk_end_p;
-static extrn _dsp_disp_partials_p;
-static extrn _dsp_jpr_name_p;
-static extrn _dsp_red_locals_inited;
+extrn _dsp_disp_chunk_start_p;
+extrn _dsp_disp_chunk_end_p;
+extrn _dsp_disp_partials_p;
+extrn _dsp_jpr_name_p;
+extrn _dsp_red_locals_inited;
 
 // Initialise the cached packed names. Called once on the first
 // reduction candidate the synthesiser actually parallelises.
@@ -5500,8 +5496,8 @@ static _dsp_pack_cstr(s) {
 // in bpp_job.bsm. The rewriter reuses one shared (k, ci) pair across
 // every reduction in the program — reductions never overlap on main
 // so a single slot is safe. Set once at first call site.
-static extrn _dsp_red_k_p;
-static extrn _dsp_red_ci_p;
+extrn _dsp_red_k_p;
+extrn _dsp_red_ci_p;
 
 // Mirrors `_OUTLINE_MIN_N` in src/bpp_job.bsm (keep the two in sync —
 // duplicated rather than imported because this module reasons about
