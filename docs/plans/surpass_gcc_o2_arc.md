@@ -86,14 +86,28 @@ real second consumer (Rule 20).
       rem_while; ACC=(ACC+a1)+(a2+a3)]` in a `T_BLOCK` and replace the original
       while node in its body array with the block. pre_reg_vars RECURSES into
       T_BLOCK (a64_codegen.bsm:870), so the new locals register + get offsets.
-    - **THE ONE OPEN DETAIL — float-typing the synth locals.** pre_reg reads the
-      per-declarator hint `cg_decl_var_hint(n, j)` (T_DECL `n.e[j]`) to set
-      `cg_var_forced_ty = TY_FLOAT`. So the synth `a1,a2,a3` need a T_DECL node
-      carrying a float hint in n.e (mirror how the parser builds `auto (a,b):
-      float`). Inference (`auto x; x=0.0` → float, verified working) runs during
-      PARSE and will NOT re-run on post-parse synth locals, so the hint must be
-      explicit. Resolve the T_DECL hint-slot encoding first (read the parser's
-      grouped-typed-decl builder), then the rest is mechanical.
+    - **Float-typing the synth locals — RESOLVED.** pre_reg reads the
+      per-declarator hint from a T_DECL and sets `cg_var_forced_ty = TY_FLOAT`.
+      The T_DECL synthesis recipe (from the parser's builder, bpp_parser.bsm
+      ~2996): `node = make_node(T_DECL); node.a = <names list via
+      list_begin/list_push/list_end>; node.b = last_list_cnt; node.c = TY_FLOAT;
+      node.e = <arr of [TY_FLOAT, TY_FLOAT, TY_FLOAT]>`. Synth the three names
+      like `_synth_make_name` (poke `__racc<N>_j` into vbuf, `pack(start,len)`).
+      Inference (`auto x; x=0.0`→float, verified) runs during PARSE only, so
+      post-parse synth locals need this explicit hint — which the recipe gives.
+    - **Signatures confirmed:** `_dsp_make_var(name_p)`, `_dsp_make_int_lit(val)`,
+      `_dsp_make_binop(op_ch, lhs, rhs)`, `_dsp_make_assign(lhs, rhs)`,
+      `ast_clone_subst(nd, params_buf, pcnt, args_buf)` where params_buf is a raw
+      buffer of packed names and args_buf a raw buffer of replacement nodes (for
+      IV→IV+j: params=[IV_name], args=[makeBinop('+',var(IV),lit(j))]).
+    - **Safety net:** the whole pass is gated on `flag_fast_math` (default off),
+      so a bug in the transform CANNOT corrupt the bootstrap or the test suite
+      (neither passes --fast-math) — the blast radius is only programs built with
+      the flag. This bounds the risk of the AST construction.
+    - **EVERYTHING RESOLVED — ready to build as a focused ~150-line increment,**
+      tested incrementally under --fast-math (float-typed synth local first, then
+      a minimal `sum += a[i]*b[i]` loop epsilon-checked, then stbconv, then the
+      a64-vs-gcc milestone measurement + full ritual).
     - **Where it runs.** A new pass `reassoc_reduction_loops()` gated on
       `flag_fast_math`, in the dispatch phase alongside the other loop rewrites
       (call it in bpp.bpp before codegen, both dispatch sites). Off = the pass
