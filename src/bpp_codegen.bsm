@@ -3998,6 +3998,32 @@ cg_assign_into_dest_ok(rhs) {
     return 0;
 }
 
+// True when `rhs` is `<target> + <expr>` or `<target> - <expr>` and the target
+// (float var index vi) is the LEFT operand held in a PROMOTED d-register. Such
+// an accumulator is safe to compute straight into its own register even though
+// it "uses" the target — which the blanket cg_node_uses_var check rejects. The
+// target is read as the fadd/fmadd ADDEND straight from its register (the fusion
+// in cg_emit_float_into reads a promoted left operand WITHOUT emitting into
+// dreg, so the register is not touched until the single final write), so nothing
+// is clobbered early. This is the dot-product / FIR-tap shape `acc = acc + a*b`,
+// which is what turns `fmadd d0,…,d8; fmov d8,d0` into a bare `fmadd d8,…,d8`.
+cg_float_acc_into_ok(rhs, vi) {
+    auto n: Node, c0, lft: Node;
+    if (rhs == 0) { return 0; }
+    n = rhs;
+    if (n.ntype != T_BINOP) { return 0; }
+    if (unpack_l(n.a) != 1) { return 0; }
+    c0 = peek(cg_sbuf + unpack_s(n.a));
+    if (c0 != '+' && c0 != '-') { return 0; }
+    lft = n.b;
+    if (lft == 0 || lft.ntype != T_VAR) { return 0; }
+    if (cg_var_idx(lft.a) != vi) { return 0; }
+    // Left must be a promoted float leaf — read from its register, not
+    // recomputed into dreg (which would clobber it before the write).
+    if (cg_float_leaf_kind(lft) <= 0) { return 0; }
+    return 1;
+}
+
 // Does variable `vi` appear anywhere in `nd`? Used to prove a destination
 // register is free of the assignment target before computing an expression
 // straight into it (no aliasing with a not-yet-read source). Unknown node
@@ -5206,7 +5232,7 @@ void cg_emit_stmt(nd) {
                 _af_reg = arr_get(cg_var_promote, _af_vi);
                 if (_af_reg >= 0 && cg_var_is_float(_af_vi) == 1 && arr_get(cg_var_stack, _af_vi) == 0 &&
                     cg_float_tree_need(n.b) <= call(p.simd_temp_count) &&
-                    cg_node_uses_var(n.b, _af_vi) == 0) {
+                    (cg_node_uses_var(n.b, _af_vi) == 0 || cg_float_acc_into_ok(n.b, _af_vi))) {
                     cg_emit_float_into(n.b, _af_reg);
                     return 0;
                 }
