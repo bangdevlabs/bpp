@@ -3637,6 +3637,25 @@ cg_float_tree_need(nd) {
         if (nl > rc) { return nl; }
         return rc;
     }
+    // peekfloat(addr) — a double load from a computed address, the float leaf a
+    // pointer-walking FIR (stbconv's conv_tick) uses on every tap. Same shape as
+    // the T_MEMLD case above: the loaded VALUE is float, but the ADDRESS (the
+    // single arg) is an INTEGER/pointer tree, so its cost is checked against the
+    // INTEGER budget right here (the caller only checks our return value against
+    // the FLOAT/SIMD budget). The float load itself needs no SIMD temp, so this
+    // leaf costs 0. Only plain `peekfloat` (8-byte double) qualifies —
+    // `peekfloat_h` loads a single and widens (FCVT), a different shape.
+    if (t == T_CALL) {
+        auto _pf_addr: Node, _pf_need;
+        if (n.b == 0) { return 999; }
+        if (cg_str_eq(n.a, "peekfloat", 9) == 0) { return 999; }
+        _pf_addr = *(n.b + 0);
+        if (_pf_addr == 0) { return 999; }
+        _pf_need = cg_int_tree_need(_pf_addr);
+        if (_pf_need >= 999) { return 999; }
+        if (_pf_need > call(p.int_temp_count)) { return 999; }
+        return 0;
+    }
     return 999;
 }
 
@@ -3702,6 +3721,33 @@ cg_emit_float_into(nd, dreg) {
         cg_emit_int_into(n.a, _mitmp);
         call(p.emit_fload_mem_into, dreg, _mitmp);
         if (_mitmp >= 0) { call(p.int_temp_free, _mitmp); }
+        return 1;
+    }
+    // peekfloat(addr): load the double straight into dreg (validated as
+    // peekfloat by cg_float_tree_need). Fast path — a promoted int-var address
+    // reads through its register with no temp, so a FIR's `peekfloat(ip)`
+    // becomes a single `ldr d<dreg>, [x<ip>]`. Otherwise the address (an INTEGER
+    // tree) is computed into a borrowed int temp first, mirroring T_MEMLD. This
+    // is what keeps `acc = acc + peekfloat(ip)*peekfloat(bp)` on the fused
+    // multiply-add path instead of the generic value-stack.
+    if (t == T_CALL) {
+        auto _pf_addr: Node, _pf_vi, _pf_reg, _pf_itmp;
+        _pf_addr = *(n.b + 0);
+        _pf_reg = -1;
+        if (_pf_addr.ntype == T_VAR) {
+            _pf_vi = cg_var_idx(_pf_addr.a);
+            if (_pf_vi >= 0 && cg_var_is_float(_pf_vi) == 0) {
+                _pf_reg = arr_get(cg_var_promote, _pf_vi);
+            }
+        }
+        if (_pf_reg >= 0) {
+            call(p.emit_fload_promoted_into, dreg, _pf_reg, 0);
+            return 1;
+        }
+        _pf_itmp = call(p.int_temp_alloc);
+        cg_emit_int_into(_pf_addr, _pf_itmp);
+        call(p.emit_fload_mem_into, dreg, _pf_itmp);
+        if (_pf_itmp >= 0) { call(p.int_temp_free, _pf_itmp); }
         return 1;
     }
     // T_BINOP: dreg = (left) OP (right). A promoted-leaf operand is read
