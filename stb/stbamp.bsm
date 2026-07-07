@@ -19,14 +19,16 @@
 //     harmonics above Nyquist don't alias; the FMV tone stack sits between
 //     stages 2 and 3 (also at the doubled rate), exactly where the Bassman
 //     places its passive Treble/Mid/Bass network.
-//   * The CAB is the cheap stepping-stone approximation the plan calls for —
-//     one lowpass (~4 kHz, the speaker's top-end rolloff) and one highpass
-//     (~85 Hz, the cabinet's low-end limit). A real impulse-response convolution
-//     replaces it in a later increment.
+//   * The CAB has two modes. By default it is the cheap stepping-stone
+//     approximation — one lowpass (~4 kHz, the speaker's top-end rolloff) and
+//     one highpass (~85 Hz, the cabinet's low-end limit). Load a measured
+//     speaker impulse response with `amp_set_cab_ir` and it switches to a real
+//     FIR CONVOLUTION cab (stbconv) instead — the genuine cabinet, resonances
+//     and all. The IR is the caller's data (license-clean, measured or made).
 //
 // Tier-2 (genre cartridge): imports the Tier-1 primitives (stbfilter, stbdrive,
-// stboversample, stbtonestack) and composes them; it names the technique
-// (amp modelling), never a trademark. Everything runs in float (64-bit double).
+// stboversample, stbtonestack, stbconv) and composes them; it names the
+// technique (amp modelling), never a trademark. Float throughout (64-bit double).
 //
 // Canonical use (one amp insert):
 //   auto amp: Amp;
@@ -43,6 +45,7 @@ import "stbfilter.bsm";
 import "stbdrive.bsm";
 import "stboversample.bsm";
 import "stbtonestack.bsm";
+import "stbconv.bsm";
 
 // The amp's whole state: the two sub-cartridge handles, the six one-pole filter
 // memories the three tube stages need (an input-lowpass + a coupling-highpass
@@ -58,7 +61,8 @@ struct Amp {
     drive1: float, drive2: float, drive3: float,   // escalating per-stage saturation
     bias: float,                             // valve asymmetry (even harmonics)
     in_gain: float, out_level: float,        // input drive trim / output makeup
-    sr: float                                // base sample rate (2x for the internal stages)
+    sr: float,                               // base sample rate (2x for the internal stages)
+    cab_conv                                 // Conv* real-IR cab, or 0 for the cheap 2-filter cab
 }
 
 // Init hook for symmetry with the other cartridges. Nothing global to set up.
@@ -87,6 +91,7 @@ amp_new(sample_rate: float) {
     amp.bias = 0.2;                          // mild valve asymmetry
     amp.in_gain = 1.0;
     amp.out_level = 1.0;
+    amp.cab_conv = 0;                        // start on the cheap cab; opt into a real IR
 
     amp_reset(amp);
     amp_set_gain(amp, 0.5);
@@ -113,6 +118,21 @@ void amp_set_tone(amp_p, treble: float, mid: float, bass: float) {
     auto amp: Amp;
     amp = amp_p;
     tonestack_set(amp.ts, treble, mid, bass, amp.sr * 2.0);
+}
+
+// Switch the cab to a real speaker impulse response: `n` float taps at `taps`.
+// The IR is copied into a convolver (stbconv) that replaces the cheap 2-filter
+// cab from the next sample on. Pass n <= 0 to drop back to the cheap cab. The
+// caller supplies the IR (a license-clean measured or synthesised cabinet); the
+// amp does not ship one.
+void amp_set_cab_ir(amp_p, taps, n) {
+    auto amp: Amp;
+    amp = amp_p;
+    if (amp.cab_conv != 0) { conv_free(amp.cab_conv); amp.cab_conv = 0; }
+    if (n > 0) {
+        amp.cab_conv = conv_new(n);
+        conv_set_ir(amp.cab_conv, taps, n);
+    }
 }
 
 // One oversampled sample through the three cascaded tube stages with the tone
@@ -168,12 +188,17 @@ amp_process(amp_p, x: float) -> float {
     b = _amp_stage_chain(amp, b);
     y = oversample_down(amp.os, a, b);
 
-    // Cheap cab: speaker lowpass then cabinet highpass.
-    amp.cab_lp = flt_onepole_tick(amp.cab_lp, y, amp.g_cab_lp);
-    y = amp.cab_lp;
-    lp = flt_onepole_tick(amp.cab_hp, y, amp.g_cab_hp);
-    amp.cab_hp = lp;
-    y = y - lp;
+    // Cab: a real IR convolution if one was loaded, else the cheap 2-filter
+    // approximation (speaker lowpass then cabinet highpass).
+    if (amp.cab_conv != 0) {
+        y = conv_tick(amp.cab_conv, y);
+    } else {
+        amp.cab_lp = flt_onepole_tick(amp.cab_lp, y, amp.g_cab_lp);
+        y = amp.cab_lp;
+        lp = flt_onepole_tick(amp.cab_hp, y, amp.g_cab_hp);
+        amp.cab_hp = lp;
+        y = y - lp;
+    }
 
     return y * amp.out_level;
 }
@@ -189,6 +214,7 @@ void amp_reset(amp_p) {
     amp.s1_in = 0.0; amp.s2_in = 0.0; amp.s3_in = 0.0;
     amp.s1_cp = 0.0; amp.s2_cp = 0.0; amp.s3_cp = 0.0;
     amp.cab_lp = 0.0; amp.cab_hp = 0.0;
+    if (amp.cab_conv != 0) { conv_reset(amp.cab_conv); }
 }
 
 // Free an amp allocated by amp_new (both sub-cartridges and the struct).
@@ -197,5 +223,6 @@ void amp_free(amp_p) {
     amp = amp_p;
     oversample_free(amp.os);
     tonestack_free(amp.ts);
+    if (amp.cab_conv != 0) { conv_free(amp.cab_conv); }
     free(amp_p);
 }

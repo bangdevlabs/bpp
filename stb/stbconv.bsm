@@ -1,0 +1,128 @@
+// stbconv.bsm — direct FIR convolution (the impulse-response engine).
+//
+// Clean-room. Convolution is textbook DSP: the output is the running dot
+// product of an impulse response (IR) with the recent input history,
+//   y[n] = sum_{k=0}^{M-1} h[k] * x[n-k],
+// where `h` is the M-tap IR. Feed a guitar amp's output through a real speaker
+// cabinet's measured IR and you get that exact cabinet — resonances, cone
+// breakup, the whole character — instead of the two-filter approximation the
+// stepping-stone cab uses. The IR itself is DATA the caller supplies (measured
+// or synthesised); this cartridge owns only the convolution.
+//
+// THE HOT LOOP IS A PURE SUM-OF-PRODUCTS, deliberately. A double-length ring
+// keeps the last M samples in a CONTIGUOUS window, so `conv_tick` is two
+// pointers walking in opposite directions through a multiply-accumulate with no
+// wraparound branch — exactly the shape an FP instruction scheduler wants to
+// software-pipeline. This is the first real FIR consumer the deferred Stage-F
+// scheduler (`docs/plans/fp_serial_scheduler.md`) was waiting for: measure the
+// gap against gcc -O2 here before deciding whether that lever is worth building.
+//
+// Everything runs in float (b++ `float` is a 64-bit double). Tier-1: depends on
+// nothing, names no genre — a leaf of the audio graph.
+//
+// Canonical use (a cabinet IR):
+//   auto c: Conv;
+//   c = conv_new(1024);              // capacity: longest IR you'll load
+//   conv_set_ir(c, ir_taps, 512);    // copy a 512-tap IR (float array)
+//   ... per sample ...
+//   auto y: float;
+//   y = conv_tick(c, x);
+//   conv_reset(c);                   // clear the input history between renders
+//   conv_free(c);
+
+// Pure leaf: no imports.
+
+// A convolver: the IR (`ntaps` float taps), a double-length ring holding the
+// last `ntaps` inputs twice over (so the convolution window is always a
+// contiguous run — see conv_tick), and the ring write cursor.
+struct Conv { ir, ntaps, ring, pos }
+
+// Init hook for symmetry with the other cartridges. Nothing global to set up.
+init_stbconv() { return 0; }
+
+// Allocate a convolver sized for an IR of up to `ntaps` taps. The IR starts as
+// a single unity tap (a pass-through: y = x) until conv_set_ir is called, so a
+// fresh convolver is inert rather than silent. The caller owns the pointer and
+// frees it with conv_free.
+conv_new(ntaps) {
+    auto c: Conv, i;
+    c = malloc(sizeof(Conv));
+    c.ntaps = ntaps;
+    c.ir    = malloc(ntaps * 8);         // ntaps float taps
+    c.ring  = malloc(ntaps * 2 * 8);     // double-length ring
+    c.pos   = 0;
+    // Default IR = unity impulse (pass-through), so an un-set convolver is a
+    // wire, not silence.
+    pokefloat(c.ir, 1.0);
+    i = 1;
+    while (i < ntaps) { pokefloat(c.ir + i * 8, 0.0); i++; }
+    conv_reset(c);
+    return c;
+}
+
+// Copy an impulse response into the convolver: `n` float taps from `taps`
+// (clamped to the allocated capacity; a shorter IR zero-pads the rest). The IR
+// is COPIED — the caller's buffer can be reused or freed immediately.
+void conv_set_ir(conv, taps, n) {
+    auto c: Conv, i, m;
+    c = conv;
+    m = n;
+    if (m > c.ntaps) { m = c.ntaps; }
+    i = 0;
+    while (i < m) {
+        pokefloat(c.ir + i * 8, peekfloat(taps + i * 8));
+        i++;
+    }
+    while (i < c.ntaps) { pokefloat(c.ir + i * 8, 0.0); i++; }
+}
+
+// Process one sample: push `x` into the history and return the convolution
+// output. The double-length ring means the last `ntaps` inputs sit in a
+// contiguous span `ring[pos+ntaps] .. ring[pos+1]`, so the dot product is one
+// straight multiply-accumulate — `ip` walks the IR forward, `bp` walks the
+// history backward, no index wrap in the loop. This IS the FIR the FP scheduler
+// exists to optimise.
+conv_tick(conv, x: float) -> float {
+    auto c: Conv, ip, bp, k, n, acc: float;
+    c = conv;
+    n = c.ntaps;
+    // Write the newest sample into both halves of the ring so the window stays
+    // contiguous no matter where `pos` is.
+    pokefloat(c.ring + c.pos * 8, x);
+    pokefloat(c.ring + (c.pos + n) * 8, x);
+    // Dot product: acc = sum_{k=0}^{n-1} ir[k] * history[n-1-k].
+    ip = c.ir;
+    bp = c.ring + (c.pos + n) * 8;        // newest sample; walks backward
+    acc = 0.0;
+    k = 0;
+    while (k < n) {
+        acc = acc + peekfloat(ip) * peekfloat(bp);
+        ip = ip + 8;
+        bp = bp - 8;
+        k++;
+    }
+    // Advance the write cursor, wrapping at ntaps.
+    c.pos = c.pos + 1;
+    if (c.pos >= n) { c.pos = 0; }
+    return acc;
+}
+
+// Clear the input history (both halves of the ring) back to silence. The IR is
+// untouched, so the loaded cabinet survives; only the signal memory is wiped.
+void conv_reset(conv) {
+    auto c: Conv, i, n2;
+    c = conv;
+    n2 = c.ntaps * 2;
+    i = 0;
+    while (i < n2) { pokefloat(c.ring + i * 8, 0.0); i++; }
+    c.pos = 0;
+}
+
+// Free a convolver allocated by conv_new (the IR, the ring, and the struct).
+void conv_free(conv) {
+    auto c: Conv;
+    c = conv;
+    free(c.ir);
+    free(c.ring);
+    free(conv);
+}

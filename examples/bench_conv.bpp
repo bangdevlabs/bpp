@@ -1,0 +1,57 @@
+// bench_conv.bpp — the FIR convolution benchmark (the Stage-F measurement).
+//
+// conv_tick is a pure sum-of-products — the workload the deferred FP
+// instruction scheduler (docs/plans/fp_serial_scheduler.md) was waiting for.
+// This times a real cabinet-length convolution (1024 taps) over a long input
+// and prints ms + a checksum, so `bpp` native and `bpp --c` -> gcc -O2 can be
+// compared on the identical kernel. If gcc is meaningfully faster HERE, the FP
+// scheduler has a measured gap to close; if not, it stays deferred.
+//
+//   bpp examples/bench_conv.bpp -o /tmp/bc && /tmp/bc
+//   bpp --c examples/bench_conv.bpp > /tmp/bc.c && \
+//     cc -O2 -w -Wno-error=implicit-function-declaration /tmp/bc.c -o /tmp/bco -lobjc -lm && /tmp/bco
+
+import "stbconv.bsm";
+
+main() {
+    auto c: Conv, ir, i, n, taps, t0, t1;
+    auto (x, y, acc, ms): float;
+    auto (msi, chk): word;
+
+    taps = 1024;
+    n    = 100000;                         // ~2.3 s of audio at 44.1k
+
+    // A synthetic decaying IR (a stand-in for a measured cabinet): an
+    // exponentially damped, sign-alternating tail — enough structure that the
+    // checksum is sensitive to any convolution error.
+    ir = malloc(taps * 8);
+    for (i = 0; i < taps; i++) {
+        auto v: float;
+        v = sin_f(i * 0.05) * exp_f(0.0 - i * 0.004);
+        pokefloat(ir + i * 8, v);
+    }
+
+    c = conv_new(taps);
+    conv_set_ir(c, ir, taps);
+
+    // A deterministic broadband-ish input (a swept sine) the convolution can't
+    // hoist — each output is the dot product of the IR with M past inputs.
+    // acc sums the outputs so the checksum is sensitive to any convolution error.
+    acc = 0.0;
+    t0  = beat_now_us();
+    for (i = 0; i < n; i++) {
+        x = sin_f(i * 0.017);
+        y = conv_tick(c, x);
+        acc = acc + y;
+    }
+    t1 = beat_now_us();
+
+    ms  = (t1 - t0) / 1000.0;
+    msi = ms;
+    chk = acc;
+    put("conv 1024-tap x ", n, " samples: ", msi, " ms   checksum(x1000): ", chk, "\n");
+
+    conv_free(c);
+    free(ir);
+    return 0;
+}

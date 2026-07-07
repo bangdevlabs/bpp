@@ -1,0 +1,67 @@
+// test_stbconv.bpp — pin the FIR convolution engine by its defining identities:
+// a fresh convolver is a pass-through, feeding an impulse plays the IR back
+// exactly (the single strongest convolution property), a constant is scaled by
+// the sum of the taps (the DC gain), and the whole thing is linear.
+
+import "stbconv.bsm";
+
+fabs_f(x: float) -> float {
+    if (x < 0.0) { return 0.0 - x; }
+    return x;
+}
+
+main() {
+    auto c: Conv, ir, i;
+    auto (x, y, sum): float;
+
+    // A known 4-tap IR: 0.5, 0.25, -0.125, 0.0625 (sum = 0.6875).
+    ir = malloc(4 * 8);
+    pokefloat(ir + 0 * 8, 0.5);
+    pokefloat(ir + 1 * 8, 0.25);
+    pokefloat(ir + 2 * 8, 0.0 - 0.125);
+    pokefloat(ir + 3 * 8, 0.0625);
+
+    c = conv_new(8);   // capacity 8 taps
+
+    // ── (1) fresh convolver is a pass-through (default unity impulse IR) ─
+    if (fabs_f(conv_tick(c, 0.7) - 0.7) > 0.000001)  { putmsg("FAIL: fresh convolver is not a pass-through"); return 1; }
+    if (fabs_f(conv_tick(c, -0.3) - (0.0 - 0.3)) > 0.000001) { putmsg("FAIL: pass-through altered the second sample"); return 2; }
+
+    // ── (2) impulse in → the IR, sample for sample ───────────────────
+    conv_set_ir(c, ir, 4);
+    conv_reset(c);
+    if (fabs_f(conv_tick(c, 1.0)   - 0.5)   > 0.000001) { putmsg("FAIL: tap 0"); return 3; }
+    if (fabs_f(conv_tick(c, 0.0)   - 0.25)  > 0.000001) { putmsg("FAIL: tap 1"); return 4; }
+    if (fabs_f(conv_tick(c, 0.0)   - (0.0 - 0.125)) > 0.000001) { putmsg("FAIL: tap 2"); return 5; }
+    if (fabs_f(conv_tick(c, 0.0)   - 0.0625) > 0.000001) { putmsg("FAIL: tap 3"); return 6; }
+    if (fabs_f(conv_tick(c, 0.0))            > 0.000001) { putmsg("FAIL: past the IR should be silence"); return 7; }
+
+    // ── (3) DC gain = sum of the taps ────────────────────────────────
+    conv_reset(c);
+    for (i = 0; i < 20; i++) { y = conv_tick(c, 1.0); }   // settle past the 4-tap transient
+    if (fabs_f(y - 0.6875) > 0.000001) { putmsg("FAIL: DC gain != sum of taps"); return 8; }
+
+    // ── (4) linearity: 2x input → 2x output ──────────────────────────
+    conv_reset(c);
+    sum = 0.0;
+    for (i = 0; i < 20; i++) {
+        x = 2.0 * ((i % 5) - 2);          // some varying signal
+        y = conv_tick(c, x);
+        sum = sum + fabs_f(y);
+    }
+    // Re-run at half amplitude; the summed output must be exactly half.
+    auto sum_half: float;
+    conv_reset(c);
+    sum_half = 0.0;
+    for (i = 0; i < 20; i++) {
+        x = 1.0 * ((i % 5) - 2);
+        y = conv_tick(c, x);
+        sum_half = sum_half + fabs_f(y);
+    }
+    if (fabs_f(sum - 2.0 * sum_half) > 0.0001) { putmsg("FAIL: convolution is not linear"); return 9; }
+
+    conv_free(c);
+    free(ir);
+    putmsg("PASS: stbconv — pass-through default, impulse plays the IR, DC = tap sum, linear");
+    return 0;
+}
