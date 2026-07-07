@@ -943,3 +943,25 @@ which fall off the CIP path (cg_float_tree_need does not accept them) and pay
 the generic value-stack. So S1 — teaching cg_float_tree_need / cg_emit_float_into
 to accept `peekfloat` as a float leaf — is not a new lever; it extends the
 already-parity machinery to the one leaf shape a pointer-walking FIR uses.
+
+### 2026-07-07 (later) — FP scheduler S1: peekfloat float-CIP leaf
+
+The conv 3.4× gap turned out NOT to be scheduling — it was the float
+value-stack. `cg_float_tree_need` accepted T_VAR/T_LIT/T_MEMLD float leaves but
+not `peekfloat(addr)`, so a pointer-walking FIR's `acc = acc +
+peekfloat(ip)*peekfloat(bp)` fell off the compute-in-place path (which already
+has fmadd fusion) and paid two stack round-trips + a d0 funnel per tap. S1 makes
+`peekfloat` a float leaf (address budgeted against the INT pool, mirroring
+T_MEMLD); the fmadd fusion then fires.
+
+| bench_conv (1024-tap, 100k) | ours | gcc -O2 | ratio |
+|---|---|---|---|
+| pre-S1 | 292 ms | 85 ms | 3.4× |
+| **S1** | **148 ms** | 85 ms | **1.74×** |
+
+Checksum bit-identical (2412) — pure copy/traffic elimination. Inner loop per
+tap: `ldr d2,[x21]; ldr d3,[x22]; fmadd d0,d2,d3,d8` (was ~16 instructions).
+bench_codegen + sound_fusion binaries byte-identical pre/post (the other kernels
+don't use peekfloat), so zero regression; md5 f61fac72 intact. The residual
+1.74× is now the genuine scheduling gap (gcc unrolls ×4 with independent fmuls)
+— S3 — plus one `fmov d8,d0`/tap (S2).

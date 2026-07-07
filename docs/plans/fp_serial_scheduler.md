@@ -190,12 +190,17 @@ carry hint 0" — the lever existed, the leaf test starved it).
 **Corrected attack order** (cheapest first, measure between, all bit-exact
 until S3):
 
-- **S1 — peekfloat as a float-CIP leaf.** Extend `cg_float_tree_need` /
-  `cg_emit_float_into` to accept `peekfloat(addrTree)` where the address tree
-  fits the INTEGER temp budget (the same cross-pool validation the T_MEMLD case
-  already does). Expected per-tap: `ldr, ldr, fmadd d8,dA,dB,d8` + loop control
-  — kills both stack round-trips, the d0 funnel, and un-starves the existing
-  fmadd fusion in one move. Bit-exact (pure copy/traffic elimination).
+- **S1 — peekfloat as a float-CIP leaf. DONE (`a6587f3`, 2026-07-07).**
+  `cg_float_tree_need` / `cg_emit_float_into` now accept `peekfloat(addrTree)`
+  as a float leaf (address tree budgeted against the INTEGER pool, mirroring the
+  T_MEMLD case; the float load reads straight into the destination d-register,
+  fast path through a promoted int-var address). The existing fmadd fusion then
+  fires. Inner loop per tap went from ~16 instructions (two stack round-trips +
+  d0 funnel + unfused fmul/fadd) to `ldr d2,[x21]; ldr d3,[x22]; fmadd d0,d2,d3,d8`.
+  **bench_conv 292 → 148 ms, 3.4× → 1.74× gcc -O2, checksum bit-identical.**
+  Native-only (C emitter has its own path); verified a64 + x64 (Docker) + C-emit;
+  bench_codegen + sound_fusion byte-identical (no regression). Residual: the
+  genuine ×4-unroll scheduling gap (S3) + one `fmov d8,d0`/tap (S2).
 - **S2 — while-loop bottom-test fusion**, if the disasm after S1 still shows
   `cmp+b.ge` at top plus unconditional `b` at bottom (the for-loop fusion lever
   may not cover `while`). Two branches per tap → one. Bit-exact.
