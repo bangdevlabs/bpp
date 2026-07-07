@@ -62,6 +62,46 @@ real second consumer (Rule 20).
     with IV→IV+1..3) + a remainder loop + the final `ACC = (a0+a1)+(a2+a3)`.
     Runs as an AST pass before codegen, so it is backend-agnostic (a64 gets the
     win now via its float-CIP; x64 inherits it once M2 lands).
+
+    **Implementation notes (investigated 2026-07-07, ready to build):**
+    - **Template exists.** The autovec ×4 unroll (`_av_build_vector_loop` /
+      `_av_build_scalar_tail`, bpp_dispatch.bsm ~3717) is the exact shape:
+      cond `i+4 <= bound` via `pack(vbuf_pos,2)` "<=", step `i += 4`, a cloned
+      remainder loop `i < bound` step `i += 1`. Copy its structure; the only
+      difference is the BODY (4 accumulator statements, not a SIMD store).
+    - **Helpers.** `_dsp_make_var(name_p)`, `_dsp_make_int_lit(n)` /
+      `_outline_make_int_lit(n)`, `_dsp_make_binop(op,l,r)`,
+      `_dsp_make_assign(lhs,rhs)`, `make_node(T_BINOP/T_ASSIGN/T_BLOCK)`,
+      `ast_clone_subst(node, names_buf, cnt, replacements_buf)`.
+    - **Detection.** A for-loop is a `T_WHILE` with `node.e != 0` (the step; the
+      init is a separate stmt before it). Match: `node.a` == `T_BINOP '<'` with
+      left `T_VAR(IV)`; `node.e` == `IV = IV + 1`; body is exactly one stmt
+      `T_ASSIGN(lhs=T_VAR(ACC), rhs=T_BINOP('+'|'-', T_VAR(ACC), TERM))` where
+      ACC is a float local and TERM does not assign ACC or IV.
+    - **TERM[IV→IV+j].** `ast_clone_subst(TERM, [IV], 1, [makeBinop('+', var(IV),
+      lit(j))])` — substitutes the IV var-node with `(IV+j)`; one pass, does not
+      recurse into the replacement, so `arr[IV]` → `arr[IV+1]`. Verified this is
+      how outlining uses it.
+    - **Splice.** Wrap `[decl a1,a2,a3:float; a1=0;a2=0;a3=0; main_while;
+      rem_while; ACC=(ACC+a1)+(a2+a3)]` in a `T_BLOCK` and replace the original
+      while node in its body array with the block. pre_reg_vars RECURSES into
+      T_BLOCK (a64_codegen.bsm:870), so the new locals register + get offsets.
+    - **THE ONE OPEN DETAIL — float-typing the synth locals.** pre_reg reads the
+      per-declarator hint `cg_decl_var_hint(n, j)` (T_DECL `n.e[j]`) to set
+      `cg_var_forced_ty = TY_FLOAT`. So the synth `a1,a2,a3` need a T_DECL node
+      carrying a float hint in n.e (mirror how the parser builds `auto (a,b):
+      float`). Inference (`auto x; x=0.0` → float, verified working) runs during
+      PARSE and will NOT re-run on post-parse synth locals, so the hint must be
+      explicit. Resolve the T_DECL hint-slot encoding first (read the parser's
+      grouped-typed-decl builder), then the rest is mechanical.
+    - **Where it runs.** A new pass `reassoc_reduction_loops()` gated on
+      `flag_fast_math`, in the dispatch phase alongside the other loop rewrites
+      (call it in bpp.bpp before codegen, both dispatch sites). Off = the pass
+      returns immediately → byte-identical.
+    - **Risk.** AST construction is the class of change the codebase repeatedly
+      finds only via Docker checksum — build incrementally, test the float-typed
+      synth local in isolation FIRST, then a minimal `sum += a[i]*b[i]` loop,
+      then stbconv, verifying bit-approx (epsilon) each step.
   - M1c: rewrite stbconv's inner loop to the index-reduction shape the transform
     recognizes, so the real consumer benefits. Measure a64 vs gcc -O2 → the
     milestone (target: beat 85 ms).
