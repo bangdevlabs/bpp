@@ -1,6 +1,10 @@
 # Plan — blondie_amp: a Fender Bassman model (preamp + convolution cab)
 
-**Status:** OPEN (2026-07-03). Increments 1 (SVF) + 2 (stbdrive) + 3 (stboversample) + 4 (FMV tone stack) + 5 (stbamp topology) + 6 (blondie_amp plugin + sound_fusion insert) DONE. Next: 7 (stbconv + real speaker IR — the Stage-F consumer).
+**Status:** FUNCTIONALLY COMPLETE (2026-07-06). Increments 1 (SVF) + 2 (stbdrive) + 3 (stboversample) + 4 (FMV tone stack) + 5 (stbamp topology) + 6 (blondie_amp plugin + sound_fusion insert) + 7 (stbconv convolution cab + the Stage-F measurement) DONE. The arc delivered its two goals: a playable Bassman AND the FIR workload that measures the FP scheduler.
+
+**Inc 7 verdict (`61d0ae1`):** `stb/stbconv.bsm` = direct FIR convolution (double-length ring → branchless two-pointer MAC); `amp_set_cab_ir` swaps the cheap cab for a real IR (off by default; caller supplies license-clean IR data). **The measurement (the arc's real payoff):** `bench_conv` 1024-tap FIR is **3.46× gcc -O2** (284 vs 82 ms, bit-identical checksums), and disassembling gcc proves the gap is **instruction scheduling, NOT SIMD** (scalar, unrolled 4× with independent fmuls filling the FP units; no reassociation). This **justifies Alavanca 3 (the FP scheduler)** with a real audio workload, and — because gcc stays bit-exact — a b++ scheduler can match it WITHOUT the `@fast` opt-in. See `docs/plans/fp_serial_scheduler.md` (Phase 2 un-deferred) + `docs/manual/benchmarks.md` (2026-07-06 FIR entry).
+
+**Optional follow-ons (not blockers):** (a) source a real license-clean cab IR .wav — the engine + wiring are done, only the data is missing; (b) the sound_fusion GUI rework the five inserts are asking for; (c) partitioned FFT convolution if a very long IR is ever needed. **The named next COMPILER arc is the FP scheduler**, now with `bench_conv` as its target.
 
 **Increment 1 note — a compiler bug fell out of it.** The SVF's guard test (an
 explicit `x != x` NaN check) exposed that the **C emitter never implemented

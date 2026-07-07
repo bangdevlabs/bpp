@@ -432,6 +432,41 @@ gen_pink_noise.bpp` writes a normalised pink-noise WAV; load it into
 sound_fusion (`--import`) to audition the Blondie amp on real broadband
 material.
 
+## Cap 11 — The convolution cab (a measured cabinet is just an FIR)
+
+The two-filter cab (Cap 9) is a caricature — a speaker cabinet has a complex,
+resonant frequency response no lowpass + highpass captures. The exact way to
+reproduce a specific cabinet is to record its **impulse response** (IR — its
+output when fed a single click) and CONVOLVE the amp's output with it:
+
+```
+y[n] = sum_{k=0}^{M-1} h[k] * x[n-k]      // h = the M-tap cabinet IR
+```
+
+That is `stb/stbconv.bsm`: the output is the running dot product of the IR
+with the last M inputs. A guitar-cab IR is short (a few hundred to a few
+thousand taps), so DIRECT convolution — literally the sum above per sample —
+is fine; only when an IR runs to tens of thousands of taps (a reverb) does
+partitioned FFT convolution earn its complexity. `amp_set_cab_ir` swaps
+stbamp's cheap cab for a real one; the IR is the caller's data (measured, or
+license-clean — the cartridge ships none).
+
+**The implementation choice that matters, and why it's the compiler's
+business.** A convolution's hot loop is a PURE sum-of-products, so how it is
+written decides how fast it runs. stbconv keeps the last M inputs in a
+DOUBLE-LENGTH ring (each sample written to both `ring[pos]` and
+`ring[pos+M]`), so the convolution window is always a contiguous span and the
+inner loop is a branchless two-pointer multiply-accumulate — no modulo, no
+wraparound test per tap. That is the exact shape an instruction scheduler
+wants. Measured against gcc -O2 (`examples/bench_conv.bpp`, 1024 taps), b++ is
+**3.46× slower**, and disassembling gcc shows why: it is NOT vectorised — it
+unrolls the loop 4× and issues independent multiplies that fill the FP units,
+shortening the critical path, while b++ emits a strict serial fmadd chain.
+This is the concrete audio workload that justified building the FP instruction
+scheduler (`docs/plans/fp_serial_scheduler.md`); the DSP and the compiler meet
+here, which is the whole reason the amp arc ends on a convolution. The full
+disasm + numbers are in `docs/manual/benchmarks.md` (2026-07-06 FIR entry).
+
 ## Cross-references
 
 - `docs/manual/bootstrap_manual.md` — the portability tiers, the

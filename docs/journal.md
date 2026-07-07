@@ -15256,3 +15256,64 @@ cramped with five inserts — a rework is due; the proposal on the table is
 "edit one insert at a time" (a channel-strip with a fixed-height selected-
 insert param panel) so it scales past N plugins and frees room for the
 interactive importer.
+
+## 2026-07-06 (later) — Inc 7: the convolution cab, and the measurement that turns the FP scheduler from speculation into the next arc
+
+The endgame of the blondie_amp arc — and the reason the whole arc was worth
+building. The roadmap's third lever (the FP instruction scheduler, "Alavanca
+3") had been DEFERRED BY DOCTRINE since 2026-06-17: Phase 1 closed the biquad
+gap, and the plan explicitly said do not build the scheduler until "a real
+audio DSP workload (an FFT butterfly bank, a polyphase filter, a convolution)
+demonstrates a scheduling-bound gap against gcc." The convolution cab is that
+workload. So this increment ships the engine AND takes the measurement that
+decides the compiler's next move.
+
+**stbconv (`61d0ae1`).** Direct FIR convolution — the impulse-response engine:
+`y[n] = sum_k h[k]·x[n-k]`. Feed a guitar amp's output through a real speaker
+cabinet's measured IR and you get that exact cabinet instead of the two-filter
+approximation. The implementation detail that matters for the measurement: a
+DOUBLE-LENGTH ring holds the last M inputs twice over, so the convolution
+window is always contiguous and `conv_tick` is a branchless two-pointer
+multiply-accumulate — `ip` walks the IR forward, `bp` walks the history
+backward, no wraparound test in the loop. That is the purest sum-of-products
+the scheduler could be handed. The test pins the convolution identities: a
+fresh convolver is a pass-through (default unity impulse IR), feeding an
+impulse plays the IR back sample-for-sample (the single strongest property),
+DC gain equals the tap sum, and the whole thing is linear. stbamp gained
+`amp_set_cab_ir` — load an IR and the cheap 2-filter cab is replaced by a real
+convolution cab (the IR is the caller's license-clean data; the amp ships
+none), off by default so the render md5 is untouched.
+
+**The measurement, and the disasm that made it trustworthy.** `bench_conv`
+(1024-tap IR × 100k samples): ours 284 ms, gcc -O2 82 ms — **3.46×**, with
+bit-identical checksums (a like-for-like kernel, not a diverged shortcut). But
+the house rule is measure the REFERENCE before naming the gap — the autovec
+"regression" of 2026-06-15 was never real precisely because a disasm wasn't
+trusted. So `otool -tv` on gcc's `conv_tick`: it is **NOT vectorized** (zero
+packed ops — and a dot product is the canonical auto-vec loop, so that was the
+first thing to rule out). It is scalar, unrolled 4× — four IR taps and four
+history samples loaded in pairs, four INDEPENDENT `fmul`s that parallelise
+across the FP units, then a serial `fadd` chain in the SAME order (no
+reassociation). The gap is **instruction scheduling**, full stop: gcc separates
+the multiplies from the add to fill the pipeline and shorten the critical path,
+while b++'s accumulator model emits a strict serial fmadd chain plus per-tap
+loop overhead.
+
+**What it decides.** Two things. (1) The FP scheduler now has a real, measured,
+scheduling-bound audio gap justifying it — `fp_serial_scheduler.md` Phase 2
+moves from "deferred, speculative" to "the next compiler arc," exactly the
+trigger the 2026-06-17 note asked for. (2) Because gcc stays BIT-EXACT while
+getting 3.46×, a b++ scheduler can match it WITHOUT the FP-non-associativity
+`@fast` opt-in — the unroll + multiply/add separation recovers most of the gap
+before multiple-accumulator reassociation (which changes rounding) is even on
+the table. That removes the single scariest piece of complexity the deferral
+was worried about.
+
+**Where the arc stands.** The blondie_amp arc is functionally complete: a
+playable Bassman (preamp + tone stack + a cab that can now be a real IR), every
+piece clean-room, every piece with a value test green on both backends. What it
+LEAVES is a pointer, not a loose end: the compiler's next arc is the FP
+scheduler, and it now has a benchmark (`bench_conv`) and a disassembled target
+to build against. Two smaller follow-ons remain optional — sourcing a real
+license-clean cab IR (the engine and the wiring are done; only the data is
+missing), and the sound_fusion GUI rework the five inserts have been asking for.

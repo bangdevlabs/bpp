@@ -4740,6 +4740,45 @@ noise_free(n);
 `sound_fusion --import <path>` loads it (the backend-agnostic import path —
 decodes through stbsound, no native dialog needed).
 
+## Cap 64 — FIR convolution (stbconv)
+
+*Depends on: nothing (Tier-1 leaf)*
+*Source: new — 2026-07-06 (blondie_amp arc Inc 7)*
+*Status: SHIPPED — 2026-07-06*
+
+`stbconv.bsm` is **direct FIR convolution** — the running dot product of an
+impulse response (IR) with the recent input history, `y[n] = sum_k h[k]·
+x[n-k]`. Feed a guitar amp through a real speaker cabinet's measured IR and
+you get that exact cabinet. The IR is DATA the caller supplies (measured or
+synthesised, license-clean); this cartridge owns only the convolution. A
+double-length ring keeps the last M inputs contiguous, so `conv_tick` is a
+branchless two-pointer multiply-accumulate — the pure sum-of-products the
+deferred FP scheduler targets (this is the workload of `examples/bench_conv.bpp`,
+`docs/manual/benchmarks.md` 2026-07-06 entry).
+
+```c
+auto c: Conv;
+c = conv_new(1024);              // capacity: the longest IR you'll load
+conv_set_ir(c, ir_taps, 512);    // copy a 512-tap float IR
+auto y: float;
+y = conv_tick(c, x);             // push x, return the convolution output
+conv_reset(c);                   // clear the input history between renders
+conv_free(c);
+```
+
+| Function | Signature | Notes |
+|----------|-----------|-------|
+| `conv_new(ntaps)` | `→ ptr` | Default IR = unity impulse (pass-through, not silence) |
+| `conv_set_ir(c, taps, n)` | `void` | Copy n float taps (clamped to capacity; zero-pads) |
+| `conv_tick(c, x)` | `→ float` | One sample; the FIR dot product |
+| `conv_reset(c)` | `void` | Clear input history (keeps the loaded IR) |
+| `conv_free(c)` | `void` | Frees IR + ring + struct |
+
+Consumed by `stbamp` (`amp_set_cab_ir` swaps the cheap 2-filter cab for a
+real convolution cab). Feeding an impulse plays the IR back sample-for-sample
+— the defining test. For a very long IR, partitioned FFT convolution is the
+follow-on this direct form is measured against.
+
 ---
 
 # Appendices
@@ -4798,6 +4837,7 @@ Use xfail tests to lock in rejection behavior: they catch regressions where a pr
 | 2026-05-18 | stbcharsheet shipped (`43a7641`). Cap 58 new. Layout row VII (Game systems) grew an stbcharsheet entry. SC1-style reference example included in the chapter, grounding the upcoming WC1 + SC1 mechanical crossover. | Cap 58 + Layout |
 | 2026-05-18 | stbprojectile shipped end of S7. Cap 59 new — pool-based projectile motion + lifecycle (genre-generic Tier-2 built on stbpool). Designed with three consumers in view: rts1 wc1_missiles (first), fps Doom-mode (Phase 4+), rpg Game 4. Industry precedent: Doom mobj_t / SC1 Bullet / Stratagus Missile. Layout row VII grew an stbprojectile entry. | Cap 59 + Layout |
 | 2026-07-06 | blondie_amp arc Inc 3-6 (`cc60079` → `c92cc0f`) + stbnoise (`cff1ec1`). Caps 60-63 new: stboversample (2× half-band FIR anti-alias), stbtonestack (FMV Fender tone stack, clean-room from Yeh & Smith DAFx-06), stbamp (Tier-2 amp topology composing the four Tier-1 audio primitives), stbnoise (white/pink test signals). The DSP rationale for each lives in `audio_specs.md` Caps 7-10. The named product wrapper `tools/blondie_amp/` wires stbamp as sound_fusion's first channel insert; `sound_fusion --import` is the backend-agnostic WAV import. | Caps 60-63 + audio_specs 7-10 |
+| 2026-07-06 | blondie_amp arc Inc 7 (`61d0ae1`) — stbconv (direct FIR convolution cab). Cap 64 new + audio_specs Cap 11. stbamp gained `amp_set_cab_ir` (real IR replaces the cheap cab). The arc's real payoff is the MEASUREMENT: `bench_conv` 1024-tap FIR is 3.46× gcc -O2, disasm-proven scheduling-bound (not SIMD) — it justifies the deferred FP scheduler (`fp_serial_scheduler.md` Phase 2 un-deferred; benchmarks.md 2026-07-06 FIR entry). | Cap 64 + audio_specs 11 |
 
 When a new stb cartridge ships, add a row here describing the
 sweep that wrote its chapter — same pattern Tonify uses for its

@@ -1,13 +1,27 @@
 # Plan — closing the FP-serial gap (biquad 1.49× → parity)
 
-**UPDATE (2026-06-17): Phase 1 SHIPPED (`befad75`) and it CLOSED the gap —
-biquad 1.49× → 1.02× (parity). Phase 2 (the FP scheduler) is DEFERRED: there is
-no longer a measured gap to chase. Build it only when a real audio DSP workload
-(an FFT butterfly bank, a polyphase filter, a convolution) demonstrates a
-scheduling-bound gap against gcc — building it now would be speculative, against
-the measure-first discipline, and it carries the FP-non-associativity opt-in
-complexity for an unmeasured benefit. The diagnosis below was correct: the bulk
-of the gap was the float copy funnel, not scheduling.**
+**UPDATE (2026-07-06): Phase 2 (the FP scheduler) is now JUSTIFIED by a measured
+gap. The blondie_amp arc's convolution cab (`stb/stbconv.bsm`, Inc 7) is the
+"real audio DSP workload" the 2026-06-17 note below said to wait for. Measured
+on the 1024-tap FIR (`examples/bench_conv.bpp`): ours 284 ms vs gcc -O2 82 ms =
+3.46×, checksums bit-identical. Disassembling gcc's kernel (house discipline —
+disasm the reference before naming the gap) is decisive: it is NOT vectorized
+(0 packed ops); it is scalar, unrolled 4× with independent `fmul`s that fill the
+FP units and shorten the critical path, then a serial `fadd` chain in the SAME
+order (no reassociation). So the gap is instruction SCHEDULING, and because gcc
+stays bit-exact, a b++ scheduler can match it WITHOUT the FP-non-associativity
+`@fast` opt-in — the unroll + mul/add separation alone recovers most of the 3.46×.
+This is the measured, scheduling-bound audio gap that moves Phase 2 from
+"deferred/speculative" to "the next compiler arc." See
+`docs/manual/benchmarks.md` (the 2026-07-06 FIR-convolution entry) for the full
+disasm + numbers.**
+
+**UPDATE (2026-06-17): Phase 1 SHIPPED (`befad75`) and it CLOSED the biquad gap —
+1.49× → 1.02× (parity). Phase 2 was DEFERRED at the time: no measured gap to
+chase. The 2026-07-06 update above is exactly the "real workload demonstrates a
+scheduling-bound gap" trigger that note asked for. The diagnosis below was
+correct: the bulk of the biquad gap was the float copy funnel, not scheduling —
+the convolution gap is the OTHER thing, genuinely scheduling.**
 
 **Status:** Phase 1 DONE, Phase 2 deferred. The integer kernels reached `gcc -O2` parity
 (lcg 1.02×, xform 1.10×) after the loop-control + the two register levers. The

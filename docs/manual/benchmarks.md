@@ -867,6 +867,42 @@ beneficiaries are UNEVEN-ref functions — the compiler's own body, above.
 `spring_process` is also byte-identical (its mangled inline slots hit
 the uncovered-mangled refusal path, not the spill path).
 
+### 2026-07-06 — FIR convolution: the measured, scheduling-bound FP gap
+
+The workload the whole blondie_amp arc was built to produce, and the one
+the FP scheduler (`docs/plans/fp_serial_scheduler.md` Phase 2) was
+deferred until it existed. `stb/stbconv.bsm`'s `conv_tick` is a pure
+sum-of-products FIR (a double-length ring makes the dot product a
+branchless two-pointer multiply-accumulate). `examples/bench_conv.bpp`
+times a cabinet-length 1024-tap IR over 100k samples.
+
+| kernel (1024-tap FIR × 100k) | ours (min of 5) | gcc -O2 (min of 5) | ratio |
+|---|---|---|---|
+| `bench_conv` | 284 ms | 82 ms | **3.46×** |
+
+Checksums are **bit-identical** (2412), so this is a like-for-like kernel,
+not a numerically-diverged shortcut.
+
+**Disasm the reference before naming the gap (the standing discipline that
+overturned the autovec story once already).** `otool -tv` on gcc's
+`conv_tick`:
+- **NOT vectorized** — `0` packed ops (no `.2d`/`mulpd`/`fmla.2d`). A dot
+  product is the textbook auto-vec loop, so this was the thing to rule out.
+- **Scalar, unrolled 4×**: `ldp d1,d2` + `ldp d3,d4` (four IR taps), `ldp
+  d6,d5` + `ldp d16,d7` (four history samples), four INDEPENDENT `fmul`,
+  then `fadd d0,d0,d1 … d0,d0,d4` — the products parallelise across the FP
+  units, and the accumulator sum stays in the SAME order (no reassociation).
+
+So the 3.46× is **instruction scheduling**, not SIMD: gcc unrolls, separates
+the multiplies from the add so the muls fill the pipeline, and shortens the
+critical path — while b++'s accumulator model emits a strict serial
+`acc = acc + ir*hist` fmadd chain plus per-tap loop overhead. Two
+consequences: (1) this is the real, measured, scheduling-bound audio gap
+that justifies Phase 2 (Alavanca 3) — it is no longer speculative; (2)
+because gcc stays bit-exact, a b++ scheduler can match it WITHOUT the
+FP-non-associativity `@fast` opt-in (multiple-accumulator reassociation is
+a further, opt-in step, not required to recover most of the 3.46×).
+
 Verified the full way: bench_codegen all four checksums exact (biquad
 -0.2285 / lcg 8843630203987260673 / xform -231170789772321 / manylive
 108041794099160); a64 native 231/0/12 + C-emit 192/0/51 on the INSTALLED
