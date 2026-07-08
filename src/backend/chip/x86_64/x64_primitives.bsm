@@ -242,18 +242,56 @@ _x64_simd_temp_count() { return 0; }
 //   emit_iload_mem_into(dreg): mov dreg, [dreg].
 //   emit_ishl_imm_into(dreg,src,amt): mov dreg,src (if dreg!=src) then shl dreg,amt.
 // Then give _x64_int_temp_count a real free count + temp pool.
-void _x64_emit_iload_var_into(dreg, off) { }
+void _x64_emit_iload_var_into(dreg, off) { x64_enc_load(dreg, 5, off); }
 // Real (not a CIP stub): the constant-promotion materialisation (emit_func
 // step 12b) loads each promoted constant into its callee-saved register, and
 // that path is backend-agnostic. dreg is a physical x86 register number.
 void _x64_emit_iconst_into(dreg, val) { x64_enc_mov_wide(dreg, val); }
-void _x64_emit_iop_into(op_code, dreg, s1, s2) { }
-void _x64_emit_iload_mem_into(dreg) { }
-void _x64_emit_ishl_imm_into(dreg, src, amt) { }
+void _x64_emit_iop_into(op_code, dreg, s1, s2) {
+    if (op_code == 3) {
+        auto save_rax, save_rdx;
+        save_rax = dreg != 0; save_rdx = dreg != 2;
+        if (save_rax) { x64_enc_push(0); }
+        if (save_rdx) { x64_enc_push(2); }
+        x64_enc_mov_reg(0, s1); x64_enc_cqo(); x64_enc_idiv(s2);
+        x64_enc_mov_reg(dreg, 0);
+        if (save_rdx) { x64_enc_pop(2); }
+        if (save_rax) { x64_enc_pop(0); }
+        return 0;
+    }
+    // Destination aliases the RIGHT operand (dreg == s2). x86's 2-operand ISA
+    // cannot `mov dreg, s1` first — it would clobber s2 before the op reads it.
+    // a64's 3-operand emit is immune, so the spine's int assign-into-dest does
+    // not guard this; x64 must. Commutative ops just apply s1 in place
+    // (s2 OP s1 == s1 OP s2); subtraction negates then adds (s1 - s2).
+    if (dreg == s2) {
+        if (op_code == 1) { x64_enc_neg(dreg); x64_enc_add_reg(dreg, s1); return 0; }
+        if (op_code == 2) { x64_enc_imul(dreg, s1);    return 0; }
+        if (op_code == 4) { x64_enc_and_reg(dreg, s1); return 0; }
+        if (op_code == 5) { x64_enc_or_reg(dreg, s1);  return 0; }
+        if (op_code == 6) { x64_enc_xor_reg(dreg, s1); return 0; }
+        x64_enc_add_reg(dreg, s1);
+        return 0;
+    }
+    if (dreg != s1) { x64_enc_mov_reg(dreg, s1); }
+    if (op_code == 1) { x64_enc_sub_reg(dreg, s2); return 0; }
+    if (op_code == 2) { x64_enc_imul(dreg, s2);    return 0; }
+    if (op_code == 4) { x64_enc_and_reg(dreg, s2); return 0; }
+    if (op_code == 5) { x64_enc_or_reg(dreg, s2);  return 0; }
+    if (op_code == 6) { x64_enc_xor_reg(dreg, s2); return 0; }
+    x64_enc_add_reg(dreg, s2);
+    return 0;
+}
+void _x64_emit_iload_mem_into(dreg) { x64_enc_load(dreg, dreg, 0); }
+void _x64_emit_ishl_imm_into(dreg, src, amt) {
+    if (dreg != src) { x64_enc_mov_reg(dreg, src); }
+    x64_enc_shl_imm(dreg, amt);
+}
 // x86_64 has no integer multiply-accumulate, so a real port would emit
 // `imul tmp,n,m; lea/add dst,a,tmp`; left as a stub while x64 stays on the
 // accumulator path (int_temp_count -1, so this is never reached).
 void _x64_emit_imadd(op_code, dst, n, m, a) { }
+_x64_has_int_madd() { return 0; }
 // Induction pointer walk: x86 has no post-index addressing mode (it is an ARM
 // feature), so iv_supported returns 0 and the spine never fires the walk on
 // x64 — the loop keeps its normal index-arithmetic codegen. The emit_iv_*
@@ -269,13 +307,16 @@ void _x64_emit_self_op_imm(reg, imm, is_sub) {
     if (is_sub) { x64_enc_sub_imm(reg, imm); }
     else { x64_enc_add_imm(reg, imm); }
 }
-_x64_int_temp_alloc() { return -1; }
-void _x64_int_temp_free(reg) { }
+_x64_int_temp_alloc() { return x64_gp_alloc(); }
+void _x64_int_temp_free(reg) { x64_gp_free(reg); }
 // -1 (not 0): an int tree of two B3-promoted leaves needs 0 temps, and on
 // x64 int locals CAN be promoted (unlike floats), so a 0 count would let
 // `need(0) <= count(0)` fire CIP on these no-op stubs. -1 makes the spine's
 // `need <= count` gate fail for every tree, fully opting x64 out.
-_x64_int_temp_count() { return 0 - 1; }
+_x64_int_temp_count() {
+    if (x64_gp_free_mask & 0x1) { return 1; }
+    return 0;
+}
 
 // ── BINOP comparisons (Wave 6) ──
 //

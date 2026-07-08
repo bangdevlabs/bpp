@@ -39,7 +39,7 @@ always confirm a codegen change with the Docker self-host (`gen1 == gen2`).
 | Immediate-form shift (`<<`/`>>` by a constant) | ✅ SBFM/UBFM | ✅ `C1 /4,/5,/7` | parity (shared spine peephole) |
 | Int expression freelist (B1) | ✅ x9..x15 (7 deep) | ⚠️ r11 (1 deep) | **architectural** |
 | Float compute-in-place (F.2.c) + float-B3 + `fmadd` | ✅ | ❌ | **architectural** |
-| **Integer compute-in-place (Stage 1)** | ✅ | ❌ stubs ready | **deferred** |
+| **Integer compute-in-place (Stage 1)** | ✅ | ✅ (2026-07-07) | parity (2-operand emit; 1-deep freelist) |
 | ↳ CIP memory-load leaf — `a[i]` subscripts (Jun 17 fix) | ✅ | ❌ (CIP off) | rides Int-CIP |
 | ↳ CIP strength reduction `x*2^k` → shift (Stage C) | ✅ | ❌ stub | rides Int-CIP |
 | ↳ CIP integer `madd`/`msub` fusion (Stage E) | ✅ | ❌ stub (no int MAC) | rides Int-CIP |
@@ -58,10 +58,12 @@ float-B3, `fmadd` — and it is **architectural, not debt**: SysV makes every
 XMM caller-saved, so the d8..d15 promotion the a64 float wins depend on has no
 x64 target. It will not close, and re-attempting it is the one thing this doc
 exists to stop. For **integer / control-flow / SIMD / structural** code x64 is
-at or near parity (inline, B3, const-promotion, multi-return, autovec, dynlink
-all real); the only genuine x64 debt is **integer-CIP** (deferred, low-value —
-SysV's shallow GP freelist caps it) and the **integer** half of RegAlloc v2
-(implementable). Practical reading: porting the audio/DSP engine to x64 will run
+at or near parity (inline, B3, const-promotion, multi-return, autovec, dynlink,
+and — since 2026-07-07 — integer-CIP all real); the only genuine remaining x64
+debt is the **integer** half of RegAlloc v2 (implementable). Integer-CIP on x64
+is capped in SCOPE by the 1-deep GP freelist (a throughput ceiling, not a
+correctness one) and stays low-value since integer serial code has ample
+headroom. Practical reading: porting the audio/DSP engine to x64 will run
 **correctly** but meaningfully slower per float sample — and since a64 has
 ~290× realtime headroom on the DAW render, even ~2.7× slower leaves comfortable
 realtime margin. The slowdown is inherent to x86-64, not a backlog to burn down.
@@ -90,49 +92,47 @@ missing work. Re-deriving them wastes time; the answer is recorded here.
 The expensive part (the spine machinery) is done and backend-agnostic; only
 the chip-specific emission remains. Filling these in is a contained task.
 
-### Integer compute-in-place (Stage 1)
+### Integer compute-in-place (Stage 1) — ✅ SHIPPED on x64 (2026-07-07)
 
-a64 emits `+ - * & | ^` integer trees destination-driven (no x0 shuttle); x64
-keeps the accumulator path. **Spine is complete** — `cg_emit_int_into` /
-`cg_int_tree_need` / `cg_int_leaf_kind` and the six struct slots
-(`emit_iop_into` etc.) exist and run on both backends. **x64 chip stubs
-exist** in `x64_primitives.bsm` (`_x64_emit_iop_into` etc., currently `{ }`)
-and `_x64_int_temp_count()` returns `-1`, so the spine gate
-`cg_int_tree_need <= int_temp_count` never fires and the accumulator path is
-used untouched.
+a64 emits `+ - * & | ^ /` integer trees destination-driven (no x0 shuttle); x64
+now does too. The four emit stubs are filled (`_x64_emit_iop_into` /
+`iload_var_into` / `iload_mem_into` / `ishl_imm_into`), and `_x64_int_temp_count`
+returns the real freelist count (r11, 1 deep). Proven by the **x64 self-host**
+(gen1 == gen2, the CIP compiler compiles itself byte-identically) + the bench
+checksums + a64 byte-identical throughout.
 
-To implement:
-1. Fill the four emit stubs. `emit_iop_into(op, dreg, s1, s2)` must handle the
-   **2-operand x86 ISA**: if `dreg != s1` emit `mov dreg, s1` first, then the
-   in-place `OP dreg, s2` (`add`/`sub`/`imul`/`and`/`or`/`xor` reg,reg). In
-   the CIP `dreg != s2` always holds, so no operand-aliasing fixup is needed.
-   `emit_iconst_into` = `mov dreg, imm64`; `emit_iload_var_into` = load from
-   the rbp-relative frame slot; `emit_iload_mem_into` = `mov dreg,[dreg]`.
-2. Give `_x64_int_temp_count()` a real free count + a temp pool. With only
-   `r11` free it fires for ≤1-temp trees (still the very common `var OP const`
-   / `var OP var`). A wider pool (e.g. r10 + reclaimed arg regs in call-free
-   regions) is more work for diminishing return — **low priority**: the SysV
-   register pressure caps the win.
+**The three bugs it took to get there — all worth keeping, because two are about
+the 2-operand ISA and one is a genuine SPINE latent bug the a64 3-operand emit
+had been masking:**
 
-**ATTEMPTED + REVERTED 2026-07-07 — the 1-temp pool is not enough; a wider
-pool is a HARD prerequisite, not an optimisation.** Filling the four stubs and
-flipping `int_temp_count` to a real count (r11, 1 deep) passed the arithmetic
-benchmarks but MISCOMPILED the compiler's own struct-lookup on the x64
-self-host (`E101 unknown type 'FieldRec'` — packed-name / registry code hit the
-register-pressure hole). Two real bugs surfaced and were fixed en route, worth
-recording for the next attempt: (a) the spine's **integer madd fusion**
-(`(a*b)+c` → `emit_imadd`) needs up to 2 temps for the multiplicands, but
-`cg_int_tree_need` under-counts that peak, so the second `int_temp_alloc`
-returned −1 (garbage) on the 1-deep pool — the fusion is also USELESS on x64
-(no integer FMA), so gate it off via a `has_int_madd` chip predicate (a64=1,
-x64=0) and let the CIP decompose to imul+add; (b) an idiv/imadd that placed the
-product/quotient in **rax must not blind-save/restore rax** — `dreg` CAN be rax
-(the return register), so the restore overwrites the result (save rax/rdx only
-when they are NOT the destination). Even with both fixed, more shapes broke —
-the 1-deep freelist is genuinely too tight for the compiler's own code. So the
-gate is confirmed: reliable x64 int-CIP needs the **wider pool FIRST**, and the
-whole feature stays **low-value** (integer serial code has ample headroom).
-Docker caught every one of these; a64 was byte-identical throughout.
+1. **Destination-aliases-right-operand (the spine bug, and the broad one).** The
+   integer assign-into-destination lever fires without a `cg_node_uses_var`
+   guard — safe on a64 because `add dreg, s1, s2` reads BOTH sources then writes
+   dreg atomically. On x64's 2-operand ISA `x = a + x` becomes
+   `mov x, a; add x, x` = 2a. Accumulators / counters (`total = delta + total`)
+   are everywhere, so enabling the x64 CIP broke the compiler's own parser
+   broadly (a spurious `E101 unknown type` from miscompiled symbol resolution).
+   Fixed in `_x64_emit_iop_into`: when `dreg == s2`, apply s1 in place for the
+   commutative ops (`s2 OP s1 == s1 OP s2`) and `neg dreg; add dreg, s1` for
+   subtraction. (The spine's own gate could ALSO grow a `cg_node_uses_var`
+   check, but the chip-level fix keeps the win — `x = a + x` still computes in
+   place — and is correct.)
+2. **Integer madd fusion needs 2 temps and is useless on x64.** The spine fuses
+   `(a*b)+c` → `emit_imadd` (a single a64 `madd`), computing both multiplicands
+   into temps; on the 1-deep freelist the second `int_temp_alloc` returned −1.
+   x86 has no integer FMA anyway, so a `has_int_madd` chip predicate (a64=1,
+   x64=0) gates the fusion off and the CIP decomposes to imul+add.
+3. **idiv/imadd must not blind-restore rax.** idiv leaves the quotient in rax;
+   `dreg` CAN be rax (the return register), so save/restore rax/rdx only when
+   they are NOT the destination.
+
+The 1-deep freelist (r11) genuinely caps the *scope* (deeper trees fall back via
+the `need <= count` gate) but is NOT a correctness blocker — the earlier
+"needs a wider pool first" verdict was wrong; the wider pool is a pure
+throughput optimisation, still **low-value** (integer serial code has ample
+headroom). Docker caught every bug; the root cause came from reasoning about the
+2-operand emit, and `bug --disasm` (which handles x86-64) would have found the
+miscompiled function faster than objdump.
 
 ### Constant promotion (Stage 2a) — ✅ SHIPPED on x64 (no longer deferred)
 
