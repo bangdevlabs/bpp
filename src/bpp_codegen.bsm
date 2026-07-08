@@ -1271,6 +1271,31 @@ cg_const_record(packed) {
     return 0;
 }
 
+// A T_CALL to an inlined memory builtin (the peek/poke family) emits only a
+// load or store — no `call`/`syscall` instruction, no caller-saved-register
+// clobber — so it must NOT disqualify a function from the leaf register budget.
+// This is what makes a FIR (`acc = acc + peekfloat(ip)*peekfloat(bp)`) count as
+// a leaf, so its accumulator promotes into a caller-saved register (x64 xmm,
+// a64's wider x9..x12 band) instead of shuttling through the frame every tap.
+// Real calls, syscalls (put/print/sys_*), and allocation still clear cg_fn_leaf.
+cg_call_leaf_safe(nd) {
+    auto n: Node;
+    n = nd;
+    if (cg_str_eq(n.a, "peek", 4)) { return 1; }
+    if (cg_str_eq(n.a, "peek_h", 6)) { return 1; }
+    if (cg_str_eq(n.a, "peek_q", 6)) { return 1; }
+    if (cg_str_eq(n.a, "peek_w", 6)) { return 1; }
+    if (cg_str_eq(n.a, "peekfloat", 9)) { return 1; }
+    if (cg_str_eq(n.a, "peekfloat_h", 11)) { return 1; }
+    if (cg_str_eq(n.a, "poke", 4)) { return 1; }
+    if (cg_str_eq(n.a, "poke_h", 6)) { return 1; }
+    if (cg_str_eq(n.a, "poke_q", 6)) { return 1; }
+    if (cg_str_eq(n.a, "poke_w", 6)) { return 1; }
+    if (cg_str_eq(n.a, "pokefloat", 9)) { return 1; }
+    if (cg_str_eq(n.a, "pokefloat_h", 11)) { return 1; }
+    return 0;
+}
+
 cg_b3_walk(nd) {
     auto n: Node, t, vi, child: Node, arr, cnt, i, w;
     if (nd == 0) { return 0; }
@@ -1313,7 +1338,8 @@ cg_b3_walk(nd) {
     T_RET      { cg_b3_walk(n.a); }
     T_TERNARY  { cg_b3_walk(n.a); cg_b3_walk(n.b); cg_b3_walk(n.c); }
     T_CALL {
-        cg_fn_leaf = 0;                  // a call disqualifies the leaf budget
+        // Inlined memory builtins (peek/poke) emit no call → keep the leaf budget.
+        if (cg_call_leaf_safe(n) == 0) { cg_fn_leaf = 0; }
         arr = n.b; cnt = n.c;
         for (i = 0; i < cnt; i++) { cg_b3_walk(arr[i]); }
     }
