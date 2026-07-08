@@ -107,8 +107,22 @@ big-league general-quality investment, not a hot-path fix.
   (site 797 may not be a local-promotion site — VERIFY what it is before routing
   it), or a claim_freelist interaction with x9..x12 now live across calls. Next
   attempt: activate ONE piece at a time (budget first, verify self-host; then
-  reg_at; then routing; then frame) so the breaking sub-step is isolated. Reverted
-  to Step 1; that is the clean base.
+  reg_at; then routing; then frame) so the breaking sub-step is isolated.
+
+  **2nd attempt (2026-07-08) — TWO bugs, first fixed, second open.** Bug A (lldb
+  backtrace = stack overflow in `_a64_route_promoted`): the global string-replace
+  of `a64_promoted_regs = arr_push(...)` → `_a64_route_promoted(reg)` ALSO rewrote
+  the router's OWN else-branch → infinite recursion. Fixed. With A fixed the
+  machinery is basically right: the minimal test (12 caller-saved locals live
+  across a call) ran CORRECTLY (785 == Step-1), trivial worked. Bug B (STILL
+  OPEN): `test_gpu_atlas_aseprite` crashed — `_png_unfilter → memcpy` with a wild
+  pointer (a promoted pointer not preserved across a call). _png_unfilter has
+  loops + nested calls the single-level test doesn't exercise. Likely (a) arg
+  evaluation clobbering a CLAIMED x9..x12 ad-hoc (read-after-clobber during arg
+  setup, the reload only comes after the bl); or (b) nested calls sharing the one
+  spill-slot band. NEXT: minimal repro (promoted pointer used before AND after a
+  call in a loop, plus a NESTED call in an arg), disasm the spill. Reverted to
+  Step 1 (clean base).
 - **M3 — the cost model.** Extend B3/RegAlloc to CHOOSE caller-saved (with
   spilling) vs callee-saved vs memory per value, by the measured trade-off. This
   is where the general-quality win lands.
