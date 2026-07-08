@@ -133,17 +133,106 @@ static _dis_rm(buf, mp, rexB) {
     return 5;
 }
 
+// Print a small decimal (0..15 is all we need for register numbers).
+static _ddec(n) {
+    if (n >= 10) { _ddec(n / 10); }
+    out_ch(n - (n / 10) * 10 + '0');
+}
+// Print an SSE register name, e.g. "xmm12".
+static _dxn(r) { out_str("xmm"); _ddec(r); }
+
+// r/m operand for an SSE instruction: a mod==3 field names an xmm register
+// (not a GP one), otherwise the addressing is identical to _dis_rm (the memory
+// base is still a GP register — `movsd xmm0, [rax+8]`).
+static _dis_xmm_rm(buf, mp, rexB) {
+    auto modrm, mod;
+    modrm = peek(buf + mp) & 0xFF;
+    mod = (modrm >> 6) & 3;
+    if (mod == 3) { _dxn((modrm & 7) | (rexB << 3)); return 1; }
+    return _dis_rm(buf, mp, rexB);
+}
+
+// Decode a two-byte SSE opcode. `p` points at the 0F escape byte; `pfx` is the
+// f2/f3/66 mandatory prefix already consumed. Covers the scalar-double family
+// the B++ float codegen emits (movsd/add/mul/sub/div/sqrt/cvt) plus movq and a
+// few packed ops, so `bug --disasm` shows real float mnemonics instead of a
+// stream of `.byte`. `store` = the r/m is the destination; `reg_is_gp` /
+// `rm_is_gp` mark the GP side of a convert / movq.
+static _dis_sse(buf, fp, p, pfx, rexR, rexB) {
+    auto op2, m, reg, mp, rmlen, store, reg_is_gp, rm_is_gp;
+    op2 = peek(buf + p + 1) & 0xFF;
+    mp = p + 2;
+    reg = ((peek(buf + mp) >> 3) & 7) | (rexR << 3);
+    m = 0; store = 0; reg_is_gp = 0; rm_is_gp = 0;
+
+    if (pfx == 0xF2) {                          // scalar double
+        if (op2 == 0x10) { m = "movsd"; }
+        if (op2 == 0x11) { m = "movsd"; store = 1; }
+        if (op2 == 0x58) { m = "addsd"; }
+        if (op2 == 0x59) { m = "mulsd"; }
+        if (op2 == 0x5C) { m = "subsd"; }
+        if (op2 == 0x5E) { m = "divsd"; }
+        if (op2 == 0x51) { m = "sqrtsd"; }
+        if (op2 == 0x5A) { m = "cvtsd2ss"; }
+        if (op2 == 0x2A) { m = "cvtsi2sd"; rm_is_gp = 1; }
+        if (op2 == 0x2C) { m = "cvttsd2si"; reg_is_gp = 1; }
+    }
+    if (pfx == 0xF3) {                          // scalar single
+        if (op2 == 0x10) { m = "movss"; }
+        if (op2 == 0x11) { m = "movss"; store = 1; }
+        if (op2 == 0x7E) { m = "movq"; }
+        if (op2 == 0x5A) { m = "cvtss2sd"; }
+    }
+    if (pfx == 0x66) {                          // movd/q + packed
+        if (op2 == 0x6E) { m = "movq"; rm_is_gp = 1; }
+        if (op2 == 0x7E) { m = "movq"; store = 1; rm_is_gp = 1; }
+        if (op2 == 0xD6) { m = "movq"; store = 1; }
+        if (op2 == 0xEF) { m = "pxor"; }
+        if (op2 == 0x57) { m = "xorpd"; }
+        if (op2 == 0x54) { m = "andpd"; }
+        if (op2 == 0x2E) { m = "ucomisd"; }
+        if (op2 == 0x28) { m = "movapd"; }
+        if (op2 == 0x29) { m = "movapd"; store = 1; }
+        if (op2 == 0x12) { m = "movups"; }
+        if (op2 == 0x13) { m = "movups"; store = 1; }
+    }
+    if (m == 0) {                               // unknown SSE op — resync
+        out_str(".byte "); _dh(pfx); out_nl();
+        return 1;
+    }
+    out_str(m); out_str(" ");
+    if (store) {
+        if (rm_is_gp) { rmlen = _dis_rm(buf, mp, rexB); } else { rmlen = _dis_xmm_rm(buf, mp, rexB); }
+        out_str(", ");
+        if (reg_is_gp) { _drn(reg); } else { _dxn(reg); }
+    } else {
+        if (reg_is_gp) { _drn(reg); } else { _dxn(reg); }
+        out_str(", ");
+        if (rm_is_gp) { rmlen = _dis_rm(buf, mp, rexB); } else { rmlen = _dis_xmm_rm(buf, mp, rexB); }
+    }
+    out_nl();
+    return (mp - fp) + rmlen;
+}
+
 // Decode ONE instruction at file offset fp, displaying it at code-relative
 // offset show_off. Prints the line and returns the instruction's byte length.
 // Unknown opcodes print ".byte 0xNN" and return 1 so the caller can resync.
 static _dis1(buf, fp, show_off) {
-    auto p, rexR, rexB, b, op, m, dir, mp, modrm, reg, rmlen, imm, rr, op2, rel, l;
+    auto p, rexR, rexB, b, op, m, dir, mp, modrm, reg, rmlen, imm, rr, op2, rel, l, sse_pfx;
     p = fp;
     rexR = 0; rexB = 0;
 
     out_str("  +"); _dhx(show_off); out_str(":  ");
 
     b = peek(buf + p) & 0xFF;
+    // Optional SSE mandatory prefix (f2/f3, or 66 before a 0F escape). The B++
+    // backend emits these only for SSE, so consume one here before the REX.
+    sse_pfx = 0;
+    if (b == 0xF2 || b == 0xF3 || b == 0x66) {
+        sse_pfx = b;
+        p = p + 1;
+        b = peek(buf + p) & 0xFF;
+    }
     if (b >= 0x40 && b <= 0x4F) {             // REX prefix
         rexR = (b >> 2) & 1;
         rexB = b & 1;
@@ -151,6 +240,11 @@ static _dis1(buf, fp, show_off) {
         b = peek(buf + p) & 0xFF;
     }
     op = b;
+
+    // Two-byte SSE opcode (prefix + 0F + op): decode with xmm operands.
+    if (sse_pfx != 0 && op == 0x0F) {
+        return _dis_sse(buf, fp, p, sse_pfx, rexR, rexB);
+    }
 
     // push / pop r64
     if (op >= 0x50 && op <= 0x57) { out_str("push "); _drn((op - 0x50) | (rexB << 3)); out_nl(); return (p - fp) + 1; }
