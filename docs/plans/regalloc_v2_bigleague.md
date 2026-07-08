@@ -59,9 +59,13 @@ big-league general-quality investment, not a hot-path fix.
 
 ## Increments
 
-- **M1 — activate linear-scan on x64.** Fill `_x64_regalloc_apply` (mirror
-  `_a64_regalloc_apply`), with the same systematic-comparison gate. Measure the
-  overflow reduction with the pressure instrumentation (re-run the study).
+- **M1 — activate linear-scan on x64. ✅ DONE (2026-07-08, `a429a63`).** Filled
+  `_x64_regalloc_apply` (mirror `_a64_regalloc_apply`) + `_x64_b3_reg_at` + a
+  `regalloc_int_budget` chip primitive (the scan had run with a64's hardcoded
+  10/14 budget; x64 needs 5). a64 byte-identical (same budget), x64 self-host
+  stable. MEASURED on the x64 gen1: `emit_node` frame accesses 676 → 137 (−80%),
+  `val_check_node` 258 → 92 (−64%); `cg_emit_stmt` declined by the gate (correct
+  fallback). Register-sharing across non-overlapping live ranges is the win.
 - **M2 — caller-saved spill set.** `cg_emit_call` computes the live caller-saved
   set at each call site and calls `save/restore_caller_saved_int`. Implement the
   primitives (push/pop the spill set). Gate on a value actually being promoted to

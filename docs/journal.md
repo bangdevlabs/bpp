@@ -15602,3 +15602,35 @@ Verification throughout: a64 byte-identical on every x64-only change, x64
 self-host gen1 == gen2 after each, native 240/0/12 + C-emit 198/0/54, gen2 ==
 gen3, zero warnings. `bug` learned to read SSE2. The scoreboard tells the truth
 about what is chip and what is compiler.
+
+## 2026-07-08 — RegAlloc v2 M1: the linear-scan goes live on x64, measured
+
+First increment of the RegAlloc-v2 big-league arc — the one the pressure study
+justified. The linear-scan allocator (liveness → intervals → scan, sharing one
+register across non-overlapping live ranges) had been running in SHADOW MODE for
+both backends, but only a64 wired its result into `cg_var_promote`;
+`_x64_regalloc_apply` was a `return 0` stub, so x64 always kept B3's greedy pick.
+Worse, the shared orchestration ran the scan with the int budget HARDCODED to
+a64's 10/14, which x64's five callee-saved registers can't honor.
+
+Three pieces closed it. A `regalloc_int_budget` chip primitive (a64: 10, or 14 in
+a leaf, exactly `_a64_b3_reg_at`'s table; x64: 5) so the scan runs with the
+TARGET's budget — a64 returns the same numbers, so a64 is byte-identical.
+`_x64_b3_reg_at(slot)` mapping the logical slot to rbx/r12..r15. And the real
+`_x64_regalloc_apply`, mirroring the a64 one: validate every assigned slot maps
+to a register, reset the covered promotions, rebuild the save list listing each
+physical register exactly once (several variables legitimately share one slot —
+that sharing is the whole point), re-run constant promotion on the leftover
+budget. No `claim_freelist` step, because x64's promoted regs (callee-saved) are
+disjoint from its freelist (r11/r8/r9), unlike a64's overlapping x9..x15.
+
+The win is register sharing: more hot locals fit the same five registers, so
+fewer spill to the frame. Measured on the x64 gen1 by disassembling the heaviest
+non-leaf offenders and counting rbp-relative accesses, old stub vs new:
+`emit_node` 676 → 137 (−80 %), `val_check_node` 258 → 92 (−64 %); `cg_emit_stmt`
+unchanged, its swap declined by the systematic-comparison gate — the correct
+conservative fallback, never a regression. Exactly the non-leaf-overflow gap the
+study measured, closing. a64 byte-identical, x64 self-host gen1 == gen2 with the
+scan live, checksums intact, 240/0/12 + 198/0/54, gen2 == gen3, zero warnings.
+M2 (caller-saved spilling — the allocator using caller-saved regs for cross-call
+values) is the next, deeper increment; M1 banked here.
