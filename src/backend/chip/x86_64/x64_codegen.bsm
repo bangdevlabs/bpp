@@ -340,6 +340,47 @@ void _x64_b3_select() {
     free(pool);
 }
 
+// Float B3 for x64 — the S2-equivalent: promote hot `: float` locals into
+// caller-saved xmm12..xmm14 so the accumulator of a DSP loop stays in a
+// register (mulsd/addsd into it, no frame round-trip). SysV has no callee-saved
+// xmm, so this is safe ONLY in a LEAF function — a call would clobber the xmm.
+// The body is scanned for any call (cg_cur_body is set before b3_select) and the
+// pass bails if one exists. The promoted regs are NOT pushed to
+// x64_promoted_regs: they are caller-saved and the function is a leaf, so no
+// prologue save/restore is needed (unlike the callee-saved int pool). The float
+// CIP then reads them directly via cg_float_leaf_kind, and load/store_var use
+// movsd (see x64_emit_load_var). xmm8..11 stay the CIP temp pool; xmm15 the
+// aliasing scratch — disjoint from 12..14, so temps and promoted never collide.
+void _x64_b3_select_float() {
+    auto budget, used, vi, n, best_vi, best_refs, reg, pool, j;
+    // Leaf gate: any call in the body → caller-saved xmm is unsafe → bail.
+    for (j = 0; j < cg_cur_bcnt; j++) {
+        if (cg_has_call(*(cg_cur_body + j * 8))) { return; }
+    }
+    pool = buf_word(3);
+    pool[0] = 12; pool[1] = 13; pool[2] = 14;
+    budget = 3;
+    n = arr_len(cg_vars);
+    used = 0;
+    while (used < budget) {
+        best_vi = -1;
+        best_refs = 1;
+        for (vi = 0; vi < n; vi++) {
+            if (arr_get(cg_var_promote, vi) >= 0) { continue; }
+            if (cg_b3_eligible_float(vi) == 0) { continue; }
+            if (arr_get(cg_var_refs, vi) > best_refs) {
+                best_refs = arr_get(cg_var_refs, vi);
+                best_vi = vi;
+            }
+        }
+        if (best_vi < 0) { free(pool); return; }
+        reg = pool[used];
+        arr_set(cg_var_promote, best_vi, reg);
+        used++;
+    }
+    free(pool);
+}
+
 // RegAlloc v2 Stage E, x64 side — "integer first" means a64 first.
 // SysV's 5-register callee-saved pool (vs AAPCS64's 10) leaves far
 // less headroom for the systematic-comparison gate
@@ -477,6 +518,9 @@ x64_emit_load_var(vi, off) {
     auto fty, _preg;
     _preg = arr_get(cg_var_promote, vi);
     if (_preg >= 0) {
+        // A float local promoted to a caller-saved xmm (leaf-only, see
+        // _x64_b3_select_float) reads with movsd; an int promoted GP reg with mov.
+        if (cg_var_is_float(vi)) { x64_enc_movsd_reg(0, _preg); return 1; }
         x64_enc_mov_reg(0, _preg);
         return 0;
     }
@@ -503,6 +547,9 @@ void x64_emit_store_var(vi, off, rty) {
     auto fty, _preg;
     _preg = arr_get(cg_var_promote, vi);
     if (_preg >= 0) {
+        // Float local promoted to a caller-saved xmm: store the value with movsd
+        // (no int conversion). Int promoted GP reg keeps the old float->int path.
+        if (cg_var_is_float(vi)) { x64_enc_movsd_reg(_preg, 0); return 0; }
         if (rty == 1) { x64_enc_cvttsd2si(0, 0); }
         x64_enc_mov_reg(_preg, 0);
         return 0;

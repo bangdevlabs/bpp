@@ -38,7 +38,8 @@ always confirm a codegen change with the Docker self-host (`gen1 == gen2`).
 | Dynamic linking / FFI externs | ✅ Mach-O | ✅ ELF PLT/GOT | parity |
 | Immediate-form shift (`<<`/`>>` by a constant) | ✅ SBFM/UBFM | ✅ `C1 /4,/5,/7` | parity (shared spine peephole) |
 | Int expression freelist (B1) | ✅ x9..x15 (7 deep) | ⚠️ r11 (1 deep) | **architectural** |
-| Float compute-in-place (F.2.c) + float-B3 + `fmadd` | ✅ | ❌ | **architectural** |
+| Float compute-in-place (F.2.c) + float-B3 | ✅ | ✅ (2026-07-07, leaf fns) | parity in leaf fns (caller-saved xmm) |
+| Float `fmadd` (fused) | ✅ | ❌ (no FMA3 baseline → mulsd+addsd) | **architectural** |
 | **Integer compute-in-place (Stage 1)** | ✅ | ✅ (2026-07-07) | parity (2-operand emit; 1-deep freelist) |
 | ↳ CIP memory-load leaf — `a[i]` subscripts (Jun 17 fix) | ✅ | ❌ (CIP off) | rides Int-CIP |
 | ↳ CIP strength reduction `x*2^k` → shift (Stage C) | ✅ | ❌ stub | rides Int-CIP |
@@ -73,15 +74,20 @@ realtime margin. The slowdown is inherent to x86-64, not a backlog to burn down.
 These are forced by the System V AMD64 ABI / baseline x86-64 ISA, not by
 missing work. Re-deriving them wastes time; the answer is recorded here.
 
-- **No callee-saved XMM → no float CIP / float-B3 / fmadd.** SysV makes ALL
-  `xmm0..15` caller-saved (Win64 keeps `xmm6..15`; this is the divergence).
-  The float F.2.c win came from promoting hot floats into callee-saved
-  `d8..d15`; x64 has no equivalent band, so the winning stage has no target.
-  `fmadd`/`fmsub` additionally need FMA3 (Haswell+, x86-64-v3), not the
-  baseline SSE2 the ELF target assumes — emitting it would SIGILL on older
-  CPUs. x64 opts out via `_x64_simd_temp_count() = 0`. See
-  `x64_primitives.bsm` (the F.2.c hooks) — the comment there is the canonical
-  explanation.
+- **No callee-saved XMM → no CROSS-CALL float-B3, and no `fmadd`.** SysV makes
+  ALL `xmm0..15` caller-saved (Win64 keeps `xmm6..15`; this is the divergence).
+  **CORRECTED 2026-07-07 — the "no float CIP / float-B3" claim was too strong.**
+  The a64-STYLE win (promoting floats into *callee-saved* d8..d15 so they survive
+  calls) has no x64 target, true. But that only blocks promotion across CALLS. In
+  a LEAF function (no calls) caller-saved xmm are never clobbered, so the float
+  CIP (temps in xmm8..11) and float-B3 (promote the accumulator into xmm12..14)
+  both work there — shipped, x64 self-host stable. Non-leaf functions still fall
+  back to the value-stack. What stays genuinely architectural is **fused
+  `fmadd`**: it needs FMA3 (Haswell+, x86-64-v3), not baseline SSE2 (would SIGILL
+  on older CPUs), so the CIP decomposes to `mulsd + addsd` via the `has_float_fma`
+  predicate. Net: x64 float is at parity for the common leaf DSP kernel, one
+  rounding-per-op behind a64 (mul+add rounds twice, fmadd once — a legitimate
+  numeric divergence, well below audio's threshold).
 - **Shallow int freelist (1 vs 7).** SysV leaves far fewer caller-saved GP
   registers free than AAPCS64, so the B1 expression freelist is `r11` only
   (vs `x9..x15`). Not a bug — a register-budget fact. It's also *why* the
