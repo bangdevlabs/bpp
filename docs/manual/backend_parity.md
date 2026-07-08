@@ -41,9 +41,9 @@ always confirm a codegen change with the Docker self-host (`gen1 == gen2`).
 | Float compute-in-place (F.2.c) + float-B3 | ✅ | ✅ (2026-07-07, leaf fns) | parity in leaf fns (caller-saved xmm) |
 | Float `fmadd` (fused) | ✅ | ❌ (no FMA3 baseline → mulsd+addsd) | **architectural** |
 | **Integer compute-in-place (Stage 1)** | ✅ | ✅ (2026-07-07) | parity (2-operand emit; 1-deep freelist) |
-| ↳ CIP memory-load leaf — `a[i]` subscripts (Jun 17 fix) | ✅ | ❌ (CIP off) | rides Int-CIP |
-| ↳ CIP strength reduction `x*2^k` → shift (Stage C) | ✅ | ❌ stub | rides Int-CIP |
-| ↳ CIP integer `madd`/`msub` fusion (Stage E) | ✅ | ❌ stub (no int MAC) | rides Int-CIP |
+| ↳ CIP memory-load leaf — `a[i]` subscripts | ✅ | ✅ (2026-07-07) | rides Int-CIP |
+| ↳ CIP strength reduction `x*2^k` → shift (Stage C) | ✅ | ✅ (2026-07-07) | rides Int-CIP |
+| ↳ CIP integer `madd`/`msub` fusion (Stage E) | ✅ | ❌ (no int MAC → imul+add) | **architectural** |
 | Constant promotion (Stage 2a) | ✅ x19..x28 | ✅ rbx/r12..r15 | parity (`emit_mov_phys`) |
 | Wider B3 budget — caller-saved promotion in leaf fns | ✅ x9..x12 (10→14) | ❌ (keeps 5) | **a64 only** |
 | Induction-variable pointer walk (`base[i]` → walking reg) | ✅ | ❌ `iv_supported`=0 (no post-index) | **a64 only** |
