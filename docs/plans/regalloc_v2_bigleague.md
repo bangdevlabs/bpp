@@ -123,6 +123,24 @@ big-league general-quality investment, not a hot-path fix.
   spill-slot band. NEXT: minimal repro (promoted pointer used before AND after a
   call in a loop, plus a NESTED call in an arg), disasm the spill. Reverted to
   Step 1 (clean base).
+
+  **Bug B refined (2026-07-08, 3rd pass).** Disassembled the M2-compiled
+  `_png_unfilter` at its crashing `memcpy(out+dst, raw+src, stride)` call: the
+  caller-saved SAVE/RESTORE (str/ldr x9..x12 to [x29,#0x130..0x148]) is balanced,
+  the frame is 0x150 so the 0x148 slot fits exactly (NOT a frame overflow), and
+  the memcpy ARGS are computed from CALLEE-saved regs (out=x20, dst=x25, raw=x19,
+  src=x21, stride=x24) — NOT the caller-saved x9..x12 (which hold i/filter/etc.).
+  Yet lldb shows memcpy's dst arg (out+dst) pointing into a READ-ONLY MAPPED region
+  → so a callee-saved pointer (out or dst) is corrupted. So caller-saved promotion
+  of SOME local (into x9..x12) corrupts a DIFFERENT var that lives in a callee-
+  saved reg — pointing at a linear-scan assignment / live-range interaction the
+  budget-14 change introduces, not the spill mechanics themselves (those look
+  right). Two call sites matter: the case-0 memcpy AND the case-4 `_paeth` inside
+  the inner loop. NEXT: a CORRECT minimal repro (the first attempt hung on its own
+  logic — needs valid filter/stride data) copying _png_unfilter + _paeth verbatim,
+  then lldb-break at ITS memcpy to read x20/x25 across scanlines and see which
+  pointer drifts + correlate with the linear-scan slot assignment. Reverted to
+  Step 1.
 - **M3 — the cost model.** Extend B3/RegAlloc to CHOOSE caller-saved (with
   spilling) vs callee-saved vs memory per value, by the measured trade-off. This
   is where the general-quality win lands.
