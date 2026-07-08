@@ -37,9 +37,9 @@ always confirm a codegen change with the Docker self-host (`gen1 == gen2`).
 | Autovec + outline (loop→worker, SIMD synth) | ✅ | ✅ | parity (shared spine) |
 | Dynamic linking / FFI externs | ✅ Mach-O | ✅ ELF PLT/GOT | parity |
 | Immediate-form shift (`<<`/`>>` by a constant) | ✅ SBFM/UBFM | ✅ `C1 /4,/5,/7` | parity (shared spine peephole) |
-| Int expression freelist (B1) | ✅ x9..x15 (7 deep) | ⚠️ r11 (1 deep) | **architectural** |
+| Int expression freelist (B1) | ✅ x9..x15 (7 deep) | ⚠️ r11 (1) / r11+r8+r9 (3) in leaf fns | narrower (SysV pressure); leaf-widened 2026-07-08 |
 | Float compute-in-place (F.2.c) + float-B3 | ✅ | ✅ (2026-07-07, leaf fns) | parity in leaf fns (caller-saved xmm) |
-| Float `fmadd` (fused) | ✅ | ❌ (no FMA3 baseline → mulsd+addsd) | **architectural** |
+| Float `fmadd` (fused) | ✅ (baseline) | ✅ under `--fma` (FMA3/VEX); mulsd+addsd otherwise | parity via opt-in (FMA3 not baseline SSE2) |
 | **Integer compute-in-place (Stage 1)** | ✅ | ✅ (2026-07-07) | parity (2-operand emit; 1-deep freelist) |
 | ↳ CIP memory-load leaf — `a[i]` subscripts | ✅ | ✅ (2026-07-07) | rides Int-CIP |
 | ↳ CIP strength reduction `x*2^k` → shift (Stage C) | ✅ | ✅ (2026-07-07) | rides Int-CIP |

@@ -15497,3 +15497,108 @@ no-op (F0 diagnosis) → a recorded contract (F1) → an E271-guarded promise (F
 bare `x;`, `static extrn`) gone and the docs telling the truth (F3). The
 three-axis storage model — dispatch/lifetime × visibility × mutability — now
 has all three axes actually implemented, functions and data alike.
+
+## 2026-07-07/08 — x64 codegen parity, the transcendental bug it uncovered, and a measured look at whether our allocator is amateur
+
+A long arc that started as "close the x64 backend's gaps to a64" and became a
+lesson, repeated until it stuck, that a strong verdict deserves suspicion and a
+design decision deserves a number.
+
+**x64 reached codegen parity for the DSP loop — by root-causing, not
+hand-waving.** Three things the `backend_parity.md` scoreboard had marked
+deferred or architectural all closed, each proven by the x64 self-host (gen1 ==
+gen2 in Docker — the CIP compiler compiles ITSELF byte-identically). Integer
+compute-in-place (`91ee0b7`): the "deferred, needs a wider freelist, low value"
+verdict was wrong — the real blocker was a latent SPINE bug the a64 3-operand ISA
+had been masking. The integer assign-into-destination lever fires with no
+`cg_node_uses_var` guard, so `x = a + x` (destination aliases the RIGHT operand)
+is safe as a64 `add dreg,s1,s2` but on x64's 2-operand ISA becomes
+`mov x,a; add x,x` = 2a. Accumulators are everywhere, so it miscompiled the
+compiler's own parser broadly; the fix handles `dreg == s2` in
+`_x64_emit_iop_into`. Float CIP (`943dde3`): "architectural, impossible" was too
+strong — it blocks the a64-style promotion into *callee-saved* xmm, not the CIP
+TEMPS, which are call-free and can live in caller-saved xmm8..11. Float promotion
+(`ebad27e`): the S2-equivalent, the FIR accumulator into caller-saved xmm12..14,
+gated on the function being a leaf. The user's "mas por que quebrou?" is what
+forced the first one open; the lesson — root-cause, don't hand-wave — carried the
+rest.
+
+**Two "impossible" verdicts fell to the same move, and a third stayed honest.**
+The user kept pressing the chip-vs-compiler distinction, and it kept mattering.
+The leaf-aware int freelist (`985fbcb`, r11 + r8/r9 in a leaf) and FMA3
+(`27aae1d`, `--fma`, VEX-encoded `vfmadd231sd`) were COMPILER limits I had called
+architectural: x86-64 has nine caller-saved GP registers a leaf can borrow, and
+the modern chip has FMA3 — my compiler just targeted baseline SSE2. What stays
+genuinely of-the-chip: `int-madd` (no x86 integer MAC on any chip), the IV
+pointer walk's post-index, cross-call float promotion (no callee-saved xmm),
+sixteen-vs-thirty-two GP registers.
+
+**Then the FMA3 verification caught something serious: the float CIP had
+silently broken every transcendental on x64.** Bit-verifying `--fma` on a
+`sin*exp` dot product, the numbers didn't match — and it wasn't the FMA, it was
+`sin_f(0.7)` returning 0 and `exp_f(1.0)` returning 1.0 on x64, with or without
+the flag. The suites had missed it entirely (sin_f/exp_f aren't in the x64 test
+path). Bisecting to d633ac0 proved it was MINE, and `bug --disasm` — after I
+taught it to decode SSE2 (`e054c74`), because it had been printing every float op
+as a stream of `.byte` — pinned two bugs. The float comparison stubs
+`_x64_emit_cmp_flt_into/_branch` were empty, justified as "unreachable while
+simd_temp_count == 0"; the float CIP set that count above zero and made them
+LIVE, so `if (x > pi)` emitted its operands and then no compare and no branch,
+running the body unconditionally — sin_f's range reduction spun. And
+`_x64_emit_arg_copy_flt` always stored the incoming arg to the frame, never
+checking promotion, so a promoted float PARAM read the caller's stale xmm. Both
+fixed (`034f6dd`); sin_f and exp_f now match a64 bit-for-bit. The lesson, sharp
+this time: a feature can pass the self-host and the whole suite and still be
+BROKEN where it matters — only disassembling the real target kernel confirms it
+engages. The same day, the leaf-classifier fix (`59edf1e`) had found the mirror
+problem: float promotion was DORMANT for real DSP because peekfloat/pokefloat
+parse as T_CALL and were disqualifying every FIR from the leaf budget.
+
+**An empty "unreachable" stub is a landmine, so we audited them all
+(`f111c45`).** The comparison bug was exactly that — a stub that a gate change
+made live and that failed silently. The gate-hidden ones (`imadd`, the `iv_*`
+family) now fail LOUD (`diag_str` + `sys_exit`) so the next gate flip aborts
+instead of miscompiling. `narrow_float_params` turned out to be REACHED — the
+compiler has a `: half` param it was silently leaving double-width — so the
+SL_HALF case got implemented for real (load_sd + cvtsd2ss + store_ss).
+
+**The million-dollar question, answered with a number instead of an opinion.**
+The user asked whether not having an aggressive allocator with caller-saved
+spilling — the thing LLVM/gcc/Jai all do — makes our design amateur, and insisted
+the answer be measured. So the B3 selection was instrumented to count, per
+function, the hot int locals (loop-weighted refs ≥ 1000) that overflow the
+promotion budget into memory, and the compiler, a game (fps_3d_cpu), and an audio
+demo (moog_demo) were compiled through it. The decisive result: the core hot
+loops — the 2.5D raycast per-column, the DSP per-sample filter — are ABSENT from
+the overflow list. They are leaf and tight and fit the budget. The overflow lives
+entirely in non-leaf general code: asset loading (which runs once), UI and text
+rendering (render_text spends 117 of 356 memory accesses on spilled locals, but
+it is text, not the pixel loop), and the compiler's own functions (build-time).
+So the design is NOT amateur where performance is decided — it is correctly
+focused, the loops that run millions of times per second are optimal — and it is
+measurably mediocre on general non-leaf code. An aggressive allocator is a
+big-league GENERAL-quality investment, not a hot-path fix, and its measured
+consumer is the overflow, not the bottleneck.
+
+**Scaffolding hygiene, with the taxonomy the user forced clean.** Auditing the
+empty ChipPrimitives slots, I kept conflating three things until the user drew
+the line: **remove** (dead, or a proven-never-implement — documenting one of
+those is pointless, just delete it), **implementa** (a measured driver or a
+parity gap), **documenta** (keep ONLY when a real future consumer exists). The
+granular-prologue trio (`fn_entry_label`, `frame_setup`, `save_callee_saved`) was
+dead — superseded by the fat `emit_prologue_full` primitive, 0-call, and removing
+it left every binary byte-identical (`b46a332`). I nearly deleted it hastily, then
+caught that the struct comment reserved it for a `cg_emit_func` spine-takeover;
+checking that `emit_prologue_full` is the LIVE fat primitive resolved it — the
+granular design lost, the fat one won, safe to delete. The caller-saved-spill
+stubs and the module-system slots are the opposite: reserved with real consumers
+(an aggressive allocator; separate compilation), so they stay, and their arcs got
+real plans grounded in the study — `regalloc_v2_bigleague.md` and
+`module_system_separate_compilation.md` (`e5bc723`). Both are long-term
+big-league investments, not urgent fixes; neither was rushed inline because,
+measured, neither is urgent.
+
+Verification throughout: a64 byte-identical on every x64-only change, x64
+self-host gen1 == gen2 after each, native 240/0/12 + C-emit 198/0/54, gen2 ==
+gen3, zero warnings. `bug` learned to read SSE2. The scoreboard tells the truth
+about what is chip and what is compiler.
