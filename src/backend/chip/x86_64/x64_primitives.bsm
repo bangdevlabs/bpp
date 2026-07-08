@@ -340,19 +340,36 @@ void _x64_emit_ishl_imm_into(dreg, src, amt) {
     if (dreg != src) { x64_enc_mov_reg(dreg, src); }
     x64_enc_shl_imm(dreg, amt);
 }
-// x86_64 has no integer multiply-accumulate, so a real port would emit
-// `imul tmp,n,m; lea/add dst,a,tmp`; left as a stub while x64 stays on the
-// accumulator path (int_temp_count -1, so this is never reached).
-void _x64_emit_imadd(op_code, dst, n, m, a) { }
+// x86_64 has no integer multiply-accumulate — architectural (no x86 chip has a
+// scalar integer MAC). has_int_madd stays 0 so the spine never fuses to this.
+// It must NEVER be reached; fail LOUD if it is, rather than silently emitting
+// nothing (the class of bug that made float comparisons miscompile when a gate
+// changed). Same discipline for every gate-hidden primitive below.
+void _x64_emit_imadd(op_code, dst, n, m, a) {
+    diag_str("internal error: _x64_emit_imadd reached — x86 has no integer MAC; has_int_madd must stay 0\n");
+    sys_exit(2);
+}
 _x64_has_int_madd() { return 0; }
-// Induction pointer walk: x86 has no post-index addressing mode (it is an ARM
-// feature), so iv_supported returns 0 and the spine never fires the walk on
-// x64 — the loop keeps its normal index-arithmetic codegen. The emit_iv_*
-// stubs are therefore never reached.
-void _x64_emit_iv_load(dreg, base_reg) { }
-void _x64_emit_iv_store(base_reg) { }
-void _x64_emit_iv_advance(base_reg) { }
-void _x64_emit_iv_setup(base_reg, idx_reg) { }
+// Induction pointer walk: x86 has no post-index addressing mode. NOTE this is a
+// COMPILER limit, not a hard chip one — x64 could walk a base with an explicit
+// `add base, 8` (a future parity item); until then iv_supported = 0 keeps the
+// normal index-arithmetic codegen and these must never be reached. Fail loud.
+void _x64_emit_iv_load(dreg, base_reg) {
+    diag_str("internal error: _x64_emit_iv_load reached — iv_supported must stay 0 (walk not implemented on x64)\n");
+    sys_exit(2);
+}
+void _x64_emit_iv_store(base_reg) {
+    diag_str("internal error: _x64_emit_iv_store reached — iv_supported must stay 0\n");
+    sys_exit(2);
+}
+void _x64_emit_iv_advance(base_reg) {
+    diag_str("internal error: _x64_emit_iv_advance reached — iv_supported must stay 0\n");
+    sys_exit(2);
+}
+void _x64_emit_iv_setup(base_reg, idx_reg) {
+    diag_str("internal error: _x64_emit_iv_setup reached — iv_supported must stay 0\n");
+    sys_exit(2);
+}
 _x64_iv_supported() { return 0; }
 
 // Self-update with an immediate: reg += imm / reg -= imm (physical reg number).
@@ -1001,10 +1018,39 @@ _x64_fn_compute_offsets() {
     return total;
 }
 
-// x86_64 does not encode sub-word float params yet (SL_HALF /
-// SL_QUARTER are aarch64-only surface today). Stub so the spine
-// can still call through a uniform slot.
-void _x64_emit_narrow_float_params(par_cnt) { }
+// Full-width float params need no narrowing here — the same no-op a64 does for
+// them. But SL_HALF (single) / SL_QUARTER (half-float) params DO need a
+// narrowing convert (a64 emits fcvt; x64 would need cvtsd2ss, and half needs
+// F16C which is not baseline). x64 does not encode those yet, so rather than
+// silently leave a sub-word float param double-width (a wrong-width read), fail
+// LOUD the moment one actually appears — a scan, not a blanket stub.
+void _x64_emit_narrow_float_params(par_cnt) {
+    auto i, fty_p, sl, off;
+    i = 0;
+    while (i < par_cnt) {
+        fty_p = arr_get(cg_var_forced_ty, i);
+        if (is_float_type(fty_p)) {
+            sl = ty_slice(fty_p);
+            off = arr_get(cg_var_off, i);
+            if (sl == SL_HALF) {
+                // : half is single-precision. The incoming arg was stored as a
+                // double (store_sd); narrow it in place: load double, cvtsd2ss to
+                // single, store single. Sub-word float locals are never promoted
+                // (cg_b3_eligible_float rejects them), so the slot is real.
+                x64_enc_load_sd(0, 5, off);
+                x64_enc_cvtsd2ss(0, 0);
+                x64_enc_store_ss(0, 5, off);
+            }
+            if (sl == SL_QUARTER) {
+                // : quarter is IEEE half-float — needs F16C (vcvtps2ph), not
+                // baseline SSE2. Fail loud rather than leave it double-width.
+                diag_str("internal error: x64 : quarter (half-float) param needs F16C, not implemented\n");
+                sys_exit(2);
+            }
+        }
+        i = i + 1;
+    }
+}
 
 // Save argc / argv / envp from the current function's incoming arg
 // registers (rdi / rsi / rdx on x86_64 Linux) into the runtime-global
