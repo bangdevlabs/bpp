@@ -183,14 +183,21 @@ void _x64_emit_fop_into(op_code, dreg, s1, s2) {
     x64_enc_addsd(dreg, s2);
     return 0;
 }
-// x86_64 has no float FMA at baseline (needs FMA3/AVX). has_float_fma=0 gates
-// the spine's fmadd fusion off; the CIP decomposes to mulsd + addsd.
-_x64_has_float_fma() { return 0; }
-// fmadd/fmsub need FMA3 (Haswell 2013+, x86-64-v3) — NOT baseline SSE2.
-// Emitting it would SIGILL on pre-Haswell CPUs, breaking the "runs on any
-// Linux x86_64" contract, so this stub is correct: the float tree falls
-// back to separate mulsd + addsd (same as it always has).
-void _x64_emit_fma(op_code, dst, n, m, a) { }
+// x86_64 has no float FMA at BASELINE (SSE2), so by default has_float_fma=0
+// gates the fusion off and the CIP decomposes to mulsd + addsd — safe on any
+// Linux x86_64. Under --fma (x86-64-v3 / Haswell 2013+) the chip has FMA3, so
+// this returns 1 and the fusion turns on, matching a64's single-rounding fmadd.
+_x64_has_float_fma() { return flag_fma; }
+// FMA3 fused multiply-add (VEX-encoded). dst = a + n*m (op 0) or a - n*m (op 1),
+// one IEEE rounding. The addend is usually already in dst (acc = acc + n*m →
+// addr_reg == dreg); otherwise move it in first. The multiplicands are distinct
+// temps/promoted regs, so that move never clobbers n or m. Only reached under
+// --fma (has_float_fma gates the fusion), so pre-Haswell CPUs never see it.
+void _x64_emit_fma(op_code, dst, n, m, a) {
+    if (dst != a) { x64_enc_movsd_reg(dst, a); }
+    if (op_code == 1) { x64_enc_vfma231sd(0xBD, dst, n, m); }   // vfnmadd231sd
+    else { x64_enc_vfma231sd(0xB9, dst, n, m); }                // vfmadd231sd
+}
 // ── Multi-value return banking — the x86_64 register window ──
 // b++ multi-value return is a CUSTOM register-window convention, not the
 // SysV struct-return rule: both caller and callee are b++ code compiled
