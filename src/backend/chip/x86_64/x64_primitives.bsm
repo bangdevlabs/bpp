@@ -487,9 +487,62 @@ void _x64_emit_cmp_flt(cond_id) {
 // simd_temp_count() == 0 (x64 opts out of the whole float-CIP gate, same
 // as every other F.2.c primitive) — filled in for primitive-table
 // completeness, not because x64 exercises it.
-void _x64_emit_cmp_flt_into(dst_int_reg, l_freg, r_freg, cond_id) { }
-// Unreachable for the same reason as _x64_emit_cmp_flt_into above.
-void _x64_emit_cmp_flt_branch(cond_id, l_freg, r_freg, lbl) { }
+// Float comparison into an int register: dst_int_reg = (l_freg <cond> r_freg).
+// Generalises _x64_emit_cmp_flt (fixed to xmm0/xmm1) to arbitrary operand
+// registers, with the SAME NaN-correct UCOMISD sequences: LT/LE test the swapped
+// operands with the ABOVE family (false when unordered); EQ folds in !PF, NE
+// folds in PF; GT/GE go direct. EQ/NE need a second setcc, so a scratch int reg
+// — rax unless dst is rax, then rcx (the rax/rcx pair _x64_emit_cmp_flt uses).
+// Reachable since the float CIP set simd_temp_count > 0 (was a no-op stub while
+// x64 opted out of the whole float gate — that is what silently broke every
+// float comparison the CIP routed here, e.g. sin_f's range-reduction `x > pi`).
+void _x64_emit_cmp_flt_into(dst_int_reg, l_freg, r_freg, cond_id) {
+    auto sc;
+    if (cond_id == CG_CC_LT) {
+        x64_enc_ucomisd(r_freg, l_freg);           // right vs left → ABOVE == left<right
+        x64_enc_setcc(CC_A, dst_int_reg);
+        x64_enc_movzx8(dst_int_reg, dst_int_reg);
+        return;
+    }
+    if (cond_id == CG_CC_LE) {
+        x64_enc_ucomisd(r_freg, l_freg);
+        x64_enc_setcc(CC_AE, dst_int_reg);
+        x64_enc_movzx8(dst_int_reg, dst_int_reg);
+        return;
+    }
+    if (cond_id == CG_CC_EQ) {
+        sc = 0; if (dst_int_reg == 0) { sc = 1; }
+        x64_enc_ucomisd(l_freg, r_freg);
+        x64_enc_setcc(CC_E, dst_int_reg);          // ZF
+        x64_enc_setcc(CC_NP, sc);                  // !PF (0 when unordered)
+        x64_enc_movzx8(dst_int_reg, dst_int_reg);
+        x64_enc_movzx8(sc, sc);
+        x64_enc_and_reg(dst_int_reg, sc);          // ZF && !PF
+        return;
+    }
+    if (cond_id == CG_CC_NE) {
+        sc = 0; if (dst_int_reg == 0) { sc = 1; }
+        x64_enc_ucomisd(l_freg, r_freg);
+        x64_enc_setcc(CC_NE, dst_int_reg);         // !ZF
+        x64_enc_setcc(CC_P, sc);                   // PF (1 when unordered)
+        x64_enc_movzx8(dst_int_reg, dst_int_reg);
+        x64_enc_movzx8(sc, sc);
+        x64_enc_or_reg(dst_int_reg, sc);           // !ZF || PF
+        return;
+    }
+    // GT / GE — direct order, unordered-safe (ABOVE/AE are false for NaN).
+    x64_enc_ucomisd(l_freg, r_freg);
+    x64_enc_setcc(_x64_cc_flt(cond_id), dst_int_reg);
+    x64_enc_movzx8(dst_int_reg, dst_int_reg);
+}
+// Float comparison branch: `if (l <cond> r)` falls through into the body, else
+// jumps to lbl. Compute the boolean into rax (NaN-correct, via _into) and jump to
+// lbl when it is zero — the branch-to-exit fusion the if/while lowering expects.
+void _x64_emit_cmp_flt_branch(cond_id, l_freg, r_freg, lbl) {
+    _x64_emit_cmp_flt_into(0, l_freg, r_freg, cond_id);
+    x64_enc_test_reg(0, 0);
+    x64_enc_jcc_label(CC_E, lbl);
+}
 
 // ── Control flow (Wave 7) ──
 
@@ -998,7 +1051,18 @@ void _x64_emit_arg_copy_int(var_idx, abi_seq_idx, frame_off) {
 // float params into callee-saved regs is not yet supported on
 // x86_64 either — falls through to frame-slot storage.
 void _x64_emit_arg_copy_flt(var_idx, abi_seq_idx, frame_off) {
-    x64_enc_store_sd(abi_seq_idx, 5, frame_off);
+    auto preg;
+    // A B3-promoted float param takes its incoming arg register straight into
+    // its promoted xmm (movsd), never the frame slot — otherwise the promoted
+    // register keeps the caller's stale value and the param reads garbage.
+    // Mirrors _x64_emit_arg_copy_int and a64's _a64_emit_arg_copy_flt. (Missing
+    // this is why a promoted float param — e.g. sin_f's `x` — read as 0.)
+    preg = arr_get(cg_var_promote, var_idx);
+    if (preg >= 0) {
+        x64_enc_movsd_reg(preg, abi_seq_idx);
+    } else {
+        x64_enc_store_sd(abi_seq_idx, 5, frame_off);
+    }
 }
 // Phase 6.3 v2 — emit a call to `_prof_save_drain` while keeping
 // the function's int + float return values (rax, xmm0) intact.
