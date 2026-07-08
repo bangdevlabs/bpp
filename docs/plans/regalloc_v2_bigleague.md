@@ -66,10 +66,49 @@ big-league general-quality investment, not a hot-path fix.
   stable. MEASURED on the x64 gen1: `emit_node` frame accesses 676 → 137 (−80%),
   `val_check_node` 258 → 92 (−64%); `cg_emit_stmt` declined by the gate (correct
   fallback). Register-sharing across non-overlapping live ranges is the win.
-- **M2 — caller-saved spill set.** `cg_emit_call` computes the live caller-saved
-  set at each call site and calls `save/restore_caller_saved_int`. Implement the
-  primitives (push/pop the spill set). Gate on a value actually being promoted to
-  a caller-saved reg across a call.
+- **M2 — caller-saved spill set.** Concrete design (reverse-engineered from the
+  machinery, 2026-07-08). The core distinction: a promoted CALLEE-saved reg is
+  saved once in the prologue; a promoted CALLER-saved reg is the opposite — NOT
+  prologue-saved, but spilled around EACH call. So M2 is a coupled atomic change:
+  1. Budget → 14 for non-leaf too (was 10 non-leaf / 14 leaf); `_a64_b3_reg_at`
+     returns x9..x12 for slots 10..13 regardless of leaf (was leaf-only). x64:
+     the caller-saved GP are the arg regs (rsi/rdi/r8/r9) — feasible but the save
+     must interleave with outgoing-arg setup, so a64 first.
+  2. A NEW list `a64_caller_saved_promoted`, separate from `a64_promoted_regs`.
+     The apply / b3_select routes an x9..x12 assignment there, NOT to
+     a64_promoted_regs, AND still calls `_a64_b3_claim_freelist(reg)` (else it
+     collides with the expression freelist that also lives in x9..x15).
+  3. Frame layout reserves a slot for each `a64_caller_saved_promoted` reg, but
+     the PROLOGUE does NOT save them (only a64_promoted_regs, the callee-saved).
+  4. `_a64_emit_save_caller_saved_int` = str each caller-saved-promoted reg to its
+     reserved frame slot; `_restore` = ldr each back. (Fixed frame slots, NOT
+     push/pop, to avoid interleaving with the value-stack.)
+  5. `cg_emit_call`: `call(p.emit_save_caller_saved_int)` before emit_call_full,
+     `call(p.emit_restore_caller_saved_int)` after. Timing works because the args
+     evaluate using x0..x7 + the remaining freelist (x13..x15), disjoint from the
+     claimed x9..x12, and the promoted values stay in-register until the call
+     clobbers them (the save to the frame is just the recovery copy).
+  Gate on `a64_caller_saved_promoted` being non-empty (empty → save/restore are
+  no-ops → byte-identical). Build + verify self-host after EACH sub-step; this is
+  the coupled frame-layout + timing class of change that produces silent bugs
+  when rushed (cf. the transcendental comparison bug).
+
+  **STATUS 2026-07-08:** Step 1 (the mechanism — `a64_caller_saved_promoted`
+  list, the save/restore primitives, the cg_emit_call hook) SHIPPED inactive +
+  byte-identical (`6fa94ee`). Step 2 (the activation — budget 14, `_a64_b3_reg_at`
+  x9..x12 always, `_a64_route_promoted` at the 3 push sites, the reserve_spill
+  caller-saved band) was attempted and **broke CATASTROPHICALLY** — gen2 ≠ gen3
+  and nearly the whole native suite failed, i.e. the miscompile hit almost every
+  function, not just the ones that promote into a caller-saved reg. That breadth
+  is the clue: it is NOT the spill-around-calls timing (which would only touch
+  caller-saved-promoting non-leaf fns) but something in the always-on path — the
+  budget-14 / `_a64_b3_reg_at`-x9..x12 change altering the linear-scan for EVERY
+  non-leaf function, or the `_a64_route_promoted` replacement of all 3 push sites
+  (site 797 may not be a local-promotion site — VERIFY what it is before routing
+  it), or a claim_freelist interaction with x9..x12 now live across calls. Next
+  attempt: activate ONE piece at a time (budget first, verify self-host; then
+  reg_at; then routing; then frame) so the breaking sub-step is isolated. Reverted
+  to Step 1; that is the clean base.
 - **M3 — the cost model.** Extend B3/RegAlloc to CHOOSE caller-saved (with
   spilling) vs callee-saved vs memory per value, by the measured trade-off. This
   is where the general-quality win lands.
