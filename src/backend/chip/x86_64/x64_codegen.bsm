@@ -176,6 +176,7 @@ void cg_install_x86_64_primitives() {
     p.b3_select              = fn_ptr(_x64_b3_select_prim);
     p.regalloc_apply         = fn_ptr(_x64_regalloc_apply);
     p.regalloc_apply_float   = fn_ptr(_x64_regalloc_apply_float);
+    p.regalloc_int_budget    = fn_ptr(_x64_regalloc_int_budget);
     p.emit_arg_copy_int      = fn_ptr(_x64_emit_arg_copy_int);
     p.emit_arg_copy_flt      = fn_ptr(_x64_emit_arg_copy_flt);
     p.emit_frame_teardown    = fn_ptr(_x64_emit_frame_teardown);
@@ -391,8 +392,70 @@ void _x64_b3_select_float() {
 // — B3's own decision is always left untouched here. Revisit once a64
 // has earned enough mileage to extend the comparison to x64's
 // narrower pool.
+// Int promotion pool size for x64: the five SysV callee-saved GP regs
+// (rbx/r12..r15) — no leaf widening (x64 has no clean caller-saved GP band the
+// way a64 borrows x9..x12). The linear-scan runs with this budget.
+_x64_regalloc_int_budget() { return 5; }
+
+// Logical slot -> physical register, mirroring _x64_b3_select's pool order
+// [rbx(3), r12, r13, r14, r15]. Slots >= 5 have no register (validate rejects).
+_x64_b3_reg_at(slot) {
+    if (slot == 0) { return 3; }
+    if (slot == 1) { return 12; }
+    if (slot == 2) { return 13; }
+    if (slot == 3) { return 14; }
+    if (slot == 4) { return 15; }
+    return 0 - 1;
+}
+
+// RegAlloc v2 Stage E, x64 int — replaces B3's greedy pick with the linear-scan
+// one when every assigned slot maps to a real register. Mirrors
+// _a64_regalloc_apply: validate first (no mutation), then reset the covered
+// promotions, rebuild x64_promoted_regs listing each PHYSICAL reg once (several
+// vars may share one slot — that sharing is the whole point), and re-run
+// constant promotion on the leftover budget. Unlike a64 there is no
+// claim_freelist step: x64's promoted regs (callee-saved) are disjoint from the
+// freelist (r11/r8/r9).
 _x64_regalloc_apply(assigns) {
-    return 0;
+    auto n, i, asn: RegAssign, reg, nc, slot_seen, j;
+    n = arr_struct_count(assigns);
+    i = 0;
+    while (i < n) {
+        asn = arr_struct_at(assigns, i);
+        if (asn.slot >= 0) {
+            if (cg_b3_eligible(asn.var_idx) == 0) { return 0; }
+            if (_x64_b3_reg_at(asn.slot) < 0) { return 0; }
+        }
+        i++;
+    }
+    i = 0;
+    while (i < n) {
+        asn = arr_struct_at(assigns, i);
+        arr_set(cg_var_promote, asn.var_idx, 0 - 1);
+        i++;
+    }
+    arr_clear(x64_promoted_regs);
+    slot_seen = arr_new();
+    j = 0;
+    while (j < 64) { slot_seen = arr_push(slot_seen, 0); j++; }
+    i = 0;
+    while (i < n) {
+        asn = arr_struct_at(assigns, i);
+        if (asn.slot >= 0) {
+            reg = _x64_b3_reg_at(asn.slot);
+            arr_set(cg_var_promote, asn.var_idx, reg);
+            if (arr_get(slot_seen, asn.slot) == 0) {
+                arr_set(slot_seen, asn.slot, 1);
+                x64_promoted_regs = arr_push(x64_promoted_regs, reg);
+            }
+        }
+        i++;
+    }
+    nc = arr_len(cg_const_reg);
+    i = 0;
+    while (i < nc) { arr_set(cg_const_reg, i, 0 - 1); i++; }
+    _x64_b3_select_const();
+    return 1;
 }
 
 // RegAlloc v2 Stage E, x64 + float — same "a64 first" deferral as the
