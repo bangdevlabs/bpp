@@ -63,7 +63,11 @@ void _x64_emit_load_float_const(fid) {
 // Unreachable: simd_temp_count() == 0 keeps the whole float-CIP gate from
 // ever firing on x64, same as every other F.2.c primitive — filled in
 // for primitive-table completeness only.
-void _x64_emit_fconst_into(dreg, fid) { }
+void _x64_emit_fconst_into(dreg, fid) {
+    auto dpos;
+    dpos = x64_enc_load_sd_rip(dreg);
+    x64_enc_add_reloc(dpos, fid, 2);
+}
 
 // ── Arithmetic / logical (Wave 4 unary ops) ──
 
@@ -153,13 +157,35 @@ void _x64_emit_fdiv() { x64_enc_divsd(1, 0); x64_enc_movsd_reg(0, 1); }
 // simd_temp_count returns 0, the spine's gate (need <= count) never fires,
 // and the correct accumulator path stays. A future x86-64-v3 target (with
 // a real float allocator) could revisit; the baseline target will not.
-void _x64_emit_fload_var_into(dreg, off) { }
+void _x64_emit_fload_var_into(dreg, off) { x64_enc_load_sd(dreg, 5, off); }
 // Unreachable for the same reason as _x64_emit_fload_var_into above
 // (simd_temp_count == 0 keeps the gate from ever firing) — filled in for
 // primitive-table completeness, not because x64 exercises it.
-void _x64_emit_fload_promoted_into(dreg, base_reg, off) { }
-void _x64_emit_fload_mem_into(dreg, addr_reg) { }
-void _x64_emit_fop_into(op_code, dreg, s1, s2) { }
+void _x64_emit_fload_promoted_into(dreg, base_reg, off) { x64_enc_load_sd(dreg, base_reg, off); }
+void _x64_emit_fload_mem_into(dreg, addr_reg) { x64_enc_load_sd(dreg, addr_reg, 0); }
+void _x64_emit_fop_into(op_code, dreg, s1, s2) {
+    // SSE2 is 2-operand (dreg OP= src). op 0=add 1=sub 2=mul 3=div. Handle
+    // dreg == s2 (dest aliases the right operand) like the int path: commutative
+    // ops apply s1 in place; sub/div route through the reserved scratch xmm15.
+    if (dreg == s2) {
+        if (op_code == 0) { x64_enc_addsd(dreg, s1); return 0; }
+        if (op_code == 2) { x64_enc_mulsd(dreg, s1); return 0; }
+        x64_enc_movsd_reg(15, s1);
+        if (op_code == 1) { x64_enc_subsd(15, s2); }
+        else { x64_enc_divsd(15, s2); }
+        x64_enc_movsd_reg(dreg, 15);
+        return 0;
+    }
+    if (dreg != s1) { x64_enc_movsd_reg(dreg, s1); }
+    if (op_code == 1) { x64_enc_subsd(dreg, s2); return 0; }
+    if (op_code == 2) { x64_enc_mulsd(dreg, s2); return 0; }
+    if (op_code == 3) { x64_enc_divsd(dreg, s2); return 0; }
+    x64_enc_addsd(dreg, s2);
+    return 0;
+}
+// x86_64 has no float FMA at baseline (needs FMA3/AVX). has_float_fma=0 gates
+// the spine's fmadd fusion off; the CIP decomposes to mulsd + addsd.
+_x64_has_float_fma() { return 0; }
 // fmadd/fmsub need FMA3 (Haswell 2013+, x86-64-v3) — NOT baseline SSE2.
 // Emitting it would SIGILL on pre-Haswell CPUs, breaking the "runs on any
 // Linux x86_64" contract, so this stub is correct: the float tree falls
@@ -224,9 +250,29 @@ void _x64_emit_bank_pop(is_flt, reg) {
 // x86_64 now implements multi-value-return banking via the register window
 // above (matching the a64 arity-8 banks).
 _x64_cap_multi_ret() { return 1; }
-_x64_simd_temp_alloc() { return -1; }
-void _x64_simd_temp_free(reg) { }
-_x64_simd_temp_count() { return 0; }
+// Float CIP temp pool — six caller-saved xmm (xmm8..xmm13). Safe because a
+// CIP float expression is call-free (leaves + peekfloat builtins only), so no
+// call clobbers them. xmm14/xmm15 are reserved (xmm15 is _x64_emit_fop_into's
+// aliasing scratch). Bit i (0..5) free => xmm(8+i) available.
+void x64_simd_freelist_reset() { x64_simd_free_mask = 0x3F; }   // all six free
+_x64_simd_temp_alloc() {
+    auto i;
+    for (i = 0; i < 6; i++) {
+        if (x64_simd_free_mask & (1 << i)) {
+            x64_simd_free_mask = x64_simd_free_mask & ~(1 << i);
+            return 8 + i;
+        }
+    }
+    return 0 - 1;
+}
+void _x64_simd_temp_free(reg) {
+    if (reg >= 8 && reg <= 13) { x64_simd_free_mask = x64_simd_free_mask | (1 << (reg - 8)); }
+}
+_x64_simd_temp_count() {
+    auto i, n; n = 0;
+    for (i = 0; i < 6; i++) { if (x64_simd_free_mask & (1 << i)) { n++; } }
+    return n;
+}
 
 // ── Integer compute-in-place — x86_64 opts out (DEFERRED) ──
 // The spine (cg_emit_int_into) is complete and runs on both backends; these
@@ -731,6 +777,8 @@ void _x64_emit_pop_discard() {
 // save_left/resolve are balanced so the mask returns to all-free per binop).
 static auto x64_gp_free_mask;
 void x64_freelist_reset() { x64_gp_free_mask = 0x1; }   // bit 0 = r11 free
+// Float CIP xmm freelist (xmm8..xmm13), declared here alongside the GP one.
+static auto x64_simd_free_mask;
 x64_gp_alloc() {
     if (x64_gp_free_mask & 0x1) {
         x64_gp_free_mask = x64_gp_free_mask & ~0x1;
@@ -813,6 +861,7 @@ void _x64_emit_prologue_full(name_p, fn_lbl_id, frame_size) {
 void _x64_fn_reset_chip_state() {
     arr_clear(x64_promoted_regs);
     x64_freelist_reset();
+    x64_simd_freelist_reset();
 }
 
 // Record B3 spill base and reserve N*8 bytes for promoted-reg spills.
