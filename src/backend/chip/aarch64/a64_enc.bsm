@@ -12,7 +12,7 @@ import "bpp_array.bsm";
 
 // ── Code buffer ──────────────────────────────────────────
 
-extrn enc_buf;       // Pointer to code buffer (1 MB). Set once; read by Mach-O writer.
+extrn enc_buf;       // Pointer to code buffer (growable). Read by Mach-O writer.
 global enc_pos;      // Current byte offset in the code buffer. Written by codegen reset.
 
 // ── Label system ─────────────────────────────────────────
@@ -26,6 +26,7 @@ global enc_lbl_max;  // Number of labels allocated so far. Reset by codegen.
 
 extrn enc_fix_pos;   // Dynamic array: byte offset of the branch instruction.
 extrn enc_fix_lbl;   // Dynamic array: target label ID.
+global enc_cap;      // Current capacity of enc_buf in bytes (doubles on demand).
 extrn enc_fix_ty;    // Dynamic array: fixup type (0=B/BL, 1=CBZ/CBNZ, 2=B.cond).
 global enc_fix_cnt;  // Number of pending fixups. Reset by codegen.
 
@@ -42,7 +43,18 @@ extrn enc_rel_ty;    // Dynamic array: relocation type (0=global, 1=string, 2=fl
 // ── Initialization ───────────────────────────────────────
 
 void init_enc_arm64() {
-    enc_buf     = malloc(1048576);
+    // Growable code buffer. It starts at 2 MB and doubles on demand
+    // (see enc_grow) — the same geometric-growth discipline LLVM's
+    // emission buffers and this project's own ph_arr/dh_arr use. The
+    // buffer used to be a FIXED 1 MB with unchecked pokes: the
+    // self-hosted compiler's code reached 98% of that cap, and the M2
+    // caller-saved arc pushed emission past the end — the overrun
+    // silently corrupted neighbouring heap (labels, relocs, the name
+    // buffer) and produced malformed binaries. All bookkeeping is
+    // offset-based (labels, relocs, patches), so moving the buffer on
+    // growth is safe by construction.
+    enc_buf     = malloc(2097152);
+    enc_cap     = 2097152;
     enc_pos     = 0;
     enc_lbl_off = arr_new();
     enc_lbl_max = 0;
@@ -57,8 +69,27 @@ void init_enc_arm64() {
 
 // ── Buffer operations ────────────────────────────────────
 
+// Double the code buffer when the next write would not fit. Copies
+// the emitted bytes into the new block and frees the old one. Callers
+// never hold raw pointers into enc_buf across emissions (labels,
+// relocations, and patches all store offsets), so the move is
+// invisible to the rest of the backend.
+void enc_grow() {
+    auto nbuf, ncap;
+    ncap = enc_cap * 2;
+    nbuf = malloc(ncap);
+    buf_copy(nbuf, enc_buf, enc_pos);
+    free(enc_buf);
+    enc_buf = nbuf;
+    enc_cap = ncap;
+}
+
 // Write a 32-bit instruction to the code buffer (little-endian).
+// Grows the buffer on demand — a silent overrun corrupts whatever the
+// allocator placed after enc_buf and surfaces as garbage symbols and
+// relocations much later, which is far harder to diagnose.
 void enc_emit32(val) {
+    if (enc_pos + 4 > enc_cap) { enc_grow(); }
     poke(enc_buf + enc_pos,     val & 0xFF);
     poke(enc_buf + enc_pos + 1, (val >> 8) & 0xFF);
     poke(enc_buf + enc_pos + 2, (val >> 16) & 0xFF);

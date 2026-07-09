@@ -17,7 +17,8 @@ import "bpp_array.bsm";
 
 // ── Code buffer ──────────────────────────────────────────
 
-extrn x64_enc_buf;       // Pointer to code buffer (1 MB). Set once; read by ELF writer.
+extrn x64_enc_buf;       // Pointer to code buffer (growable). Read by ELF writer.
+global x64_enc_cap;      // Current capacity of x64_enc_buf in bytes (doubles on demand).
 global x64_enc_pos;      // Current byte offset in the code buffer. Reset by codegen.
 
 // ── Label system ─────────────────────────────────────────
@@ -63,7 +64,12 @@ const CC_G  = 15;
 // ── Initialization ───────────────────────────────────────
 
 init_x64_enc() {
-    x64_enc_buf     = malloc(1048576);
+    // Growable code buffer — see the a64 twin (enc_grow): starts at
+    // 2 MB and doubles on demand. The old fixed 1 MB cap was outgrown
+    // by the compiler's own code, and the unchecked pokes silently
+    // corrupted the heap past the end of the buffer.
+    x64_enc_buf     = malloc(2097152);
+    x64_enc_cap     = 2097152;
     x64_enc_pos     = 0;
     x64_enc_lbl_off = arr_new();
     x64_enc_fix_pos = arr_new();
@@ -75,14 +81,29 @@ init_x64_enc() {
 
 // ── Buffer operations ────────────────────────────────────
 
+// Double the code buffer when the next write would not fit — the
+// x86-64 twin of the a64 enc_grow. Offsets stay valid across the
+// move; only the base pointer changes.
+void x64_enc_grow() {
+    auto nbuf, ncap;
+    ncap = x64_enc_cap * 2;
+    nbuf = malloc(ncap);
+    buf_copy(nbuf, x64_enc_buf, x64_enc_pos);
+    free(x64_enc_buf);
+    x64_enc_buf = nbuf;
+    x64_enc_cap = ncap;
+}
+
 // Write a single byte to the code buffer.
 void x64_enc_emit8(val) {
+    if (x64_enc_pos + 1 > x64_enc_cap) { x64_enc_grow(); }
     poke(x64_enc_buf + x64_enc_pos, val & 0xFF);
     x64_enc_pos++;
 }
 
 // Write a 32-bit value to the code buffer (little-endian).
 void x64_enc_emit32(val) {
+    if (x64_enc_pos + 4 > x64_enc_cap) { x64_enc_grow(); }
     poke(x64_enc_buf + x64_enc_pos,     val & 0xFF);
     poke(x64_enc_buf + x64_enc_pos + 1, (val >> 8) & 0xFF);
     poke(x64_enc_buf + x64_enc_pos + 2, (val >> 16) & 0xFF);
