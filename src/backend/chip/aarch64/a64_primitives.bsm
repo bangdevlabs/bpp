@@ -1233,12 +1233,17 @@ void _a64_emit_branch_ne(label_id) {
     else { out("  b.ne .L"); a64_print_dec(label_id); putchar('\n'); }
 }
 
-// Drop one stack-top word. aarch64 pops into x9 — a freelist register
-// that is always safe to clobber, and matches the pre-lift chip-local
-// emission byte-for-byte.
+// Drop one stack-top word. The value is discarded, so no register load
+// is needed at all — just release the slot by bumping sp. (This used to
+// pop into x9, "a freelist register that is always safe to clobber" —
+// no longer true: B3's leaf widening promotes LOCALS into x9..x12 in
+// leaf functions, so a hidden x9 write here silently destroys whichever
+// variable owns that register. Found via `bug --watch` during the M2
+// caller-saved arc: T_SWITCH emits this discard on every case match, so
+// a switch on a chunk tag overwrote a promoted `w` with the tag value.)
 void _a64_emit_pop_discard() {
-    if (a64_bin_mode) { enc_ldr_post(9, 31, 16); }
-    else { out("  ldr x9, [sp], #16"); putchar('\n'); }
+    if (a64_bin_mode) { enc_add_imm(31, 31, 16); }
+    else { out("  add sp, sp, #16"); putchar('\n'); }
     cg_depth--;
 }
 
@@ -2085,27 +2090,32 @@ void _a64_emit_caller_pc() {
     walkoff_lbl = enc_new_label();
 
     if (a64_bin_mode) {
+        // The frame-pointer walk needs one scratch register. Use x16
+        // (IP0): the AArch64 procedure-call scratch that the allocator
+        // never hands to locals, temps, or promotions — unlike x9,
+        // which the leaf widening / caller-saved band can assign to a
+        // live variable (a hidden x9 write here would destroy it).
         // cbz x0, .Lzero
         enc_cbz_label(0, zero_lbl);
-        // mov x9, x29
-        enc_mov_reg(9, 29);
+        // mov x16, x29
+        enc_mov_reg(16, 29);
         // .Lwalk:
         enc_def_label(walk_lbl);
-        // cbz x9, .Lwalk_off  — guard every walk iteration so a null
+        // cbz x16, .Lwalk_off  — guard every walk iteration so a null
         // saved FP terminates the walk gracefully instead of faulting.
-        enc_cbz_label(9, walkoff_lbl);
+        enc_cbz_label(16, walkoff_lbl);
         // subs x0, x0, #1
         enc_sub_imm(0, 0, 1);
         // cbz x0, .Ltake_lr
         enc_cbz_label(0, take_lbl);
-        // ldr x9, [x9]
-        enc_ldr_uoff(9, 9, 0);
+        // ldr x16, [x16]
+        enc_ldr_uoff(16, 16, 0);
         // b .Lwalk
         enc_b_label(walk_lbl);
         // .Ltake_lr:
         enc_def_label(take_lbl);
-        // ldr x0, [x9, #8]
-        enc_ldr_uoff(0, 9, 8);
+        // ldr x0, [x16, #8]
+        enc_ldr_uoff(0, 16, 8);
         // b .Ldone
         enc_b_label(done_lbl);
         // .Lzero:
@@ -2122,15 +2132,15 @@ void _a64_emit_caller_pc() {
         enc_def_label(done_lbl);
     } else {
         out("  cbz x0, .Lcpc_zero_"); a64_print_dec(zero_lbl); putchar('\n');
-        out("  mov x9, x29"); putchar('\n');
+        out("  mov x16, x29"); putchar('\n');
         out(".Lcpc_walk_"); a64_print_dec(walk_lbl); out(":"); putchar('\n');
-        out("  cbz x9, .Lcpc_walkoff_"); a64_print_dec(walkoff_lbl); putchar('\n');
+        out("  cbz x16, .Lcpc_walkoff_"); a64_print_dec(walkoff_lbl); putchar('\n');
         out("  sub x0, x0, #1"); putchar('\n');
         out("  cbz x0, .Lcpc_take_"); a64_print_dec(take_lbl); putchar('\n');
-        out("  ldr x9, [x9]"); putchar('\n');
+        out("  ldr x16, [x16]"); putchar('\n');
         out("  b .Lcpc_walk_"); a64_print_dec(walk_lbl); putchar('\n');
         out(".Lcpc_take_"); a64_print_dec(take_lbl); out(":"); putchar('\n');
-        out("  ldr x0, [x9, #8]"); putchar('\n');
+        out("  ldr x0, [x16, #8]"); putchar('\n');
         out("  b .Lcpc_done_"); a64_print_dec(done_lbl); putchar('\n');
         out(".Lcpc_zero_"); a64_print_dec(zero_lbl); out(":"); putchar('\n');
         out("  adr x0, ."); putchar('\n');
