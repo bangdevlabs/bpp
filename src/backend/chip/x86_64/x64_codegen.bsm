@@ -364,13 +364,17 @@ void _x64_b3_select() {
 // aliasing scratch — disjoint from 12..14, so temps and promoted never collide.
 void _x64_b3_select_float() {
     auto budget, used, vi, n, best_vi, best_refs, reg, pool;
-    // Leaf gate: caller-saved xmm survive only if no call clobbers them.
-    // cg_fn_leaf is the spine's canonical signal (set before b3_select, cleared
-    // by the B3 reference walk the moment it sees a call).
-    if (cg_fn_leaf == 0) { return; }
     // Four promoted floats (xmm11..xmm14) so a 4-accumulator reduction (the
     // --fast-math reassociation target) keeps every accumulator in a register.
     // Temps drop to xmm8..xmm10 (3), scratch stays xmm15 — still disjoint.
+    //
+    // LEAF functions promote freely: no call ever clobbers a caller-saved
+    // xmm there, so promotion costs nothing (the original leaf-only rule).
+    // NON-leaf functions promote through the M4 caller-saved band: each
+    // promoted xmm is saved/restored around every call site (the
+    // emit_save/restore_caller_saved_flt wrap), and each pick must pass
+    // the M3 cost gate — SysV has no callee-saved xmm, so this wrap is
+    // the ONLY way x86-64 keeps a float in a register across a call.
     pool = buf_word(4);
     pool[0] = 11; pool[1] = 12; pool[2] = 13; pool[3] = 14;
     budget = 4;
@@ -388,8 +392,15 @@ void _x64_b3_select_float() {
             }
         }
         if (best_vi < 0) { free(pool); return; }
+        // M3 gate (non-leaf only, inside cg_caller_saved_worth): candidates
+        // come out in descending ref order, so the first one that cannot
+        // pay for its per-call wrap ends the selection.
+        if (cg_caller_saved_worth(best_refs) == 0) { free(pool); return; }
         reg = pool[used];
         arr_set(cg_var_promote, best_vi, reg);
+        if (cg_fn_leaf == 0) {
+            x64_caller_saved_promoted_flt = arr_push(x64_caller_saved_promoted_flt, reg);
+        }
         used++;
     }
     free(pool);
@@ -618,8 +629,10 @@ x64_emit_load_var(vi, off) {
     auto fty, _preg;
     _preg = arr_get(cg_var_promote, vi);
     if (_preg >= 0) {
-        // A float local promoted to a caller-saved xmm (leaf-only, see
-        // _x64_b3_select_float) reads with movsd; an int promoted GP reg with mov.
+        // A float local promoted to a caller-saved xmm (leaf freely,
+        // non-leaf through the M4 save/restore wrap — see
+        // _x64_b3_select_float) reads with movsd; an int promoted GP
+        // reg with mov.
         if (cg_var_is_float(vi)) { x64_enc_movsd_reg(0, _preg); return 1; }
         x64_enc_mov_reg(0, _preg);
         return 0;
