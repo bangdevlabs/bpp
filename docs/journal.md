@@ -15634,3 +15634,69 @@ study measured, closing. a64 byte-identical, x64 self-host gen1 == gen2 with the
 scan live, checksums intact, 240/0/12 + 198/0/54, gen2 == gen3, zero warnings.
 M2 (caller-saved spilling — the allocator using caller-saved regs for cross-call
 values) is the next, deeper increment; M1 banked here.
+
+## 2026-07-09 — M2 caller-saved spilling ships, and the four bugs that guarded the door
+
+The M2 activation (budget 14 everywhere, x9..x12 as promotion targets in
+non-leaf functions, save/restore around each call site) looked like a
+four-piece patch and turned into the deepest debugging arc of the RegAlloc
+project. It shipped (`06df00d`) — but only after four REAL bugs, each one
+masking the next, and each found with a different tool. Worth recording in
+order, because the method matters more than the patch.
+
+**Bug 1 — self-inflicted infinite recursion.** The first activation attempt
+built `_a64_route_promoted` with a global string-replace that ALSO rewrote
+the helper's own else-branch into a self-call. Every function that promoted
+anything recursed to stack overflow. lldb's backtrace gave it away in one
+run. Lesson re-learned: automated edits need the replace-then-define order.
+
+**Bug 2 — the constant/local register collision.** With the recursion fixed,
+`test_gpu_atlas_aseprite` crashed in `_png_unfilter`'s memcpy. The user asked
+the right question — "debug with bug não te ajuda a achar?" — and
+`bug --tui --watch w,h,bpp` (variables BY NAME at the breakpoint, which raw
+lldb registers cannot give) showed `w` reading back as `0x49444154` — the
+ASCII of "IDAT", i.e. the switch case-label CONSTANT. `_a64_b3_select_const`'s
+taken-scan only consulted `a64_promoted_regs`; locals promoted into the
+caller-saved band live in the OTHER list, so a promoted constant landed on a
+register a local already owned and its prologue materialization overwrote the
+local. One both-lists scan fixed it.
+
+**Bug 3 — two latent hidden-x9 clobbers, older than M2 (`a03036f`).** The
+same watch session exposed that the T_SWITCH pop-discard pops the switch value
+into a HARDCODED x9 ("a freelist register that is always safe to clobber" —
+false since the leaf widening began promoting locals into x9..x12), and
+`_a64_emit_caller_pc`'s FP walk used x9 as scratch. Every case-match in a
+switch destroyed whichever variable owned x9. The discard now just bumps sp
+(no register at all); the walk uses x16 (IP0), which the allocator never
+assigns. These two also POISONED THE BOOTSTRAP: the installed compiler binary
+still carried the buggy emitters, so compilers it built inherited miscompiled
+leaf-switch functions — position-sensitive garbage that made a bisect lie to
+us (an innocuous debug-print edit flipped the failing threshold). The fix had
+to be laundered through gen1→gen2 before anything downstream could be trusted.
+
+**Bug 4 — the 1 MB code buffer, 98.4% full (`3151c1a`).** With everything
+above fixed, the M2 compiler compiled tests fine but its OWN gen2 was a
+malformed Mach-O (invalid signature, garbage relocs targeting +0x118 pages,
+a wrong _main offset, a symbol table one nlist too long). Hours of structural
+diagnosis — every symptom pointed at the writer, the resolver, the trie —
+until the numbers converged: `enc_buf = malloc(1048576)`, unchecked pokes,
+and an M1-era compiler whose code section was already 1,032,192 bytes. M2's
+~6% code growth wrote past the end and corrupted whatever the allocator had
+placed after the buffer. Same latent class as the 256 KB `.bug` cap and the
+one-page chained-fixups datasize. Per the user's prompt — "não gostaria de
+recorrer a info disponível sobre c/c++ e outras linguagens?" — the fix
+follows prior art rather than a bigger cap: geometric growth (LLVM-style
+doubling; GNU as solves it with chained frags, JITs with reserve/commit),
+which is also this project's own ph_arr/dh_arr precedent. All bookkeeping is
+offset-based, so the move-on-grow is safe by construction. Both chips.
+
+**The scoreboard.** tga passes, native suite 240/0/12, a64 gen2==gen3, x64
+Docker self-host gen1==gen2, benchmark catalog bit-exact: biquad 0.87x and
+lcg 0.86x now BEAT gcc -O2 (the callee-saved sharing plus wider budget),
+xform 1.05x, conv at exact parity, and manylive — the many-live-locals shape
+that motivated the whole arc — improved 1.44x → 1.26x. The honest cost:
+call-dense code pays 8 wrap instructions per call (png_decode_to_buf's
+x29-touches went 60 → 342 across its 34 call sites). Hot loops are call-free,
+so the catalog holds — but that trade is exactly what M3's cost model must
+gate before M2 can be called complete: weigh loop-weighted ref savings
+against 8 bytes of save/restore per call site the live range crosses.
