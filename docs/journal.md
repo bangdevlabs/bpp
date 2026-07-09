@@ -15873,3 +15873,77 @@ bar. Outputs byte-identical, bootstrap PASS, suite 240/0/12.
 The arc that set out to "surpass gcc -O2 with a flag" ends with b++ beating
 gcc -O2 flagless (biquad 0.87x, lcg 0.86x) and bit-exact — the better
 trophy.
+
+## 2026-07-09 (night) — three arcs in one sitting: leaf widening, the oracle triple-proof, and the hunt that kept paying tolls
+
+The user asked for the three remaining small arcs at once. Two landed
+whole; the third advanced to a precise frontier and paid for itself twice
+along the way.
+
+**x64 leaf widening (`f50f23f`).** r8/r9 now promote in LEAF functions too
+— claimed out of the expression freelist (x64_freelist_claim, the twin of
+a64's discipline) instead of wrapped, since nothing in a call-free body
+ever clobbers a caller-saved register. Budget is 7 everywhere on both
+chips now; the difference between leaf and non-leaf is purely HOW the band
+is protected (claim vs wrap). Proof: a 7-hot-locals leaf kernel bit-exact
+across backends with its locals fully register-resident, and — a fresh
+manual lesson applied — the bootstrap ritual read from bootstrap_manual.md
+before running (gen1==gen2, since an x64-only change leaves a64 bytes
+alone). En route: `&=` does not exist in b++ (Rule 14's list is the whole
+list); the build error was the reminder.
+
+**The C-emit pair (`907da3f` + `a772ec3`) — and the compiler's third
+independent execution.** The watch item said `_rr`/`_ws_i` block the gcc
+oracle; the truth was deeper and better. First, a real PARSER bug:
+parse_for's init stash was never cleared after delivery, so a `for`
+sitting as the last statement of a nested body leaked a phantom duplicate
+of its init into the ENCLOSING body — benign natively only because b++
+locals are function-scoped, fatal in C's block scoping, and semantically
+wrong for any init with side effects (it ran twice). The compiler's own
+source contained phantom inits: fixing the parser produced the classic
+1-cycle oscillation, then gen2==gen3. Second, the switch emitter assumed
+every case label is a literal; `global const` labels (the T_* node tags)
+are .data slots in C, and `case T_ADDR:` is not a constant expression.
+Non-literal switches now lower to an if/else chain over a saved scrutinee
+— which also matches the native backends' break-inside-arm semantics.
+With both fixed: `bpp --c src/bpp.bpp | cc -O2` BUILDS AND WORKS. The
+gcc-built compiler compiles programs correctly, and — the day's most
+satisfying measurement — its first-generation output differs from the
+native fixpoint (system malloc vs b++'s deterministic mmap bases feeding
+some address-dependent iteration) but CONVERGES to the exact native
+fixpoint in one generation: a64-native, x64-under-Rosetta, and C-under-gcc
+all reach the same byte-identical compiler.
+
+**The flaky hunt (4a) — one real fix, one explained divergence, one
+precise frontier (`ca3a5da`).** test_dsp_param_safety's x64 segfault:
+core-dump analysis (gdb can't ptrace under Rosetta; a python walk of the
+core's PRSTATUS + LOAD segments, mapped through `bug --dump`'s address
+map — the tool as designed) revealed a worker-thread stack in a binary
+with ZERO synths. The prescan injects job_init on a weak gate (any @safe
+loop host) for callgraph reachability, and nothing retired it when
+dispatch outlined nothing — every DSP/game binary importing @safe helpers
+was starting a phantom 4-thread pool; on Linux, whose thread infra is the
+documented not-yet-ported piece, those threads are a startup hazard. The
+prescan's node is now flipped to T_NOP when _any_dispatched == 0
+(bench_compose keeps its real pool). The segfault itself SURVIVES the fix
+— checkpoint bisection pins it inside the spring_process loop under the
+full test's heap context (the isolated spring repro passes), at a
+CONSTANT wild RIP. Exonerations recorded: pre-M4 compilers reproduce it,
+and the spring output divergence between backends (x64 123.18 vs a64
+69.65 per mille) is the DOCUMENTED fmadd-vs-mulsd rounding difference
+amplified by a 0.98-feedback recursive tank over 44100 samples — 
+legitimate, not the bug. The remaining hunt (context-dependent memory
+corruption in the spring/delay chain on x64) has its exact repro recipe
+in the handoff.
+
+**Loop-align boundary settled (4c).** Re-measured on a genuinely quiet
+machine, min-of-7 interleaved: 16 B won or tied on both gate kernels
+(biquad 43.4 vs 44.0, manylive 102.7 vs 105.5 against a 32 B build). The
+emitter comment now records the verdict — the boundary is settled, not
+provisional.
+
+**Not attempted: the live-range wrap refinement (arc 2).** Session
+context was the binding constraint; its design notes stand in the
+regalloc plan, and the day's finding that inline syscalls bypass
+cg_emit_call is exactly the class of callsite-enumeration mismatch its
+implementation must survive.
