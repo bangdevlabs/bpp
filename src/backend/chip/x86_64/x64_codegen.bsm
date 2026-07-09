@@ -334,11 +334,19 @@ void _x64_b3_select() {
     // only apply when a register is used as a memory BASE; a B3-promoted local
     // is only ever a value (reg-reg moves + rbp-based prologue spill), never a
     // base — so they are safe here. 5 regs vs a64's 6 (x19..x24).
-    pool = buf_word(5);
+    // Slots 5/6 extend the pool into the caller-saved r8/r9 band
+    // (M2-x64): NON-leaf only (in leaf bodies r8/r9 belong to the
+    // expression freelist), each pick M3-gated, and routed to
+    // x64_caller_saved_promoted so the per-call wrap — not the
+    // prologue — preserves them.
+    pool = buf_word(7);
     pool[0] = 3; pool[1] = 12; pool[2] = 13; pool[3] = 14; pool[4] = 15;
+    pool[5] = 8; pool[6] = 9;
     budget = 5;
+    if (cg_fn_leaf == 0) { budget = 7; }
     n = arr_len(cg_vars);
     arr_clear(x64_promoted_regs);
+    arr_clear(x64_caller_saved_promoted);
     used = 0;
     while (used < budget) {
         best_vi = -1;
@@ -353,8 +361,17 @@ void _x64_b3_select() {
         }
         if (best_vi < 0) { free(pool); return; }
         reg = pool[used];
-        arr_set(cg_var_promote, best_vi, reg);
-        x64_promoted_regs = arr_push(x64_promoted_regs, reg);
+        if (used >= 5) {
+            // M3 gate: candidates come out in descending ref order, so
+            // the first one that cannot pay for its per-call wrap ends
+            // the caller-saved band.
+            if (cg_caller_saved_worth(best_refs) == 0) { free(pool); return; }
+            arr_set(cg_var_promote, best_vi, reg);
+            x64_caller_saved_promoted = arr_push(x64_caller_saved_promoted, reg);
+        } else {
+            arr_set(cg_var_promote, best_vi, reg);
+            x64_promoted_regs = arr_push(x64_promoted_regs, reg);
+        }
         used++;
     }
     free(pool);
@@ -426,9 +443,13 @@ void _x64_b3_select_float() {
 // has earned enough mileage to extend the comparison to x64's
 // narrower pool.
 // Int promotion pool size for x64: the five SysV callee-saved GP regs
-// (rbx/r12..r15) — no leaf widening (x64 has no clean caller-saved GP band the
-// way a64 borrows x9..x12). The linear-scan runs with this budget.
-_x64_regalloc_int_budget() { return 5; }
+// (rbx/r12..r15), plus the caller-saved r8/r9 band in NON-leaf functions
+// (M2-x64 — saved/restored around each call; in leaf bodies r8/r9 stay
+// expression-freelist temps). The linear-scan runs with this budget.
+_x64_regalloc_int_budget() {
+    if (cg_fn_leaf) { return 5; }
+    return 7;
+}
 
 // Pad the code buffer with NOPs so the next instruction (a loop-head
 // label) starts on a 16-byte fetch boundary — the x86-64 twin of
@@ -455,14 +476,20 @@ void _x64_emit_align_loop() {
 }
 
 // Logical slot -> physical register, mirroring _x64_b3_select's pool order
-// [rbx(3), r12, r13, r14, r15]. Slots >= 5 have no register (validate rejects).
+// [rbx(3), r12, r13, r14, r15, r8, r9]. Slots 5/6 are the caller-saved
+// M2-x64 band — valid only in NON-leaf functions (leaf bodies hand r8/r9
+// out as expression-freelist temps, the inverse of a64's leaf widening).
 _x64_b3_reg_at(slot) {
     if (slot == 0) { return 3; }
     if (slot == 1) { return 12; }
     if (slot == 2) { return 13; }
     if (slot == 3) { return 14; }
     if (slot == 4) { return 15; }
-    return 0 - 1;
+    if (cg_fn_leaf == 0) {
+        if (slot == 5) { return 8; }
+        if (slot == 6) { return 9; }
+    }
+    return -1;
 }
 
 // RegAlloc v2 Stage E, x64 int — replaces B3's greedy pick with the linear-scan
@@ -492,25 +519,58 @@ _x64_regalloc_apply(assigns) {
         i++;
     }
     arr_clear(x64_promoted_regs);
+    arr_clear(x64_caller_saved_promoted);
     slot_seen = arr_new();
     j = 0;
     while (j < 64) { slot_seen = arr_push(slot_seen, 0); j++; }
+
+    // M3 pre-pass (mirrors _a64_regalloc_apply): total the loop-weighted
+    // references landing on each slot — the wrap is paid per REGISTER,
+    // so a caller-saved slot is judged by the SUM of every variable
+    // sharing it.
+    auto slot_refs, worth;
+    slot_refs = arr_new();
+    j = 0;
+    while (j < 64) { slot_refs = arr_push(slot_refs, 0); j++; }
+    i = 0;
+    while (i < n) {
+        asn = arr_struct_at(assigns, i);
+        if (asn.slot >= 0) {
+            arr_set(slot_refs, asn.slot,
+                arr_get(slot_refs, asn.slot) + arr_get(cg_var_refs, asn.var_idx));
+        }
+        i++;
+    }
+
     i = 0;
     while (i < n) {
         asn = arr_struct_at(assigns, i);
         if (asn.slot >= 0) {
             reg = _x64_b3_reg_at(asn.slot);
-            arr_set(cg_var_promote, asn.var_idx, reg);
-            if (arr_get(slot_seen, asn.slot) == 0) {
-                arr_set(slot_seen, asn.slot, 1);
-                x64_promoted_regs = arr_push(x64_promoted_regs, reg);
+            // M2-x64 routing + M3 gate: slots 5/6 (r8/r9, non-leaf) go to
+            // the caller-saved list and must pay for their per-call wrap;
+            // a refused slot's variables simply stay in memory.
+            worth = 1;
+            if (asn.slot >= 5) {
+                worth = cg_caller_saved_worth(arr_get(slot_refs, asn.slot));
+            }
+            if (worth) {
+                arr_set(cg_var_promote, asn.var_idx, reg);
+                if (arr_get(slot_seen, asn.slot) == 0) {
+                    arr_set(slot_seen, asn.slot, 1);
+                    if (asn.slot >= 5) {
+                        x64_caller_saved_promoted = arr_push(x64_caller_saved_promoted, reg);
+                    } else {
+                        x64_promoted_regs = arr_push(x64_promoted_regs, reg);
+                    }
+                }
             }
         }
         i++;
     }
     nc = arr_len(cg_const_reg);
     i = 0;
-    while (i < nc) { arr_set(cg_const_reg, i, 0 - 1); i++; }
+    while (i < nc) { arr_set(cg_const_reg, i, -1); i++; }
     _x64_b3_select_const();
     return 1;
 }
@@ -530,26 +590,45 @@ _x64_regalloc_apply_float(assigns) {
 // cg_const_reg is set so the prologue materialises it once and the accumulator
 // use-site (cg_emit_lit) reads it with emit_mov_phys instead of a fresh movabs.
 void _x64_b3_select_const() {
-    auto pool, used, n, best_idx, best_wt, ci, reg;
+    auto pool, slot, n, best_idx, best_wt, ci, reg, pi, pn, _taken;
     pool = buf_word(5);
     pool[0] = 3; pool[1] = 12; pool[2] = 13; pool[3] = 14; pool[4] = 15;
-    used = arr_len(x64_promoted_regs);   // locals already took the first `used` slots
     n = arr_len(cg_const_val);
-    while (used < 5) {
-        best_idx = -1;
-        best_wt = 999;                   // threshold: only loop constants (>= 1000)
-        for (ci = 0; ci < n; ci++) {
-            if (arr_get(cg_const_reg, ci) >= 0) { continue; }
-            if (arr_get(cg_const_wt, ci) > best_wt) {
-                best_wt = arr_get(cg_const_wt, ci);
-                best_idx = ci;
+    // `arr_len(x64_promoted_regs)` used to stand in for "next free slot".
+    // RegAlloc v2's slot-sharing broke that invariant (a64 hit the same
+    // bug — see _a64_b3_select_const): the linear scan can legitimately
+    // leave a low slot unclaimed while a higher one is taken, so length-
+    // as-index hands out a register a local already owns. Walk the pool
+    // and skip any register present in EITHER promoted list instead.
+    slot = 0;
+    while (slot < 5) {
+        reg = pool[slot];
+        _taken = 0;
+        pn = arr_len(x64_promoted_regs);
+        for (pi = 0; pi < pn; pi++) {
+            if (arr_get(x64_promoted_regs, pi) == reg) { _taken = 1; pi = pn; }
+        }
+        if (_taken == 0) {
+            pn = arr_len(x64_caller_saved_promoted);
+            for (pi = 0; pi < pn; pi++) {
+                if (arr_get(x64_caller_saved_promoted, pi) == reg) { _taken = 1; pi = pn; }
             }
         }
-        if (best_idx < 0) { free(pool); return; }
-        reg = pool[used];
-        arr_set(cg_const_reg, best_idx, reg);
-        x64_promoted_regs = arr_push(x64_promoted_regs, reg);
-        used++;
+        if (_taken == 0) {
+            best_idx = -1;
+            best_wt = 999;               // threshold: only loop constants (>= 1000)
+            for (ci = 0; ci < n; ci++) {
+                if (arr_get(cg_const_reg, ci) >= 0) { continue; }
+                if (arr_get(cg_const_wt, ci) > best_wt) {
+                    best_wt = arr_get(cg_const_wt, ci);
+                    best_idx = ci;
+                }
+            }
+            if (best_idx < 0) { free(pool); return; }
+            arr_set(cg_const_reg, best_idx, reg);
+            x64_promoted_regs = arr_push(x64_promoted_regs, reg);
+        }
+        slot++;
     }
     free(pool);
 }
