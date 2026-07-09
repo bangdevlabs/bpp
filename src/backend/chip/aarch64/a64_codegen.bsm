@@ -543,10 +543,22 @@ void a64_print_dec(n) {
 // or -1 past the budget.
 static _a64_b3_reg_at(slot) {
     if (slot < 10) { return 19 + slot; }
-    if (cg_fn_leaf) {
-        if (slot < 14) { return 9 + (slot - 10); }
-    }
+    if (slot < 14) { return 9 + (slot - 10); }
     return -1;
+}
+
+// Route one promoted register to its save list: callee-saved (x19..x28,
+// and the leaf-widened x9..x12 in leaf functions, where no call can
+// clobber them) go to a64_promoted_regs and are saved once in the
+// prologue; caller-saved x9..x12 in NON-leaf functions go to
+// a64_caller_saved_promoted and are saved/restored around each call
+// site instead (the M2 caller-saved spill mechanism).
+_a64_route_promoted(reg) {
+    if (reg >= 9 && reg <= 15 && cg_fn_leaf == 0) {
+        a64_caller_saved_promoted = arr_push(a64_caller_saved_promoted, reg);
+    } else {
+        a64_promoted_regs = arr_push(a64_promoted_regs, reg);
+    }
 }
 
 // When a caller-saved register (x9..x15) is claimed for promotion it must
@@ -576,7 +588,7 @@ void _a64_b3_select() {
         }
         if (best_vi < 0) { return; }
         arr_set(cg_var_promote, best_vi, reg);
-        a64_promoted_regs = arr_push(a64_promoted_regs, reg);
+        _a64_route_promoted(reg);
         _a64_b3_claim_freelist(reg);
         used++;
     }
@@ -611,10 +623,7 @@ void _a64_b3_select() {
 // plus x9..x12 in a leaf = 14). The linear-scan runs with THIS budget so the
 // systematic comparison is apples-to-apples with B3 and the apply can honor
 // every slot.
-_a64_regalloc_int_budget() {
-    if (cg_fn_leaf) { return 14; }
-    return 10;
-}
+_a64_regalloc_int_budget() { return 14; }
 _a64_regalloc_apply(assigns) {
     auto n, i, asn: RegAssign, reg, nc, slot_seen, j;
     n = arr_struct_count(assigns);
@@ -670,7 +679,7 @@ _a64_regalloc_apply(assigns) {
             arr_set(cg_var_promote, asn.var_idx, reg);
             if (arr_get(slot_seen, asn.slot) == 0) {
                 arr_set(slot_seen, asn.slot, 1);
-                a64_promoted_regs = arr_push(a64_promoted_regs, reg);
+                _a64_route_promoted(reg);
             }
             _a64_b3_claim_freelist(reg);
         }
@@ -773,10 +782,24 @@ void _a64_b3_select_const() {
     while (1) {
         reg = _a64_b3_reg_at(slot);
         while (reg >= 0) {
+            // A register counts as taken when EITHER promoted list holds
+            // it. Locals promoted into the caller-saved band (x9..x12,
+            // non-leaf) are recorded in a64_caller_saved_promoted, NOT in
+            // a64_promoted_regs — checking only the callee-saved list
+            // hands a constant a register a local already owns, and the
+            // constant's materialization silently overwrites that local
+            // (found via `bug --watch`: a PNG width variable reading back
+            // as the promoted IDAT case-label constant).
             _taken = 0;
             pn = arr_len(a64_promoted_regs);
             for (pi = 0; pi < pn; pi++) {
                 if (arr_get(a64_promoted_regs, pi) == reg) { _taken = 1; pi = pn; }
+            }
+            if (_taken == 0) {
+                pn = arr_len(a64_caller_saved_promoted);
+                for (pi = 0; pi < pn; pi++) {
+                    if (arr_get(a64_caller_saved_promoted, pi) == reg) { _taken = 1; pi = pn; }
+                }
             }
             if (_taken == 0) { break; }
             slot++;
@@ -794,7 +817,7 @@ void _a64_b3_select_const() {
         }
         if (best_idx < 0) { return; }
         arr_set(cg_const_reg, best_idx, reg);
-        a64_promoted_regs = arr_push(a64_promoted_regs, reg);
+        _a64_route_promoted(reg);
         _a64_b3_claim_freelist(reg);
         slot++;
     }

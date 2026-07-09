@@ -141,6 +141,52 @@ big-league general-quality investment, not a hot-path fix.
   then lldb-break at ITS memcpy to read x20/x25 across scanlines and see which
   pointer drifts + correlate with the linear-scan slot assignment. Reverted to
   Step 1.
+
+  **M2 SHIPPED 2026-07-09.** The activation is live on a64: budget 14 for
+  every function, `_a64_b3_reg_at` maps slots 10..13 to x9..x12
+  unconditionally, `_a64_route_promoted` sends caller-saved promotions to
+  the per-call save list, and `_a64_fn_reserve_spill` reserves the
+  caller-saved band at the end of the frame. Getting here took FOUR real
+  bugs, in order of discovery: (1) a self-inflicted infinite recursion in
+  the route helper (a careless global string-replace rewrote the helper's
+  own else-branch); (2) `_a64_b3_select_const`'s taken-scan only checked
+  `a64_promoted_regs`, so promoted constants collided with caller-saved
+  locals — a PNG width variable read back as the IDAT case-label constant
+  (found with `bug --watch`); (3) TWO latent hidden-x9 clobbers that
+  predate M2 entirely — the T_SWITCH pop-discard popped into a hardcoded
+  x9 and `_a64_emit_caller_pc`'s FP walk used x9 as scratch (`a03036f`;
+  these also poisoned the bootstrap toolchain until laundered through);
+  (4) the fixed 1 MB code buffer was 98.4% full and M2's code growth
+  overran it, corrupting neighbouring heap (`3151c1a`, now growable).
+  Verification: tga + native suite 240/0/12 + a64 gen2==gen3 + x64 Docker
+  self-host gen1==gen2 + full benchmark catalog (biquad 0.87x / lcg 0.86x
+  BEAT gcc -O2; xform 1.05x; conv at exact parity; manylive — the
+  motivating shape — 1.44x -> 1.26x). Honest cost note: in call-dense
+  functions the per-call wrap ADDS traffic (png_decode_to_buf 60 -> 342
+  x29-touches across 34 call sites) — hot loops are call-free so the
+  catalog holds, but this is exactly the promote-or-not decision **M3's
+  cost model** must gate: weigh (loop-weighted ref savings) against
+  (8 bytes of save/restore per call site crossed by the live range).
+
+  ---- Historical diagnosis trail (kept for the method) ----
+
+  **Bug B ROOT-CAUSE DIRECTION (2026-07-08, cracked with `bug --watch`, not lldb).**
+  `bug --tui --break stb/stbpixels.bsm:565 --watch out,dst,src,stride,prior,j
+  <bin>` on the M2 binary reads the b++ VARIABLES BY NAME at the memcpy (this is
+  the tool lldb couldn't match — raw registers don't tell you which *variable*).
+  Result: at the 1st memcpy `out = 0x300000010` and `stride = 0x125153910` are
+  BOTH garbage while dst/src/j/prior are correct; at the crash `dst = 0x300000010`
+  (the value `out` held earlier). Since the 1st memcpy did NOT crash, the real
+  out/stride there are valid — so the `.bug` map (emitted by the SAME M2 codegen)
+  records out/stride at the WRONG locations. That is the tell: under budget-14 the
+  variable→register assignment is INCONSISTENT — `cg_var_promote` holds one reg for
+  a variable while the value lives elsewhere in some range. Classic LIVE-RANGE
+  SPLIT leaking past the `regalloc_has_any_split` refusal (or the split producing
+  two assigns and the apply/`_a64_route_promoted` recording the wrong one). NEXT:
+  dump the linear-scan assigns for `_png_unfilter` under budget-14, find the var
+  with >1 assign (a split) or two vars mapped to the same slot/reg, and either
+  tighten the split refusal or make the apply consistent. The spill mechanics are
+  NOT the bug (confirmed earlier); the ASSIGNMENT is. Reverted to Step 1.
 - **M3 — the cost model.** Extend B3/RegAlloc to CHOOSE caller-saved (with
   spilling) vs callee-saved vs memory per value, by the measured trade-off. This
   is where the general-quality win lands.
