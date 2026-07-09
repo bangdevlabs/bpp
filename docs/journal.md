@@ -15841,3 +15841,35 @@ journey. The poetry: that journey ended up DELIVERING the plan's own M2
 (non-leaf floats too). The xmm11..14 pool was sized for exactly this
 transform. M1b is now a both-backends-day-one increment; the plan carries
 a status banner saying so, and the next session starts there.
+
+## 2026-07-09 (epilogue) — the design review that killed --fast-math, and the study it leaves behind
+
+The handoff pointed at M1b as the next mission; the user's scrutiny killed
+the arc instead, with two questions that cut straight through. First: "as
+flags de compilação são pra debug e bootstrap" — which forced the honest
+taxonomy (real optimizations in b++ are default-on BECAUSE they preserve
+results; a flag that trades float bits for speed is a semantics switch, not
+an optimization). Second, the fatal one: the only real consumer of the
+reassociation win — the convolution cab — lives inside sound_fusion, whose
+offline export must stay byte-identical. A whole-binary flag cannot serve a
+per-kernel need. The design contradicted its own consumer.
+
+And the study's conclusion writes itself: the measured 2.7× (33 ms vs gcc
+-O2's 89) came from HAND-WRITTEN 4-accumulator source — and the parity
+journey already built the codegen that compiles exactly that source
+optimally on both backends (float-CIP, float-B3, fmadd; the x64 xmm11..14
+pool sized for four accumulators). The transform would have automated what
+the source can say explicitly and visibly, at the price of a hidden
+semantics switch. Rule 39's doctrine settles it: implicit is acceptable
+only when semantics-preserving; reassociation is not; therefore it belongs
+in the source, where the DSP author owns the rounding trade.
+
+Faxina executed per the house taxonomy (never document a never-implement —
+remove it): the orphan --fast-math parse deleted (nothing ever read the
+flag), flag_fast_math global gone, the plan moved to docs/plans/legacy/
+with the full rationale and the spec kept for the record behind a Rule-20
+bar. Outputs byte-identical, bootstrap PASS, suite 240/0/12.
+
+The arc that set out to "surpass gcc -O2 with a flag" ends with b++ beating
+gcc -O2 flagless (biquad 0.87x, lcg 0.86x) and bit-exact — the better
+trophy.

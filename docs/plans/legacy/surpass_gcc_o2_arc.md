@@ -1,15 +1,31 @@
 # Plan — surpass gcc -O2 on FP reductions (multi-accumulator reassociation + x64 float)
 
-> **STATUS 2026-07-09 — M1b IS THE NEXT COMPILER MISSION.** M1a (the
-> `--fast-math` flag) shipped 07-07 (`ba83e28`); then the backend-parity
-> journey (int-CIP → float-CIP → RegAlloc v2 M1..M4 + M2-x64) interrupted
-> this arc — and ended up DELIVERING this plan's own M2: x64 float-CIP +
-> float-B3 shipped 07-07, and the RegAlloc M4 caller-saved band now even
-> covers non-leaf floats. The xmm11..14 pool was sized for exactly this
-> transform. So M1b (the ~150-line AST pass below, spec fully resolved)
-> now benefits BOTH backends the day it lands. Everything in the
-> "Implementation notes" section remains valid; start with the
-> float-typed synth local in isolation, per the risk note.
+> **CLOSED 2026-07-09 — ARC KILLED BY DESIGN REVIEW (legacy).** The user's
+> question that ended it: the only real consumer of the reassociation win —
+> the convolution cab — lives INSIDE sound_fusion, whose offline export must
+> stay byte-identical. `--fast-math` is a whole-binary flag; the consumer
+> needs per-KERNEL granularity. A flag that silently changes float results
+> also contradicts b++'s core promise (bit-exact by default, semantics never
+> traded behind a switch — every real optimization in this codebase is
+> default-on precisely because it preserves results).
+>
+> **The win survives WITHOUT the arc.** The measured 2.7× came from
+> HAND-WRITTEN 4-accumulator source (`bench_ring4.bpp`, 33 ms vs gcc -O2's
+> 89 ms) — and the parity journey's codegen (float-CIP + float-B3 + fmadd on
+> BOTH backends; the x64 xmm11..14 pool sized for exactly 4 accumulators)
+> already compiles that source optimally, today, no flag. When the cab needs
+> the headroom (it does not: ~290× realtime margin, conv at gcc parity),
+> write the FIR inner loop with 4 explicit accumulators in stbconv — the
+> reassociation becomes a visible, testable choice by the DSP author in the
+> source, which is the b++ way (cf. Rule 39's explicit-vs-implicit doctrine:
+> implicit transforms are only acceptable when semantics-preserving).
+>
+> M1a's orphan `--fast-math` parse was removed the same day (nothing ever
+> read the flag). This plan's own M2 (x64 float codegen) WAS delivered — by
+> the backend-parity journey (`943dde3`/`ebad27e` + RegAlloc M4). The
+> implementation notes below are kept for the record: if a future domain
+> ever justifies per-scope reassociation, the spec is here and Rule 20
+> (second real consumer) is the bar it must clear.
 
 **Opened 2026-07-07.** After S1+S2 closed the FP-serial gap to PARITY (conv
 1.02× gcc -O2, bit-exact), a hand-written experiment showed the milestone the
