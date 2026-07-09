@@ -15790,3 +15790,40 @@ M4 cross-call float closing x64's last float gap. RegAlloc v2 as planned in
 the scaffolding-taxonomy session is COMPLETE; what remains beyond it is the
 live-range-level wrap refinement (designed into the plan) and the separate
 compilation arc, still unstarted.
+
+## 2026-07-09 (coda) — M2-x64: the parity question that reopened a closed verdict
+
+The user looked at the parity table's one remaining ❌ — "no clean
+caller-saved GP band on x64" — and asked the question this project's whole
+method is built on: isso não está feito? Re-examining the verdict with M4's
+wrap in hand, it fell apart: r8/r9 are only freelist temps in LEAF bodies
+(non-leaf depth is 1, r11 alone), and as SysV arg registers 5/6 they are
+written strictly between the wrap's save and the call. That is a clean
+2-register band — the "architectural" phrasing had quietly hidden a
+compiler-structure fact, the exact chip-vs-compiler confusion this journal
+has recorded being overturned three times before.
+
+Shipped as the by-now-standard two increments. Step 1 (`3ca9414`): the
+mechanism inactive and byte-identical on both backends — the list, the
+real save/restore emitters riding the existing spine hook, the frame band
+below M4's float band, and the danger the audit caught before it could
+bite: inline syscalls bypass cg_emit_call entirely, and sys_mmap (6 args) /
+sys_select (5) pop arguments straight into r8/r9 — so _x64_emit_syscall
+wraps itself chip-locally (the kernel preserves r8/r9 across `syscall`;
+only our own argument setup needed covering). Step 2 (`5f5c482`): slots 5/6
+in _x64_b3_select (non-leaf only, M3-gated through the spine's shared
+cg_caller_saved_worth), reg_at/budget answering 7, and the apply mirroring
+a64's per-slot gate + routing.
+
+The audit also paid a bonus: _x64_b3_select_const still used
+arr_len(x64_promoted_regs) as "next free slot" — the same length-as-index
+latent bug the a64 side fixed when RegAlloc v2's slot-sharing broke the
+sequential invariant. x64 now walks the pool with the taken-scan too.
+
+Proof: a 7-hot-locals non-leaf kernel bit-exact between a64 native and x64
+Docker, the disasm showing the full promised shape (wrap save, argument
+evaluation reading the still-live r8/r9, call, reload, increments running
+in-register), plus a malloc/mmap path through the syscall wrap. a64 outputs
+byte-identical, bootstrap PASS, native suite 240/0/12, x64 Docker self-host
+gen1==gen2. The M2 row now reads parity — band width differing only by ABI
+headroom (a64 +4, x64 +2), which is the honest kind of difference.
