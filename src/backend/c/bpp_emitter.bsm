@@ -1719,9 +1719,52 @@ void emit_node(nd) {
         sw_cnt = n.c;
 
         if (n.a != 0) {
-            // Form 1 → C switch. Case labels must be integer constants,
-            // which B++ switch values always are in practice (literals
-            // or const-references that inline to literals).
+            // Form 1 → C switch, but ONLY when every case value is an
+            // integer literal. B++ also accepts `global const` references
+            // as case labels (real .data slots, e.g. the T_* node tags),
+            // which are variables in the emitted C — `case T_ADDR:` is
+            // not a constant expression there and gcc rejects it. Those
+            // switches fall through to the if/else chain below, which
+            // also matches the native backends' `break` semantics (a
+            // break inside an arm exits the enclosing LOOP, not the
+            // switch).
+            auto _sw_all_lit, _sv: Node;
+            _sw_all_lit = 1;
+            for (si = 0; si < sw_cnt; si++) {
+                sv_arr = sw_arms[si * 2];
+                sv_cnt = sw_arms[si * 2 + 1];
+                for (sk = 0; sk < sv_cnt; sk++) {
+                    _sv = sv_arr[sk];
+                    if (_sv.ntype != T_LIT) { _sw_all_lit = 0; }
+                }
+            }
+            if (_sw_all_lit == 0) {
+                // Non-literal labels: save the scrutinee once, compare
+                // per arm. Nested switches shadow _bpp_swv harmlessly
+                // (each lives in its own C block).
+                out("{ long long _bpp_swv = "); emit_node(n.a); out(";\n");
+                for (si = 0; si < sw_cnt; si++) {
+                    sv_arr = sw_arms[si * 2];
+                    sv_cnt = sw_arms[si * 2 + 1];
+                    sb_arr = sw_bodies[si * 2];
+                    sb_cnt = sw_bodies[si * 2 + 1];
+                    if (si == 0) { out("if ("); } else { out("else if ("); }
+                    for (sk = 0; sk < sv_cnt; sk++) {
+                        if (sk > 0) { out(" || "); }
+                        out("(_bpp_swv == "); emit_node(sv_arr[sk]); out(")");
+                    }
+                    out(") {\n");
+                    emit_body(sb_arr, sb_cnt);
+                    out("}\n");
+                }
+                if (n.d != 0) {
+                    out("else {\n");
+                    emit_body(n.d, n.e);
+                    out("}\n");
+                }
+                out("}"); putchar('\n');
+                return;
+            }
             out("switch ("); emit_node(n.a); out(") {\n");
             for (si = 0; si < sw_cnt; si++) {
                 sv_arr = sw_arms[si * 2];
