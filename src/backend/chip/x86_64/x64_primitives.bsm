@@ -758,11 +758,29 @@ void _x64_emit_call_extern(ex_idx) {
 _x64_emit_copy_ret_int() { return 0; }
 _x64_emit_copy_ret_flt() { return 0; }
 
-// Caller-saved spill, int side — intentionally empty: x86_64 has no clean
-// caller-saved GP band to promote into (r11/r8/r9 are the expression
-// freelist), so the int list never exists on this chip.
-void _x64_emit_save_caller_saved_int() { }
-void _x64_emit_restore_caller_saved_int() { }
+// Caller-saved spill, int side (M2-x64). r8/r9 promoted in non-leaf
+// functions are saved to their frame band before each call (and before
+// each inline syscall — see _x64_emit_syscall) and reloaded after.
+// mov [rbp + off], r / mov r, [rbp + off]; offsets are negative
+// (x86_64 frames grow down from rbp).
+void _x64_emit_save_caller_saved_int() {
+    auto n, i, reg, off;
+    n = arr_len(x64_caller_saved_promoted);
+    for (i = 0; i < n; i++) {
+        reg = arr_get(x64_caller_saved_promoted, i);
+        off = x64_caller_spill_off - (i + 1) * 8;
+        x64_enc_store(reg, 5, off);
+    }
+}
+void _x64_emit_restore_caller_saved_int() {
+    auto n, i, reg, off;
+    n = arr_len(x64_caller_saved_promoted);
+    for (i = 0; i < n; i++) {
+        reg = arr_get(x64_caller_saved_promoted, i);
+        off = x64_caller_spill_off - (i + 1) * 8;
+        x64_enc_load(reg, 5, off);
+    }
+}
 
 // Caller-saved spill, FLOAT side (M4). SysV has no callee-saved xmm, so a
 // float promoted across calls lives in a caller-saved xmm and is spilled
@@ -999,6 +1017,7 @@ void _x64_emit_prologue_full(name_p, fn_lbl_id, frame_size) {
 // clearing at function entry.
 void _x64_fn_reset_chip_state() {
     arr_clear(x64_promoted_regs);
+    arr_clear(x64_caller_saved_promoted);
     arr_clear(x64_caller_saved_promoted_flt);
     x64_freelist_reset();
     x64_simd_freelist_reset();
@@ -1009,14 +1028,18 @@ void _x64_fn_reset_chip_state() {
 // from rbp, so the spill base is the negative absolute magnitude
 // (-(24 + total)).
 _x64_fn_reserve_spill(total) {
-    auto int_bytes;
+    auto int_bytes, cf_bytes;
     x64_b3_spill_off = 0 - (24 + total);
-    // The caller-saved FLOAT band (M4) sits below the B3 int spills;
-    // its per-slot offsets walk further DOWN (see the save/restore
-    // wrappers). Empty list -> zero extra bytes, byte-identical.
+    // Band order, walking DOWN from rbp: callee-saved B3 spills, then
+    // the caller-saved FLOAT band (M4), then the caller-saved INT band
+    // (M2-x64, r8/r9). Per-slot offsets inside each band walk further
+    // down (see the save/restore wrappers). Empty lists cost zero bytes.
     int_bytes = arr_len(x64_promoted_regs) * 8;
     x64_caller_fspill_off = x64_b3_spill_off - int_bytes;
-    return total + int_bytes + arr_len(x64_caller_saved_promoted_flt) * 8;
+    cf_bytes = arr_len(x64_caller_saved_promoted_flt) * 8;
+    x64_caller_spill_off = x64_caller_fspill_off - cf_bytes;
+    return total + int_bytes + cf_bytes
+         + arr_len(x64_caller_saved_promoted) * 8;
 }
 
 // Pre-register body variables for x86_64 layout. Thin wrapper.
@@ -1416,6 +1439,13 @@ static _x64_sys_num(cg_id) {
 // normalisation is required after the syscall returns.
 void _x64_emit_syscall(cg_id, arg_count, extra_slot, extra_val) {
     auto num;
+    // Inline syscalls bypass cg_emit_call's caller-saved wrap, yet the
+    // 5th/6th syscall args land in r8/r9 — the very registers the
+    // M2-x64 band promotes locals into. Save the band first (no-op
+    // when the list is empty) and reload it after the trap; the Linux
+    // kernel itself preserves r8/r9 across `syscall`, so only our own
+    // argument setup needs covering.
+    _x64_emit_save_caller_saved_int();
     // Move arg 0 from rax (tree walker convention) into rdi (syscall ABI).
     if (arg_count >= 1) { x64_enc_mov_reg(7, 0); }
     // Pop remaining args from the stack into rsi, rdx, r10, r8, r9.
@@ -1430,6 +1460,7 @@ void _x64_emit_syscall(cg_id, arg_count, extra_slot, extra_val) {
     num = _x64_sys_num(cg_id);
     x64_enc_mov_wide(0, num);
     x64_enc_syscall();
+    _x64_emit_restore_caller_saved_int();
 }
 
 // ── Wave 19 function-frame primitives ──
