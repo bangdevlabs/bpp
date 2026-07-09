@@ -758,9 +758,39 @@ void _x64_emit_call_extern(ex_idx) {
 _x64_emit_copy_ret_int() { return 0; }
 _x64_emit_copy_ret_flt() { return 0; }
 
-// Caller-saved spill — placeholder, see Wave 9b.
+// Caller-saved spill, int side — intentionally empty: x86_64 has no clean
+// caller-saved GP band to promote into (r11/r8/r9 are the expression
+// freelist), so the int list never exists on this chip.
 void _x64_emit_save_caller_saved_int() { }
 void _x64_emit_restore_caller_saved_int() { }
+
+// Caller-saved spill, FLOAT side (M4). SysV has no callee-saved xmm, so a
+// float promoted across calls lives in a caller-saved xmm and is spilled
+// to its frame slot around each call site — this pair emits that wrap.
+// movsd [rbp + off], xmm / movsd xmm, [rbp + off]; offsets are negative
+// (x86_64 frames grow down from rbp).
+void _x64_emit_save_caller_saved_flt() {
+    auto n, i, reg, off;
+    n = arr_len(x64_caller_saved_promoted_flt);
+    for (i = 0; i < n; i++) {
+        reg = arr_get(x64_caller_saved_promoted_flt, i);
+        // Same slot convention as the int spills above: the first slot
+        // sits one word BELOW the band base, so bands never overlap.
+        off = x64_caller_fspill_off - (i + 1) * 8;
+        x64_enc_store_sd(reg, 5, off);
+    }
+}
+void _x64_emit_restore_caller_saved_flt() {
+    auto n, i, reg, off;
+    n = arr_len(x64_caller_saved_promoted_flt);
+    for (i = 0; i < n; i++) {
+        reg = arr_get(x64_caller_saved_promoted_flt, i);
+        // Same slot convention as the int spills above: the first slot
+        // sits one word BELOW the band base, so bands never overlap.
+        off = x64_caller_fspill_off - (i + 1) * 8;
+        x64_enc_load_sd(reg, 5, off);
+    }
+}
 
 // ── Phase 3.5/4 scaffolding (Waves 13-17) ──
 // Stub bodies. Real implementations land in followup session.
@@ -969,6 +999,7 @@ void _x64_emit_prologue_full(name_p, fn_lbl_id, frame_size) {
 // clearing at function entry.
 void _x64_fn_reset_chip_state() {
     arr_clear(x64_promoted_regs);
+    arr_clear(x64_caller_saved_promoted_flt);
     x64_freelist_reset();
     x64_simd_freelist_reset();
 }
@@ -978,8 +1009,14 @@ void _x64_fn_reset_chip_state() {
 // from rbp, so the spill base is the negative absolute magnitude
 // (-(24 + total)).
 _x64_fn_reserve_spill(total) {
+    auto int_bytes;
     x64_b3_spill_off = 0 - (24 + total);
-    return total + arr_len(x64_promoted_regs) * 8;
+    // The caller-saved FLOAT band (M4) sits below the B3 int spills;
+    // its per-slot offsets walk further DOWN (see the save/restore
+    // wrappers). Empty list -> zero extra bytes, byte-identical.
+    int_bytes = arr_len(x64_promoted_regs) * 8;
+    x64_caller_fspill_off = x64_b3_spill_off - int_bytes;
+    return total + int_bytes + arr_len(x64_caller_saved_promoted_flt) * 8;
 }
 
 // Pre-register body variables for x86_64 layout. Thin wrapper.
