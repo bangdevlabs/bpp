@@ -1054,6 +1054,12 @@ global cg_addr_const_base;
 // promote locals into caller-saved registers too — nothing can clobber them
 // mid-function — widening the budget beyond the callee-saved pool.
 global cg_fn_leaf;
+// M3 cost model input: the loop-weighted number of real calls the current
+// function makes (a call inside a loop counts 1000, matching the B3 ref
+// weighting, so refs and call cost are in the same currency). A promotion
+// into a caller-saved register pays one save + one restore around EVERY
+// call, so the chip's routing gates on refs > 2 * cg_fn_call_wt.
+global cg_fn_call_wt;
 
 // Add a variable to the current scope. Initialises all parallel
 // arrays to their defaults and returns the fresh slot index.
@@ -1340,7 +1346,14 @@ cg_b3_walk(nd) {
     T_TERNARY  { cg_b3_walk(n.a); cg_b3_walk(n.b); cg_b3_walk(n.c); }
     T_CALL {
         // Inlined memory builtins (peek/poke) emit no call → keep the leaf budget.
-        if (cg_call_leaf_safe(n) == 0) { cg_fn_leaf = 0; }
+        if (cg_call_leaf_safe(n) == 0) {
+            cg_fn_leaf = 0;
+            // M3: count the call at its loop weight — the caller-saved
+            // save/restore wrap around it will execute this many times.
+            w = 1;
+            if (cg_b3_loop_depth > 0) { w = 1000; }
+            cg_fn_call_wt = cg_fn_call_wt + w;
+        }
         arr = n.b; cnt = n.c;
         for (i = 0; i < cnt; i++) { cg_b3_walk(arr[i]); }
     }
@@ -2603,6 +2616,7 @@ void cg_emit_func(fi) {
     // true and is cleared by any T_CALL the walk meets; a leaf function lets the
     // chip widen its promotion pool into caller-saved registers.
     cg_fn_leaf = 1;
+    cg_fn_call_wt = 0;
     // Expose the function body + reset the induction state so the pointer-walk
     // pass (cg_iv_detect) can scan the whole function for unsafe base uses.
     cg_cur_body = body_arr;

@@ -547,6 +547,19 @@ static _a64_b3_reg_at(slot) {
     return -1;
 }
 
+// M3 cost model: is a caller-saved promotion worth `refs` loop-weighted
+// references? The promotion pays one save + one restore around EVERY
+// call the function makes (2 * cg_fn_call_wt weighted executions), so
+// it only wins when the references it turns into register hits outweigh
+// that wrap traffic. Both sides use the same 1000x loop weighting, so
+// the comparison is in one currency. Leaf functions have no calls and
+// therefore no wrap cost — always worth it.
+_a64_caller_saved_worth(refs) {
+    if (cg_fn_leaf) { return 1; }
+    if (refs > cg_fn_call_wt * 2) { return 1; }
+    return 0;
+}
+
 // Route one promoted register to its save list: callee-saved (x19..x28,
 // and the leaf-widened x9..x12 in leaf functions, where no call can
 // clobber them) go to a64_promoted_regs and are saved once in the
@@ -587,6 +600,14 @@ void _a64_b3_select() {
             }
         }
         if (best_vi < 0) { return; }
+        // M3: once the budget reaches the caller-saved band (x9..x12 in
+        // a non-leaf function), each further promotion must beat the
+        // save/restore wrap it adds around every call. Candidates come
+        // out in descending ref order, so the first one that is not
+        // worth it ends the selection.
+        if (reg >= 9 && reg <= 15 && cg_fn_leaf == 0) {
+            if (_a64_caller_saved_worth(best_refs) == 0) { return; }
+        }
         arr_set(cg_var_promote, best_vi, reg);
         _a64_route_promoted(reg);
         _a64_b3_claim_freelist(reg);
@@ -625,7 +646,7 @@ void _a64_b3_select() {
 // every slot.
 _a64_regalloc_int_budget() { return 14; }
 _a64_regalloc_apply(assigns) {
-    auto n, i, asn: RegAssign, reg, nc, slot_seen, j;
+    auto n, i, asn: RegAssign, reg, nc, slot_seen, j, slot_refs;
     n = arr_struct_count(assigns);
 
     // Pass 1 (validate ONLY — no mutation yet).
@@ -671,17 +692,47 @@ _a64_regalloc_apply(assigns) {
     slot_seen = arr_new();
     j = 0;
     while (j < 64) { slot_seen = arr_push(slot_seen, 0); j++; }
+
+    // M3 pre-pass: total the loop-weighted references landing on each
+    // slot. The save/restore wrap is paid once per REGISTER, so the
+    // promote-or-not decision for a caller-saved slot weighs the SUM of
+    // every variable sharing it (a cold variable rides a slot a hot one
+    // already paid for) against the wrap cost.
+    slot_refs = arr_new();
+    j = 0;
+    while (j < 64) { slot_refs = arr_push(slot_refs, 0); j++; }
+    i = 0;
+    while (i < n) {
+        asn = arr_struct_at(assigns, i);
+        if (asn.slot >= 0) {
+            arr_set(slot_refs, asn.slot,
+                arr_get(slot_refs, asn.slot) + arr_get(cg_var_refs, asn.var_idx));
+        }
+        i++;
+    }
+
+    auto worth;
     i = 0;
     while (i < n) {
         asn = arr_struct_at(assigns, i);
         if (asn.slot >= 0) {
             reg = _a64_b3_reg_at(asn.slot);
-            arr_set(cg_var_promote, asn.var_idx, reg);
-            if (arr_get(slot_seen, asn.slot) == 0) {
-                arr_set(slot_seen, asn.slot, 1);
-                _a64_route_promoted(reg);
+            // M3: refuse a caller-saved slot whose combined references
+            // do not beat the per-call wrap it would add. The variable
+            // simply stays in memory (cg_var_promote already reset to
+            // -1 above) — always the safe fallback.
+            worth = 1;
+            if (reg >= 9 && reg <= 15 && cg_fn_leaf == 0) {
+                worth = _a64_caller_saved_worth(arr_get(slot_refs, asn.slot));
             }
-            _a64_b3_claim_freelist(reg);
+            if (worth) {
+                arr_set(cg_var_promote, asn.var_idx, reg);
+                if (arr_get(slot_seen, asn.slot) == 0) {
+                    arr_set(slot_seen, asn.slot, 1);
+                    _a64_route_promoted(reg);
+                }
+                _a64_b3_claim_freelist(reg);
+            }
         }
         i++;
     }
@@ -816,6 +867,13 @@ void _a64_b3_select_const() {
             }
         }
         if (best_idx < 0) { return; }
+        // M3: a constant promoted into a caller-saved register pays the
+        // same per-call save/restore wrap a local does. Candidates come
+        // out heaviest-first, so the first one not worth the wrap ends
+        // constant promotion for this function.
+        if (reg >= 9 && reg <= 15 && cg_fn_leaf == 0) {
+            if (_a64_caller_saved_worth(best_wt) == 0) { return; }
+        }
         arr_set(cg_const_reg, best_idx, reg);
         _a64_route_promoted(reg);
         _a64_b3_claim_freelist(reg);

@@ -15700,3 +15700,40 @@ x29-touches went 60 → 342 across its 34 call sites). Hot loops are call-free,
 so the catalog holds — but that trade is exactly what M3's cost model must
 gate before M2 can be called complete: weigh loop-weighted ref savings
 against 8 bytes of save/restore per call site the live range crosses.
+
+## 2026-07-09 (later) — M3: the cost model that pays for M2's wraps
+
+M2 shipped promoting into caller-saved registers whenever there was demand;
+the honest cost note in its commit — png_decode_to_buf's x29-touches going
+60 → 342 across 34 call sites — was the measured bill. M3 (`_a64_caller_saved_worth`)
+is the gate that decides when that bill is worth paying, and it shipped the
+same day the bill was recorded.
+
+The model: a caller-saved promotion pays one save + one restore around EVERY
+call the function makes. The spine now counts real calls at loop weight
+(`cg_fn_call_wt`, 1000x inside loops — the same currency `cg_var_refs` uses),
+and the three a64 routing points (`_a64_b3_select`, `_a64_regalloc_apply`,
+`_a64_b3_select_const`) promote into x9..x12 only when refs > 2 × call_wt.
+In the linear-scan apply the gate is per SLOT, not per variable — the wrap is
+paid per register, so a cold variable rides a slot a hot one already paid for.
+Selection is descending-order in both selectors, so the first candidate not
+worth the wrap ends the band cleanly.
+
+Measured: png_decode_to_buf 342 → 78 x29-touches (the call-dense regression
+gone), tga passes, native suite 240/0/12, gen2==gen3, x64 Docker self-host
+gen1==gen2, conv checksum intact.
+
+The catalog re-run produced the day's best trap: manylive read 14% slower
+under M3 — with an INSTRUCTION-IDENTICAL kernel (the diff shows only
+addresses). The M2 build's hot loop head had landed on a 64-byte boundary by
+pure layout luck (0x2f840 % 64 == 0); M3's smaller wrap code shifted it 4
+bytes off. A 20M-iteration tight loop turns fetch-phase into 14%. Lesson
+recorded twice over: (a) compare INSTRUCTIONS before believing a benchmark
+delta between compiler builds — layout luck is real and larger than most
+optimizations; (b) loop-head alignment is a genuine future lever (gcc/LLVM
+p2align loop tops precisely to kill this class of noise; b++ emits linearly).
+
+Also recorded: the model is function-level. The live-range refinement — wrap
+only the registers LIVE at a given call, charge only the calls a range
+actually crosses — needs interval-vs-callsite positions at emit time and is
+designed into M4 rather than bolted on here.

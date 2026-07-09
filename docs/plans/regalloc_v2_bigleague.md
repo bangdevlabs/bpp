@@ -187,9 +187,26 @@ big-league general-quality investment, not a hot-path fix.
   with >1 assign (a split) or two vars mapped to the same slot/reg, and either
   tighten the split refusal or make the apply consistent. The spill mechanics are
   NOT the bug (confirmed earlier); the ASSIGNMENT is. Reverted to Step 1.
-- **M3 — the cost model.** Extend B3/RegAlloc to CHOOSE caller-saved (with
-  spilling) vs callee-saved vs memory per value, by the measured trade-off. This
-  is where the general-quality win lands.
+- **M3 — the cost model. SHIPPED 2026-07-09.** Function-level gate at the three
+  caller-saved routing points: promote into x9..x12 (non-leaf) only when the
+  loop-weighted references beat twice the loop-weighted call count
+  (`_a64_caller_saved_worth`: refs > 2 * cg_fn_call_wt — one save + one restore
+  around every call, both sides in the same 1000x currency; the spine counts
+  real calls at loop weight in cg_b3_walk's T_CALL). In `_a64_regalloc_apply`
+  the gate is PER SLOT (the wrap is paid per register, so a cold variable rides
+  a slot a hot one already paid for). Measured: png_decode_to_buf x29-touches
+  342 -> 78 (the M2 call-dense regression killed) while the catalog holds.
+  Two findings recorded en route: (a) manylive showed a 14% swing purely from
+  LOOP-HEAD ALIGNMENT (the M2 build's hot loop landed on a 64-byte boundary by
+  luck, the M3 layout shifted it 4 bytes off — instruction-identical disasm) —
+  a real future lever: gcc/LLVM align loop tops to 16/32B, b++ emits linearly;
+  (b) the model is function-level, not live-range-level — the honest refinement
+  (wrap only the regs LIVE at each call, cost only the calls a range CROSSES)
+  needs interval-vs-callsite positions at emit time and belongs to M4's design.
+  Known approximation: the linear scan may assign a hot var a caller-saved slot
+  where B3 would have used callee-saved; the gate then refuses it entirely
+  instead of re-slotting (safe fallback = memory, never wrong, occasionally
+  conservative).
 - **M4 — float.** Same for float cross-call values (x64: no callee-saved xmm, so
   caller-saved spilling is the ONLY way to keep a float live across a call in a
   register — this also finally gives x64 cross-call float promotion, closing the
