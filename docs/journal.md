@@ -15827,3 +15827,17 @@ in-register), plus a malloc/mmap path through the syscall wrap. a64 outputs
 byte-identical, bootstrap PASS, native suite 240/0/12, x64 Docker self-host
 gen1==gen2. The M2 row now reads parity — band width differing only by ABI
 headroom (a64 +4, x64 +2), which is the honest kind of difference.
+
+## 2026-07-09 (handoff) — the thread picks back up where it was cut
+
+Archaeology on the user's hunch ("tinha uma última coisa nos dois backends
+antes da paridade") found it precisely: the surpass-gcc-O2 arc
+(docs/plans/surpass_gcc_o2_arc.md, opened 07-07). M1a — the --fast-math
+flag — shipped that same day (`ba83e28`); M1b — the reduction-reassociation
+transform, spec'd to "EVERYTHING RESOLVED, ready to build as a focused
+~150-line increment" — was interrupted the next morning by the parity
+journey. The poetry: that journey ended up DELIVERING the plan's own M2
+(x64 float codegen), and RegAlloc M4 went further than the plan asked
+(non-leaf floats too). The xmm11..14 pool was sized for exactly this
+transform. M1b is now a both-backends-day-one increment; the plan carries
+a status banner saying so, and the next session starts there.

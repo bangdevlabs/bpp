@@ -1,5 +1,16 @@
 # Plan — surpass gcc -O2 on FP reductions (multi-accumulator reassociation + x64 float)
 
+> **STATUS 2026-07-09 — M1b IS THE NEXT COMPILER MISSION.** M1a (the
+> `--fast-math` flag) shipped 07-07 (`ba83e28`); then the backend-parity
+> journey (int-CIP → float-CIP → RegAlloc v2 M1..M4 + M2-x64) interrupted
+> this arc — and ended up DELIVERING this plan's own M2: x64 float-CIP +
+> float-B3 shipped 07-07, and the RegAlloc M4 caller-saved band now even
+> covers non-leaf floats. The xmm11..14 pool was sized for exactly this
+> transform. So M1b (the ~150-line AST pass below, spec fully resolved)
+> now benefits BOTH backends the day it lands. Everything in the
+> "Implementation notes" section remains valid; start with the
+> float-typed synth local in isolation, per the risk note.
+
 **Opened 2026-07-07.** After S1+S2 closed the FP-serial gap to PARITY (conv
 1.02× gcc -O2, bit-exact), a hand-written experiment showed the milestone the
 user asked for is real and measured: a 4-accumulator FIR runs **33 ms vs gcc
