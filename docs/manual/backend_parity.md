@@ -47,7 +47,8 @@ always confirm a codegen change with the Docker self-host (`gen1 == gen2`).
 | Constant promotion (Stage 2a) | ✅ x19..x28 | ✅ rbx/r12..r15 | parity (`emit_mov_phys`) |
 | Wider B3 budget — caller-saved promotion in leaf fns | ✅ x9..x12 (10→14) | ❌ (keeps 5) | **a64 only** |
 | Induction-variable pointer walk (`base[i]` → walking reg) | ✅ | ❌ `iv_supported`=0 (no post-index) | **a64 only** |
-| RegAlloc v2 (liveness → linear-scan; shares one reg across non-overlapping live ranges + sees through inlined call sites) | ✅ int + float | ✅ int (2026-07-08, M1); float declined | int: parity (M1 — measured emit_node 676→137 frame accesses); float: **architectural** (no callee-saved XMM band). Caller-saved spilling (M2+) = big-league general quality, see `docs/plans/regalloc_v2_bigleague.md` |
+| RegAlloc v2 (liveness → linear-scan; shares one reg across non-overlapping live ranges + sees through inlined call sites) | ✅ int + float | ✅ int (2026-07-08, M1); float declined | int: parity (M1 — measured emit_node 676→137 frame accesses); float: **architectural** (no callee-saved XMM band). See `docs/plans/regalloc_v2_bigleague.md` |
+| ↳ M2 caller-saved spilling (locals promoted into x9..x12 in non-leaf fns, saved/restored around each call site) | ✅ (2026-07-09) | ❌ (x64 has no clean caller-saved GP band; r11/r8/r9 are the expression freelist) | **a64 only** — manylive 1.44x→1.26x, biquad/lcg now beat gcc -O2; M3 cost model must gate the per-call wrap cost in call-dense fns before M4 |
 | `fmov d, #imm` for AArch64-encodable float constants (1 insn) | ✅ | n/a | a64 closing its OWN 3-insn `adrp+add+ldr` cost for encodable consts; x64 already loads ANY float const in one `movsd [rip]`, so x64 is *ahead* on non-encodable constants |
 
 ## Bottom line for a port
