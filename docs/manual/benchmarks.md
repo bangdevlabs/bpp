@@ -1000,3 +1000,51 @@ now would chase a gap the measurement says does not exist. The FP-serial arc is
 **closed at parity** (biquad 0.97× since Phase 1, conv 1.02× after S1+S2), with
 S3 available if a future workload (an FFT butterfly bank) ever shows a real
 scheduling-bound gap the fmadd chain cannot cover.
+
+## 2026-07-09 — full catalog re-run after the RegAlloc v2 completion day (M2/M3/M4/M2-x64 + loop alignment + growable buffers) — with a -O3 oracle study
+
+The standing discipline, run at the close of the biggest codegen day since
+the parity arc: caller-saved spilling on both chips (a64 x9..x12, x64 r8/r9
++ xmm11..14), the M3 cost model, 16-byte loop-head alignment, growable code
+buffers, and the two latent x9-clobber fixes. Process per this doc:
+min-of-5 interleaved runs, checksums on every kernel, binary identity via
+`bench_compile.sh`, audio md5 as the noise-robust correctness signal.
+
+This run also adds a **`-O3` oracle column** as a one-off study (user
+question: "what does -O3 mean, should we fear it?"). Method: the same
+`bpp --c` output built `cc -O3` alongside `cc -O2`.
+
+| Benchmark | ours (min-5) | gcc -O2 (min-5) | gcc -O3 (min-5) | Verdict |
+|---|---|---|---|---|
+| `bench_compile.sh` bootstrap | 0.34s min | — | — | historical band (0.29-0.35) |
+| `bench_codegen` biquad | 42.4 ms | 41.9 | 41.7 | **1.01× parity** |
+| `bench_codegen` lcg | 18.5 ms | 18.2 | 18.2 | **1.02× parity** |
+| `bench_codegen` xform | 6.85 ms | 6.27 | 6.19 | 1.09×, band |
+| `bench_codegen` manylive | 103.1 ms | 74.3 | 73.6 | 1.39×, band (1.24-1.72) |
+| `bench_conv` (1024-tap FIR) | 86 ms | 82 | 83 | **1.05× parity**, checksum 2412 exact |
+| `sf_bench` (stereo, REAL workload) | 245× rt (~12.2 ms) | 647× rt | — | ~2.6×, band (machine under load) |
+| `sf_bench_flat` | 604× rt (4962 µs) | — | — | band |
+| `bench_compose` | 3×, PASS | — | — | unchanged |
+| `bench_simd_raw` | checksums exact | — | — | unchanged |
+| `bench_outline` | 6× vs serial, 102% vs explicit | — | — | healthy |
+| `bench_stbflow` | 4×, PASS | — | — | band |
+| `bench_ecs_iter` / `physics` / `scheduler` | OK / PASS / PASS | — | — | unchanged |
+| `bench_ecs_sparse_query` | first run FAILed the 2.5× 10%-bucket gate, immediate re-run 13.3× OK | — | — | the exact noise-floor edge documented 2026-07-05; not a regression |
+| `bench_autovec_gate.sh` (repo `./bug` on PATH) / `bench_mixed_auto.sh` | PASS / PASS | — | — | — |
+| `tablah` / `tablah_opt` | 24544 filtered both | — | — | unchanged |
+| audio md5 | `f61fac72be5077a6e9ef9cae21dde2a1` | — | — | **exact** |
+
+**Honest correction recorded:** the M2-day claim "biquad 0.87× / lcg 0.86×
+BEAT gcc -O2" was a single-run reading; this min-of-5 interleaved run says
+**parity** (1.01-1.02×). The doc's own ±15% noise philosophy applies to our
+own headlines too.
+
+**The -O3 study's conclusion:** across the entire catalog, **-O3 ≈ -O2**
+(deltas 0-1.4%, inside noise). Our kernels are serial/latency-bound, so
+-O3's extra weapons (aggressive vectorization cost model, function cloning,
+loop peeling) have nothing to bite. Both -O2 and -O3 preserve FP semantics
+bit-exactly, so either would be a fair oracle — -O2 stays ours because it is
+the industry reference (what distros actually ship) and the stable
+conventional bar. The real step above -O2 is `-Ofast` (= -O3 + -ffast-math),
+which trades float results for speed — the exact trade b++ refused by design
+the same day (see docs/plans/legacy/surpass_gcc_o2_arc.md).
