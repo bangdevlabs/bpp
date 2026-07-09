@@ -15737,3 +15737,56 @@ Also recorded: the model is function-level. The live-range refinement — wrap
 only the registers LIVE at a given call, charge only the calls a range
 actually crosses — needs interval-vs-callsite positions at emit time and is
 designed into M4 rather than bolted on here.
+
+## 2026-07-09 (closing) — M4 ships and the RegAlloc v2 arc closes at the big-league bar
+
+M4 — cross-call float promotion via caller-saved spilling — went in as two
+verified increments the same way M2 should have gone in the first time:
+step 1 (`69f63b1`) the mechanism on BOTH chips, proven byte-identical on
+both backends before activation; step 2 (`0cf5286`) the x64 activation.
+
+The x64 story is the whole point. SysV gives x86-64 ZERO callee-saved xmm
+registers, which is why backend_parity.md carried "no cross-call float"
+as an architectural gap since the float-CIP arc. It never was architectural
+— it was a mechanism gap: save the promoted xmm around each call site and
+the register survives the call without any callee-saved bank.
+`_x64_b3_select_float` now promotes in non-leaf functions, every pick gated
+by the M3 cost model — and the policy formula moved to the spine
+(`cg_caller_saved_worth`, Disciplina QG: one definition, both chips'
+routing call it), with a64's helper reduced to a thin alias. a64's own
+float band stays empty by design: callee-saved d8..d15 already covers
+cross-call floats there, and no measured workload has overflowed eight
+slots — the machinery honors the spine contract and waits for a real
+driver.
+
+Proof of the close: a non-leaf float accumulator kernel (the shape that was
+impossible on x64 — the accumulator must survive a call every iteration)
+runs bit-exact between a64 native and x64 under Docker, and the x64 disasm
+shows exactly the promised shape: `acc` living in xmm11, one movsd save
+before the call, one movsd reload after, addsd accumulating in-register.
+Bootstrap PASS via tests/test_bootstrap_stable.sh, native suite 240/0/12,
+x64 Docker self-host gen1==gen2, a64 outputs byte-identical (the activation
+touches only the x64 selector).
+
+Discipline notes from the day's course-correction: verification now goes
+through the house scripts (test_bootstrap_stable.sh — fresh mktemp dir,
+four generations, no BPP_BUILD_ID crutch — the hand-rolled /tmp cmp checks
+produced a false-divergence ghost earlier in this arc), and source edits go
+through surgical replaces, not global ones (a global replace CAUSED the M2
+route-helper recursion). The manuals were re-read start to finish before
+M4; the tonify pass (Rule 14 compound assignment, Rule 2 static) landed as
+its own commit (`2938088`) before the M4 work, per Three Disciplines #1.
+
+Watch item recorded, not chased: test_dsp_param_safety segfaults
+NONDETERMINISTICALLY on x64/Rosetta (exit 0 on one run, 139 on the next,
+same binary — and identically on pre-M4 compilers). Pre-existing, likely
+uninitialized-memory-or-Rosetta class, deserves its own session with the
+bug debugger rather than a footnote fix here.
+
+The arc scoreboard: M1 register sharing (measured -64..-80% frame traffic),
+M2 caller-saved int spilling (manylive 1.44x → 1.26x, biquad/lcg beating
+gcc -O2), M3 the cost model that pays for M2's wraps (png_decode 342 → 78),
+M4 cross-call float closing x64's last float gap. RegAlloc v2 as planned in
+the scaffolding-taxonomy session is COMPLETE; what remains beyond it is the
+live-range-level wrap refinement (designed into the plan) and the separate
+compilation arc, still unstarted.

@@ -207,10 +207,23 @@ big-league general-quality investment, not a hot-path fix.
   where B3 would have used callee-saved; the gate then refuses it entirely
   instead of re-slotting (safe fallback = memory, never wrong, occasionally
   conservative).
-- **M4 — float.** Same for float cross-call values (x64: no callee-saved xmm, so
-  caller-saved spilling is the ONLY way to keep a float live across a call in a
-  register — this also finally gives x64 cross-call float promotion, closing the
-  one "architectural" float gap through spilling instead of callee-saved regs).
+- **M4 — float. SHIPPED 2026-07-09** (`69f63b1` mechanism + `0cf5286`
+  activation). Two new chip primitives (emit_save/restore_caller_saved_flt)
+  wrap every call, nested inside the int pair. x64: `_x64_b3_select_float`
+  promotes in NON-leaf functions too — each pick M3-gated
+  (cg_caller_saved_worth, now a SPINE function shared by both chips'
+  routing) and pushed to x64_caller_saved_promoted_flt; the band sits one
+  word below the B3 int spills with the same -(i+1)*8 convention. a64: the
+  machinery exists but the band stays EMPTY by design (callee-saved d8..d15
+  already covers cross-call floats; no measured pressure driver). Proof:
+  non-leaf float accumulator kernel bit-exact a64-native vs x64-Docker,
+  disasm shows acc in xmm11 + movsd wrap; a64 byte-identical; bootstrap
+  PASS; suite 240/0/12; x64 self-host gen1==gen2. THE former "architectural"
+  x64 cross-call float gap is CLOSED. Remaining refinement (designed, not
+  built): live-range-level wraps — save only the regs LIVE at a given call,
+  charge only the calls a range crosses; needs interval-vs-callsite
+  positions at emit time. Watch item: test_dsp_param_safety flaky segfault
+  on x64/Rosetta, PRE-existing (same on pre-M4 compilers), separate hunt.
 
 ## Gate + measurement per increment
 

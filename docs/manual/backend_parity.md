@@ -48,7 +48,8 @@ always confirm a codegen change with the Docker self-host (`gen1 == gen2`).
 | Wider B3 budget — caller-saved promotion in leaf fns | ✅ x9..x12 (10→14) | ❌ (keeps 5) | **a64 only** |
 | Induction-variable pointer walk (`base[i]` → walking reg) | ✅ | ❌ `iv_supported`=0 (no post-index) | **a64 only** |
 | RegAlloc v2 (liveness → linear-scan; shares one reg across non-overlapping live ranges + sees through inlined call sites) | ✅ int + float | ✅ int (2026-07-08, M1); float declined | int: parity (M1 — measured emit_node 676→137 frame accesses); float: **architectural** (no callee-saved XMM band). See `docs/plans/regalloc_v2_bigleague.md` |
-| ↳ M2 caller-saved spilling (locals promoted into x9..x12 in non-leaf fns, saved/restored around each call site) | ✅ (2026-07-09) | ❌ (x64 has no clean caller-saved GP band; r11/r8/r9 are the expression freelist) | **a64 only** — manylive 1.44x→1.26x, biquad/lcg now beat gcc -O2; M3 cost model must gate the per-call wrap cost in call-dense fns before M4 |
+| ↳ M2 caller-saved spilling (locals promoted into x9..x12 in non-leaf fns, saved/restored around each call site) | ✅ (2026-07-09) | ❌ int side (no clean caller-saved GP band; r11/r8/r9 are the expression freelist) | **a64 only for int** — manylive 1.44x→1.26x, biquad/lcg now beat gcc -O2; gated by the M3 cost model (refs > 2× loop-weighted call count, policy shared in the spine) |
+| ↳ M4 cross-call FLOAT promotion via caller-saved spilling (xmm11..14 / d-band saved around each call) | ✅ machinery (band empty by design — callee-saved d8..d15 already covers cross-call floats) | ✅ (2026-07-09) | **closes the former "architectural" x64 float gap**: SysV has no callee-saved xmm, so the per-call wrap is the only way x86-64 keeps a float in a register across a call — proven bit-exact vs a64 on a non-leaf accumulator kernel, M3-gated |
 | `fmov d, #imm` for AArch64-encodable float constants (1 insn) | ✅ | n/a | a64 closing its OWN 3-insn `adrp+add+ldr` cost for encodable consts; x64 already loads ANY float const in one `movsd [rip]`, so x64 is *ahead* on non-encodable constants |
 
 ## Bottom line for a port
@@ -77,6 +78,10 @@ missing work. Re-deriving them wastes time; the answer is recorded here.
 
 - **No callee-saved XMM → no CROSS-CALL float-B3, and no `fmadd`.** SysV makes
   ALL `xmm0..15` caller-saved (Win64 keeps `xmm6..15`; this is the divergence).
+  **CORRECTED AGAIN 2026-07-09 — the cross-call half is CLOSED.** RegAlloc M4
+  keeps a float in xmm11..14 ACROSS calls by spilling it around each call site
+  (the caller-saved wrap, M3 cost-gated) — no callee-saved xmm needed. What
+  remains architectural in this bullet is only the `fmadd` note below.
   **CORRECTED 2026-07-07 — the "no float CIP / float-B3" claim was too strong.**
   The a64-STYLE win (promoting floats into *callee-saved* d8..d15 so they survive
   calls) has no x64 target, true. But that only blocks promotion across CALLS. In
