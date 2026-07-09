@@ -1927,6 +1927,20 @@ static _dsp_prescan_find_main_idx() {
     return -1;
 }
 
+// The T_CALL node the prescan injected into main, so the end of
+// dispatch can NEUTRALIZE it (flip to T_NOP) when no candidate ever
+// turned into a worker-pool call. The prescan's own gate (any @safe
+// loop host exists) is deliberately weaker than the real outline
+// gates that run later, so a binary full of @safe DSP helpers that
+// outlines NOTHING used to start 4 worker threads it never submits
+// to — pure waste on macOS and a startup crash on the Linux target,
+// whose thread infra is the documented not-yet-ported piece (the
+// "concurrency-infra-macos-only" suite-skip family; found hunting
+// test_dsp_param_safety's nondeterministic x64/Rosetta segfault).
+// 0 = prescan injected nothing (user has an explicit freeze call, or
+// no @safe host exists).
+global _dsp_prescan_ji_node;
+
 // Entry point — called once, right before `call_graph_build`, from
 // both the modular and monolithic pipelines in bpp.bpp.
 void prescan_inject_job_init() {
@@ -1991,6 +2005,9 @@ void prescan_inject_job_init() {
     }
     *(fn_rec + FN_BODY) = new_body;
     *(fn_rec + FN_BCNT) = body_cnt + 1;
+    // Remember the injected node so the end of dispatch can neutralize
+    // it when nothing ever outlines (see _dsp_prescan_ji_node's header).
+    _dsp_prescan_ji_node = call_node;
     // No fn_calls edge-wiring here on purpose: call_graph_build's own
     // per-function walk (which runs right after this returns) will
     // visit the injected call naturally while it walks main()'s body
@@ -5964,6 +5981,20 @@ void rewrite_dispatch_loops() {
     // here — it needs no worker pool at all.
     if (_any_dispatched > 0 && _dsp_has_freeze == 0 && _dsp_main_idx >= 0) {
         _dsp_auto_init_job_pool();
+    }
+
+    // The prescan injected a job_init(N) into main on a WEAK gate (any
+    // @safe loop host exists) so the callgraph would keep the pool
+    // reachable. If dispatch just finished and NO candidate actually
+    // turned into a worker-pool call, that startup pool would spawn
+    // threads nothing ever submits to — neutralize the injected call.
+    // (_dsp_has_freeze == 1 whenever the prescan injected, because the
+    // freeze detector sees the prescan's own call — so this is the ONLY
+    // gate that can retire it.)
+    if (_any_dispatched == 0 && _dsp_prescan_ji_node != 0) {
+        auto _pji: Node;
+        _pji = _dsp_prescan_ji_node;
+        _pji.ntype = T_NOP;
     }
 
     // Rebuild reachability. Seeds include every address-taken
