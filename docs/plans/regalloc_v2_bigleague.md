@@ -224,6 +224,28 @@ big-league general-quality investment, not a hot-path fix.
   charge only the calls a range crosses; needs interval-vs-callsite
   positions at emit time. Watch item: test_dsp_param_safety flaky segfault
   on x64/Rosetta, PRE-existing (same on pre-M4 compilers), separate hunt.
+  [Both closed 2026-07-10 — the wraps refinement shipped as M5 below, and
+  the "flaky segfault" watch item was a deterministic float-CIP gate
+  off-by-one, fixed in `154f317`.]
+- **M5 — live-range wrap masks. SHIPPED 2026-07-10** (`5f14566` mechanism
+  byte-identical + `e3a5ae1` activation). The refinement's first half:
+  regalloc_stamp_call_masks walks the CFG in the interval position
+  numbering and stamps each T_CALL node with a bitmask of the band
+  entries whose occupant is live at that statement; cg_emit_call passes
+  the mask to the chip save/restore primitives, which skip dead entries.
+  The spine mirrors band occupancy via cg_caller_band_note at the chips'
+  routing sites (promoted constants note var -1 = always live); every
+  unknown — unstamped call, splice clone, refused apply, occupant without
+  an interval — defaults to the full wrap, so masking only ever removes
+  saves liveness disproves. Measured: _png_unfilter 38→32 x29-touches;
+  png_decode_to_buf honestly unchanged (its M3 survivors ARE live across
+  its calls); sf_bench A/B alternating min-of-5 equal. NOT yet built (the
+  second half): charging only the calls a range CROSSES in the M3 cost
+  model itself — the promotion gate still weighs refs against the
+  function-wide call count, so a variable dead around most calls pays the
+  full-function price at promotion time even though emission no longer
+  wraps it there. That refinement wants a per-interval crossed-call
+  weight computed from the same stamp walk.
 
 ## Gate + measurement per increment
 

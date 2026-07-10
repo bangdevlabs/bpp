@@ -15947,3 +15947,52 @@ context was the binding constraint; its design notes stand in the
 regalloc plan, and the day's finding that inline syscalls bypass
 cg_emit_call is exactly the class of callsite-enumeration mismatch its
 implementation must survive.
+
+## 2026-07-10 — the spring-segv falls, and the wraps learn liveness
+
+Two missions from the handoff's ranked list, both closed.
+
+**The spring-segv (frontier 4a) — a codegen bug all along (`154f317`).**
+The handoff's repro recipe ran exactly as written: core dump via docker
+--privileged, NT_SIGINFO + NT_PRSTATUS parsed with python, guest
+registers read off the Rosetta translator state. The "wild RIP
+0xeffff7de6a40" from the last hunt turned out to be Rosetta's own x16
+(a translation-cache pointer, a red herring); the real faulting address
+was NT_SIGINFO's si_addr = guest R11 — and the number was EXACTLY the
+sum of two heap pointers. `bug --disasm spring_process` read the rest:
+`mov r11, [rbp-0x70]; mov rdi, 0x8; add r11, r15; movsd xmm8, [r11]` —
+a struct-field float load whose offset went to ONE garbage register
+while the add read ANOTHER, both lowerings of int_temp_alloc() == -1
+(the core's guest RDI still held the orphaned 8, sealing it). Root
+cause: cg_float_tree_need's T_MEMLD gate tested `ineed > count` where
+the emit borrows one extra temp for the address register — the exact
+off-by-one the peekfloat sibling gate had already been fixed for. On
+x64 the hole opened once spring_process became a fully-inlined leaf
+(B3 leaf widening claims r8/r9, pool drops to r11 alone; ineed == count
+== 1 passed). The fix is one character (`>` → `>=`) plus the war-story
+comment. Was 2/20 in Docker, now 20/20; a64 corpus 6/6 byte-identical;
+the flaky-test watch item is retired. The lesson that keeps paying:
+the constant-wild-address + context-dependence smelled like memory
+corruption for two sessions, and was a deterministic miscompile whose
+trigger register (the caller's stale r15) just varied with heap layout.
+
+**Live-range wrap masks (arc 2) — shipped in the two-step discipline
+(`5f14566` mechanism byte-identical 10/10, `e3a5ae1` activation).**
+The M2/M4 wrap saved the whole caller-saved band at every call; now
+each T_CALL node is stamped (hash, node ptr → mask) with the band
+liveness at its statement position, computed from the SAME intervals
+and RPO numbering the linear scan already builds, and the chip
+save/restore primitives skip provably-dead entries. The spine mirrors
+each chip's band occupancy ((reg, var) pairs noted at the three routing
+sites; promoted constants note var -1 = always live), so the mask can
+only ever REMOVE a save liveness disproves — every unknown (unstamped
+call, splice clone, refused apply, missing interval) defaults to the
+full wrap. Measured: _png_unfilter 38 → 32 x29-touches;
+png_decode_to_buf unchanged at 78 because its M3-gated survivors ARE
+live across its calls — the mask being honest in both directions.
+sf_bench A/B alternating min-of-5: equal within noise. Full ladder
+green: gen2==gen3, native 240/0/12, C-emit 198/0/54, Docker x64
+self-host, DSP test 10/10, md5 f61fac72… intact.
+
+Next from the handoff: the separate-compilation arc (mission 1) opens
+with a clean slate.
