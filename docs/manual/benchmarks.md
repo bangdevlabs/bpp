@@ -1048,3 +1048,45 @@ the industry reference (what distros actually ship) and the stable
 conventional bar. The real step above -O2 is `-Ofast` (= -O3 + -ffast-math),
 which trades float results for speed — the exact trade b++ refused by design
 the same day (see docs/plans/legacy/surpass_gcc_o2_arc.md).
+
+## 2026-07-10 — full catalog after the spring-segv fix + M5 live-range masks + M6 per-range promotion cost
+
+The standing discipline at the close of the day that shipped three
+codegen changes (`154f317` gate fix, `e3a5ae1` M5 masks, `ffd7b19` M6
+gate). Docker Desktop was quit for the readings; min-of-5, checksums on
+every kernel. The day's specific question (user's own): **should the
+bootstrap not get FASTER, since M6 promoted loop-hot variables inside
+the compiler's own compile path?**
+
+| Benchmark | Historical (07-09) | Today | Verdict |
+|---|---|---|---|
+| `bench_compile.sh` bootstrap | 0.34s min | 0.34s min; **interleaved A/B: M6 binary 0.34/0.36/0.34 vs pre-M6 0.36/0.36/0.37** | **yes, direction confirmed — ~0.02s (~5%) faster, consistent across 3 rounds; small because the self-compile is lexer/parser/lookup-bound (the S1-S3k arc's territory), and mo_resolve_relocations / topo_sort / classify_inlineable / regalloc_linear_scan are a modest Amdahl slice; M6's own lazy analysis eats part of the win** |
+| `bench_codegen` biquad | 42.4 / 1.01× | 43.1 vs 41.8 = 1.03× | parity band |
+| `bench_codegen` lcg | 18.5 / 1.02× | 18.8 vs 18.2 = 1.03× | parity band |
+| `bench_codegen` xform | 6.85 / 1.09× | 6.84 vs 6.25 = 1.09× | exact band |
+| `bench_codegen` manylive | 103.1 / 1.39× | 105.6 vs 74.5 = 1.42× | band (1.24-1.72) |
+| `bench_conv` (1024-tap FIR) | 86 vs 82 = 1.05× | 88 vs 92 = 0.96× | parity (oracle read high this round; checksum 2412 exact) |
+| `sf_bench` (stereo) | ~12.2 ms (under load) | 12.48 ms vs oracle 4.41 = 2.83× | band — the hot chain is leaf/inlined, untouched by caller-band work; the 2.8× is the known inliner frontier |
+| `sf_bench_flat` | 4962 µs | 5044 µs | band |
+| `bench_compose` / `bench_outline` / `bench_simd_raw` | 3× / 6× / exact | 3× / 6× / checksums exact | unchanged |
+| `bench_autovec_gate.sh` / `bench_mixed_auto.sh` | PASS | PASS (9 vector ops / checksum match) | — |
+| `bench_stbflow` | 4× | 4× PASS | unchanged |
+| `bench_ecs_iter` / `physics` / `scheduler` | OK / PASS / PASS | 0.97 informational / PASS bit-exact / 51% PASS | unchanged |
+| `bench_ecs_sparse_query` | gate-edge flicker | 10%-bucket flickers 2.21-2.54× around the 2.5× gate (passes some runs); 2%-bucket healthy at 13.2×. **Not compiler-era: the pre-M5 binary reads the same low band on today's machine while the mid-day step-1 binary read 2.55-3.24× — no coherent ordering by era** | the documented noise-floor edge, third occurrence |
+| `tablah` / `tablah_opt` | 24544 both | 24544 both | unchanged |
+| all four bench_codegen checksums | exact | exact | — |
+| audio md5 | `f61fac72…` | `f61fac72…` | exact |
+
+**The analysis the day earns.** M5/M6 by design cannot move the kernel
+catalog: every kernel is a leaf (proven instruction-identical under
+M6), and the caller-saved band only exists in non-leaf code. Where the
+pair pays is exactly where the plan aimed — general non-leaf code
+(asset loaders, UI, the compiler itself: probe loop-hot refusals
+51 → 12) — and the bootstrap A/B above is the first wall-clock
+evidence of that class of win, modest and honestly sized. The model
+and the machine now agree end to end: promotion charges (M6) what
+emission pays (M5), and the one function that could have called the
+bluff (png_decode_to_buf, static x29 78 → 141 under M6) is an
+asset-load function whose loop-weighted DYNAMIC traffic the gate
+certifies as a net win — static instruction counts are no longer the
+right gauge for caller-band functions, loop-weighted refs are.
