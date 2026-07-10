@@ -3711,6 +3711,115 @@ static _inline_stamp_nested(cloned, nested_ids, nk, owner_fidx) {
     return nk;
 }
 
+// ── Structured early returns inside a splice (inliner lever 1) ──────
+//
+// A `return` buried inside an inlined body used to jump to the CALLER's
+// epilogue (the Inc 7 corruption), so such bodies were disqualified
+// outright — which is exactly what walled off the transcendental family
+// once the 2026-07-03 totality guards prepended `if (cond) { return X; }`
+// clauses to exp_f / sin_f / log_f (see docs/plans/inliner_frontier_2.md).
+// The fix is structural: every splice carries an end-of-splice label and
+// a context frame; a T_RET met during body emission evaluates its
+// value(s) exactly the way the trailing return would — coerced to the
+// callee's declared type (value splice), discarded (void splice), or
+// stored into the caller-side targets (multi-assign splice) — and then
+// JUMPS to the end label instead of falling anywhere near an epilogue.
+// The guard's short-circuit is preserved by a real branch, so a body
+// whose guards exist to prevent non-termination (exp_f on ±inf) stays
+// correct — the reason a guard→ternary rewrite was rejected.
+//
+// The frames form a stack (splices nest via the nested-inline
+// architecture). cg_spl_early marks a frame whose body actually emitted
+// an early return: the value-splice tail then coerces its own trailing
+// expression to the declared type too, so every path reaching the end
+// label agrees on the accumulator's type.
+global cg_spl_lbl;       // end-of-splice label per active frame
+global cg_spl_kind;      // 0 = value, 1 = void, 2 = multi-assign
+global cg_spl_fidx;      // callee index (declared return type)
+global cg_spl_targets;   // kind 2: caller-side target node array
+global cg_spl_tcount;    // kind 2: target count
+global cg_spl_early;     // 1 = this frame emitted an early return
+
+static void _cg_splice_push(lbl, kind, fidx, targets, tcount) {
+    if (cg_spl_lbl == 0) {
+        cg_spl_lbl     = arr_new();
+        cg_spl_kind    = arr_new();
+        cg_spl_fidx    = arr_new();
+        cg_spl_targets = arr_new();
+        cg_spl_tcount  = arr_new();
+        cg_spl_early   = arr_new();
+    }
+    cg_spl_lbl     = arr_push(cg_spl_lbl, lbl);
+    cg_spl_kind    = arr_push(cg_spl_kind, kind);
+    cg_spl_fidx    = arr_push(cg_spl_fidx, fidx);
+    cg_spl_targets = arr_push(cg_spl_targets, targets);
+    cg_spl_tcount  = arr_push(cg_spl_tcount, tcount);
+    cg_spl_early   = arr_push(cg_spl_early, 0);
+}
+
+static void _cg_splice_pop() {
+    arr_pop(cg_spl_lbl);
+    arr_pop(cg_spl_kind);
+    arr_pop(cg_spl_fidx);
+    arr_pop(cg_spl_targets);
+    arr_pop(cg_spl_tcount);
+    arr_pop(cg_spl_early);
+}
+
+// Emit an early return met inside the current splice frame — the
+// splice-context twin of cg_emit_stmt's real T_RET handler. `n` is the
+// already-alpha-renamed clone (the prelude's statement loop cloned and
+// nested-stamped it before dispatching here), so its expressions emit
+// directly.
+static void _cg_splice_ret(nd) {
+    auto p: ChipPrimitives;
+    auto n: Node, top, kind, fidx, lbl, rty;
+    p = cg_prim;
+    n = nd;
+    top  = arr_len(cg_spl_lbl) - 1;
+    kind = arr_get(cg_spl_kind, top);
+    fidx = arr_get(cg_spl_fidx, top);
+    lbl  = arr_get(cg_spl_lbl, top);
+    arr_set(cg_spl_early, top, 1);
+    if (kind == 1) {
+        // Void splice: evaluate for side effects only, discard the value.
+        if (n.a != 0) { call(p.emit_node, n.a); }
+    } else if (kind == 2) {
+        // Multi-assign splice: store each result into its caller-side
+        // target — the same store discipline as the trailing loop in
+        // cg_emit_inline_multi_assign, coercing to the TARGET's type.
+        auto targets, tcount, k, rexprs, tnode: Node, tvi, toff, tis_f, rrty;
+        targets = arr_get(cg_spl_targets, top);
+        tcount  = arr_get(cg_spl_tcount, top);
+        rexprs  = n.b;
+        k = 0;
+        while (k < tcount) {
+            rrty = call(p.emit_node, *(rexprs + k * 8));
+            tnode = *(targets + k * 8);
+            tvi = cg_var_idx(tnode.a);
+            toff = arr_get(cg_var_off, tvi);
+            tis_f = cg_var_is_float(tvi);
+            if (tis_f) {
+                if (rrty == 0) { call(p.emit_promote_int_to_flt); }
+            } else {
+                if (rrty == 1) { call(p.emit_demote_flt_to_int); }
+            }
+            call(p.emit_store_var_typed, tvi, toff, tis_f);
+            k++;
+        }
+    } else {
+        // Value splice: leave the value in acc/d0 coerced to the CALLEE's
+        // declared return type, so every path into the end label agrees.
+        rty = call(p.emit_node, n.a);
+        if (is_float_type(get_fn_ret_type(fidx))) {
+            if (rty == 0) { call(p.emit_promote_int_to_flt); }
+        } else {
+            if (rty == 1) { call(p.emit_demote_flt_to_int); }
+        }
+    }
+    call(p.emit_jump, lbl);
+}
+
 // Single-value / void inline splice (Phase B2 + S4 P3b + VI-2 unified).
 // Thin wrapper over the shared prelude: binds args, splices every body
 // statement but the last, then finishes with the ONE shape this call site
@@ -3720,8 +3829,23 @@ cg_emit_inline_multi(call_node, fidx) {
     auto names_buf, args_buf, total_names, ret_stmt: Node;
     auto pp: ChipPrimitives;
     auto _inl_s, ret_clone, final_ety, is_void_splice, nested_ids, nk;
+    auto _spl_lbl, _spl_top, _pre_body, _pre_bcnt, _pre_last: Node, _pre_void;
+    auto inl_callee;
     pp = cg_prim;
     _inl_s = call(pp.cur_text_pos);   // .bug: text offset where this inlined body begins
+    // Early-return frame: pushed BEFORE the prelude (which emits the body
+    // statements where an early T_RET can fire). The splice kind (value
+    // vs void) is decided from the callee's own trailing statement.
+    inl_callee = funcs[fidx];
+    _pre_void = 0;
+    _pre_body = *(inl_callee + FN_BODY);
+    _pre_bcnt = *(inl_callee + FN_BCNT);
+    if (_pre_bcnt > 0) {
+        _pre_last = _pre_body[_pre_bcnt - 1];
+        if (_pre_last.ntype != T_RET) { _pre_void = 1; }
+    }
+    _spl_lbl = call(pp.emit_new_label);
+    _cg_splice_push(_spl_lbl, _pre_void, fidx, 0, 0);
     names_buf, args_buf, total_names, ret_stmt, nested_ids, nk = _cg_inline_splice_prelude(call_node, fidx);
     is_void_splice = (ret_stmt.ntype != T_RET);
     if (is_void_splice != 0) {
@@ -3734,7 +3858,24 @@ cg_emit_inline_multi(call_node, fidx) {
         ret_clone = ast_clone_subst(ret_stmt.a, names_buf, total_names, args_buf);
         nk = _inline_stamp_nested(ret_clone, nested_ids, nk, fidx);
         final_ety = call(pp.emit_node, ret_clone);
+        // If the body took an early return anywhere, every path must reach
+        // the end label with the SAME type in the accumulator — coerce the
+        // trailing value to the callee's declared return type, exactly as
+        // _cg_splice_ret coerced each early one.
+        _spl_top = arr_len(cg_spl_early) - 1;
+        if (arr_get(cg_spl_early, _spl_top) != 0) {
+            auto _spl_df;
+            _spl_df = is_float_type(get_fn_ret_type(fidx));
+            if (_spl_df) {
+                if (final_ety == 0) { call(pp.emit_promote_int_to_flt); }
+            } else {
+                if (final_ety == 1) { call(pp.emit_demote_flt_to_int); }
+            }
+            final_ety = _spl_df;
+        }
     }
+    call(pp.emit_label, _spl_lbl);   // early returns land here (0 bytes)
+    _cg_splice_pop();
     _bug_inl_record(_inl_s, call(pp.cur_text_pos), fidx);   // .bug: record this inlined range
     free(names_buf);
     free(args_buf);
@@ -3757,9 +3898,13 @@ cg_emit_inline_multi_assign(call_node, fidx, targets, tcount) {
     auto names_buf, args_buf, total_names, ret_stmt: Node;
     auto pp: ChipPrimitives;
     auto _inl_s, k, rexprs, rclone, rrty, tnode: Node, tvi, toff, tis_f;
-    auto nested_ids, nk;
+    auto nested_ids, nk, _spl_lbl;
     pp = cg_prim;
     _inl_s = call(pp.cur_text_pos);
+    // Early-return frame (kind 2): an early `return a, b, …;` stores into
+    // the caller-side targets and jumps here — see _cg_splice_ret.
+    _spl_lbl = call(pp.emit_new_label);
+    _cg_splice_push(_spl_lbl, 2, fidx, targets, tcount);
     names_buf, args_buf, total_names, ret_stmt, nested_ids, nk = _cg_inline_splice_prelude(call_node, fidx);
     rexprs = ret_stmt.b;
     k = 0;
@@ -3789,6 +3934,8 @@ cg_emit_inline_multi_assign(call_node, fidx, targets, tcount) {
         call(pp.emit_store_var_typed, tvi, toff, tis_f);
         k++;
     }
+    call(pp.emit_label, _spl_lbl);   // early returns land here (0 bytes)
+    _cg_splice_pop();
     _bug_inl_record(_inl_s, call(pp.cur_text_pos), fidx);
     free(names_buf);
     free(args_buf);
@@ -5315,6 +5462,13 @@ void cg_emit_stmt(nd) {
     // T_RET: evaluate return expression, coerce to the function's
     // declared return type, jump to the epilogue.
     if (t == T_RET) {
+        // Inside an inline splice this return belongs to the CALLEE — it
+        // must exit the splice (jump to its end label), never this
+        // function's epilogue. See _cg_splice_ret / the lever-1 block.
+        if (cg_spl_lbl != 0 && arr_len(cg_spl_lbl) > 0) {
+            _cg_splice_ret(n);
+            return 0;
+        }
         // Multi-value return `return e1, e2, …;` — integer slots fill
         // x0..x7, float slots fill d0..d7 independently (a slot's bank
         // position is its index among same-typed slots). Two passes keep
