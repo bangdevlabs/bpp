@@ -587,7 +587,7 @@ static _a64_b3_claim_freelist(reg) {
 }
 
 void _a64_b3_select() {
-    auto used, vi, n, best_vi, best_refs, reg;
+    auto used, vi, n, best_vi, best_refs, reg, is_caller;
     n = arr_len(cg_vars);
     arr_clear(a64_promoted_regs);
     arr_clear(a64_caller_saved_promoted);
@@ -595,24 +595,27 @@ void _a64_b3_select() {
     while (1) {
         reg = _a64_b3_reg_at(used);
         if (reg < 0) { return; }
+        // M3/M6: once the budget reaches the caller-saved band (x9..x12
+        // in a non-leaf function), each promotion must beat the wrap it
+        // adds — charged per crossed call (M6), which is what the M5
+        // masks actually emit. The gate sits INSIDE the candidate scan:
+        // per-range costs are not monotone in refs (a colder variable
+        // crossing fewer calls can be worth a slot a hotter one is not),
+        // so an unworthy best candidate no longer ends the selection.
+        is_caller = (reg >= 9 && reg <= 15 && cg_fn_leaf == 0);
         best_vi = -1;
         best_refs = 1;
         for (vi = 0; vi < n; vi++) {
             if (arr_get(cg_var_promote, vi) >= 0) { continue; }
             if (cg_b3_eligible(vi) == 0) { continue; }
+            if (is_caller && cg_caller_saved_worth_range(vi) == 0) { continue; }
             if (arr_get(cg_var_refs, vi) > best_refs) {
                 best_refs = arr_get(cg_var_refs, vi);
                 best_vi = vi;
             }
         }
         if (best_vi < 0) { return; }
-        // M3: once the budget reaches the caller-saved band (x9..x12 in
-        // a non-leaf function), each further promotion must beat the
-        // save/restore wrap it adds around every call. Candidates come
-        // out in descending ref order, so the first one that is not
-        // worth it ends the selection.
-        if (reg >= 9 && reg <= 15 && cg_fn_leaf == 0) {
-            if (_a64_caller_saved_worth(best_refs) == 0) { return; }
+        if (is_caller) {
             // Live-range wrap bookkeeping: record who occupies the band
             // register so the per-call mask can prove it dead.
             cg_caller_band_note(reg, best_vi);
@@ -722,20 +725,41 @@ _a64_regalloc_apply(assigns) {
     j = 0;
     while (j < 64) { slot_seen = arr_push(slot_seen, 0); j++; }
 
-    // M3 pre-pass: total the loop-weighted references landing on each
-    // slot. The save/restore wrap is paid once per REGISTER, so the
-    // promote-or-not decision for a caller-saved slot weighs the SUM of
-    // every variable sharing it (a cold variable rides a slot a hot one
-    // already paid for) against the wrap cost.
+    // M3/M6 pre-pass: total the loop-weighted references landing on each
+    // slot, and (M6) the crossed-call weights of its members. The wrap
+    // is paid once per REGISTER and — since the M5 masks — only at calls
+    // some member is live across; members' intervals never overlap, so
+    // the slot's true cost is the plain SUM of their crossed weights. A
+    // member without interval data poisons the slot to `unknown`, which
+    // falls back to the function-level gate.
+    auto slot_crossed, slot_unknown, _cw;
     slot_refs = arr_new();
+    slot_crossed = arr_new();
+    slot_unknown = arr_new();
     j = 0;
-    while (j < 64) { slot_refs = arr_push(slot_refs, 0); j++; }
+    while (j < 64) {
+        slot_refs = arr_push(slot_refs, 0);
+        slot_crossed = arr_push(slot_crossed, 0);
+        slot_unknown = arr_push(slot_unknown, 0);
+        j++;
+    }
     i = 0;
     while (i < n) {
         asn = arr_struct_at(assigns, i);
         if (asn.slot >= 0) {
             arr_set(slot_refs, asn.slot,
                 arr_get(slot_refs, asn.slot) + arr_get(cg_var_refs, asn.var_idx));
+            // Crossed weights matter only for the caller-saved band
+            // (slots 10..13 → x9..x12, non-leaf); asking for them
+            // elsewhere would trigger the lazy pass for nothing.
+            if (asn.slot >= 10 && cg_fn_leaf == 0) {
+                _cw = cg_var_crossed_of(asn.var_idx);
+                if (_cw < 0) { arr_set(slot_unknown, asn.slot, 1); }
+                else {
+                    arr_set(slot_crossed, asn.slot,
+                        arr_get(slot_crossed, asn.slot) + _cw);
+                }
+            }
         }
         i++;
     }
@@ -746,13 +770,14 @@ _a64_regalloc_apply(assigns) {
         asn = arr_struct_at(assigns, i);
         if (asn.slot >= 0) {
             reg = _a64_b3_reg_at(asn.slot);
-            // M3: refuse a caller-saved slot whose combined references
-            // do not beat the per-call wrap it would add. The variable
-            // simply stays in memory (cg_var_promote already reset to
-            // -1 above) — always the safe fallback.
+            // M6: refuse a caller-saved slot whose combined references
+            // do not beat the wrap of the calls its members cross. The
+            // variable simply stays in memory (cg_var_promote already
+            // reset to -1 above) — always the safe fallback.
             worth = 1;
             if (reg >= 9 && reg <= 15 && cg_fn_leaf == 0) {
-                worth = _a64_caller_saved_worth(arr_get(slot_refs, asn.slot));
+                worth = cg_caller_saved_worth_slot(arr_get(slot_refs, asn.slot),
+                    arr_get(slot_crossed, asn.slot), arr_get(slot_unknown, asn.slot));
             }
             if (worth) {
                 arr_set(cg_var_promote, asn.var_idx, reg);

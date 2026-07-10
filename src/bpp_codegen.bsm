@@ -1090,17 +1090,40 @@ cg_caller_saved_worth(refs) {
 // loop-weighted sum of the calls variable vi's intervals cross
 // (regalloc_compute_crossed_wt), or -1 when no interval data exists —
 // the fallback is the function-level gate, i.e. the old M3 behaviour.
+//
+// The pass is LAZY: cg_emit_func stashes the function's CFG / RPO /
+// intervals and the compute runs only when a routing site actually asks
+// (cg_crossed_ensure) — most functions never reach the caller-saved
+// band, so most never pay the walk. Compile-time is the budget here.
 global cg_var_crossed_wt;
+global cg_crossed_ready;             // 1 = cg_var_crossed_wt is valid for this fn
+global cg_rg_cfg_cur;                // stashed by cg_emit_func for the lazy pass
+global cg_rg_rpo_cur;
+global cg_rg_ivl_cur;
+
+// Run the crossed-weight pass on first demand for the current function.
+void cg_crossed_ensure() {
+    if (cg_crossed_ready) { return; }
+    cg_crossed_ready = 1;
+    regalloc_compute_crossed_wt(cg_rg_cfg_cur, cg_rg_rpo_cur, cg_rg_ivl_cur);
+}
+
+// Crossed weight for variable `vi`, computing the pass on demand.
+// -1 = unknown (no interval data) — callers fall back to function-level.
+cg_var_crossed_of(vi) {
+    cg_crossed_ensure();
+    if (cg_var_crossed_wt != 0 && vi >= 0 && vi < arr_len(cg_var_crossed_wt)) {
+        return arr_get(cg_var_crossed_wt, vi);
+    }
+    return -1;
+}
 
 // Is promoting variable `vi` into a caller-saved register worth it,
 // charging only the calls its live range crosses?
 cg_caller_saved_worth_range(vi) {
     auto crossed, refs;
     if (cg_fn_leaf) { return 1; }
-    crossed = -1;
-    if (cg_var_crossed_wt != 0 && vi >= 0 && vi < arr_len(cg_var_crossed_wt)) {
-        crossed = arr_get(cg_var_crossed_wt, vi);
-    }
+    crossed = cg_var_crossed_of(vi);
     refs = arr_get(cg_var_refs, vi);
     if (crossed < 0) { return cg_caller_saved_worth(refs); }
     if (refs > crossed * 2) { return 1; }
@@ -2844,11 +2867,13 @@ void cg_emit_func(fi) {
         regalloc_dump_intervals(_rg_ivl, name_p);
     }
 
-    // M6: per-variable crossed-call weight (the promotion side of the
-    // live-range refinement — the emission side is the M5 masks). Fills
-    // cg_var_crossed_wt for cg_caller_saved_worth_range/_slot, which the
-    // chips' caller-saved routing consults during b3_select below.
-    regalloc_compute_crossed_wt(_rg_cfg, _rg_rpo, _rg_ivl);
+    // M6: stash this function's analysis so the per-range cost pass can
+    // run LAZILY — cg_crossed_ensure computes cg_var_crossed_wt only if
+    // a caller-saved routing site actually consults the gate below.
+    cg_rg_cfg_cur = _rg_cfg;
+    cg_rg_rpo_cur = _rg_rpo;
+    cg_rg_ivl_cur = _rg_ivl;
+    cg_crossed_ready = 0;
 
     call(p.b3_select);
 
