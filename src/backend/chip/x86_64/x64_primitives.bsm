@@ -762,20 +762,24 @@ _x64_emit_copy_ret_flt() { return 0; }
 // functions are saved to their frame band before each call (and before
 // each inline syscall — see _x64_emit_syscall) and reloaded after.
 // mov [rbp + off], r / mov r, [rbp + off]; offsets are negative
-// (x86_64 frames grow down from rbp).
-void _x64_emit_save_caller_saved_int() {
+// (x86_64 frames grow down from rbp). `mask` narrows the wrap to the
+// live band entries (bit i = save entry i; -1 = everything) — the
+// live-range refinement; the paired restore must receive the SAME mask.
+void _x64_emit_save_caller_saved_int(mask) {
     auto n, i, reg, off;
     n = arr_len(x64_caller_saved_promoted);
     for (i = 0; i < n; i++) {
+        if ((mask & (1 << i)) == 0) { continue; }
         reg = arr_get(x64_caller_saved_promoted, i);
         off = x64_caller_spill_off - (i + 1) * 8;
         x64_enc_store(reg, 5, off);
     }
 }
-void _x64_emit_restore_caller_saved_int() {
+void _x64_emit_restore_caller_saved_int(mask) {
     auto n, i, reg, off;
     n = arr_len(x64_caller_saved_promoted);
     for (i = 0; i < n; i++) {
+        if ((mask & (1 << i)) == 0) { continue; }
         reg = arr_get(x64_caller_saved_promoted, i);
         off = x64_caller_spill_off - (i + 1) * 8;
         x64_enc_load(reg, 5, off);
@@ -787,10 +791,11 @@ void _x64_emit_restore_caller_saved_int() {
 // to its frame slot around each call site — this pair emits that wrap.
 // movsd [rbp + off], xmm / movsd xmm, [rbp + off]; offsets are negative
 // (x86_64 frames grow down from rbp).
-void _x64_emit_save_caller_saved_flt() {
+void _x64_emit_save_caller_saved_flt(mask) {
     auto n, i, reg, off;
     n = arr_len(x64_caller_saved_promoted_flt);
     for (i = 0; i < n; i++) {
+        if ((mask & (1 << i)) == 0) { continue; }
         reg = arr_get(x64_caller_saved_promoted_flt, i);
         // Same slot convention as the int spills above: the first slot
         // sits one word BELOW the band base, so bands never overlap.
@@ -798,10 +803,11 @@ void _x64_emit_save_caller_saved_flt() {
         x64_enc_store_sd(reg, 5, off);
     }
 }
-void _x64_emit_restore_caller_saved_flt() {
+void _x64_emit_restore_caller_saved_flt(mask) {
     auto n, i, reg, off;
     n = arr_len(x64_caller_saved_promoted_flt);
     for (i = 0; i < n; i++) {
+        if ((mask & (1 << i)) == 0) { continue; }
         reg = arr_get(x64_caller_saved_promoted_flt, i);
         // Same slot convention as the int spills above: the first slot
         // sits one word BELOW the band base, so bands never overlap.
@@ -1456,7 +1462,9 @@ void _x64_emit_syscall(cg_id, arg_count, extra_slot, extra_val) {
     // when the list is empty) and reload it after the trap; the Linux
     // kernel itself preserves r8/r9 across `syscall`, so only our own
     // argument setup needs covering.
-    _x64_emit_save_caller_saved_int();
+    // Full-band wrap (-1): inline syscalls are never stamped with a
+    // live-range mask, so the conservative save covers every entry.
+    _x64_emit_save_caller_saved_int(-1);
     // Move arg 0 from rax (tree walker convention) into rdi (syscall ABI).
     if (arg_count >= 1) { x64_enc_mov_reg(7, 0); }
     // Pop remaining args from the stack into rsi, rdx, r10, r8, r9.
@@ -1471,7 +1479,7 @@ void _x64_emit_syscall(cg_id, arg_count, extra_slot, extra_val) {
     num = _x64_sys_num(cg_id);
     x64_enc_mov_wide(0, num);
     x64_enc_syscall();
-    _x64_emit_restore_caller_saved_int();
+    _x64_emit_restore_caller_saved_int(-1);
 }
 
 // ── Wave 19 function-frame primitives ──

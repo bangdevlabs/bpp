@@ -214,10 +214,10 @@ struct ChipPrimitives {
     emit_call_extern,   // (ex_idx)
     emit_copy_ret_int,  // ()  no-op on most chips
     emit_copy_ret_flt,  // ()  no-op on most chips
-    emit_save_caller_saved_int,    // ()
-    emit_restore_caller_saved_int, // ()
-    emit_save_caller_saved_flt,    // ()  M4 twin: spill promoted caller-saved
-    emit_restore_caller_saved_flt, // ()  FLOAT regs (xmm / d) around a call
+    emit_save_caller_saved_int,    // (mask) — bit i = save band entry i; -1 = all
+    emit_restore_caller_saved_int, // (mask) — must mirror the paired save's mask
+    emit_save_caller_saved_flt,    // (mask)  M4 twin: spill promoted caller-saved
+    emit_restore_caller_saved_flt, // (mask)  FLOAT regs (xmm / d) around a call
 
     // Wave 9b fat-primitive (A.3/A.4): wraps the chip-local
     // <chip>_emit_call helper. The finer-grained T_CALL
@@ -1081,6 +1081,84 @@ cg_caller_saved_worth(refs) {
     if (cg_fn_leaf) { return 1; }
     if (refs > cg_fn_call_wt * 2) { return 1; }
     return 0;
+}
+
+// ── Live-range caller-saved wraps (the M3 refinement) ──────────────
+//
+// The M2/M4 wrap saves the WHOLE caller-saved band at every call site.
+// The refinement: at each call, save only the band registers whose
+// variable is LIVE across that statement (a dead value needs no
+// recovery copy). The spine keeps a mirror of each chip's band — the
+// register order (band index = chip save-list index) plus (reg, var)
+// pairs recording every variable the allocator parked on a band
+// register (several can share one register across non-overlapping
+// live ranges; a promoted CONSTANT records var -1 = always live).
+// regalloc_stamp_call_masks (bpp_regalloc.bsm) then walks the CFG in
+// interval-position order and stamps each T_CALL node with a band
+// bitmask; cg_emit_call reads the stamp and passes it to the chip
+// save/restore primitives. Everything fails SAFE: an unstamped call, a
+// band register with no recorded pair, a variable with no interval, or
+// a refused/absent analysis all leave the mask bits set (-1 = save
+// everything, the exact M2 behaviour).
+global cg_caller_band_regs;          // int band mirror: reg per band index
+global cg_caller_band_pair_reg;      // int pairs: register…
+global cg_caller_band_pair_vi;       // …and the variable parked on it (-1 = always)
+global cg_caller_band_regs_flt;      // float band mirror
+global cg_caller_band_pair_reg_flt;  // float pairs
+global cg_caller_band_pair_vi_flt;
+global cg_wrap_mask_hash;            // T_CALL node ptr → packed masks + 1
+
+// Reset the INT band mirror (chip re-populates it — the regalloc apply
+// clears the chip's own list the same way). The float mirror is reset
+// separately because the int apply never touches the chip's float band.
+// Both lazily allocate their arrays (and the shared stamp hash) on the
+// first function, so neither chip init needs a new wiring line.
+void cg_caller_band_clear_int() {
+    if (cg_caller_band_regs == 0) {
+        cg_caller_band_regs     = arr_new();
+        cg_caller_band_pair_reg = arr_new();
+        cg_caller_band_pair_vi  = arr_new();
+        cg_wrap_mask_hash       = hash_new(64);
+    }
+    arr_clear(cg_caller_band_regs);
+    arr_clear(cg_caller_band_pair_reg);
+    arr_clear(cg_caller_band_pair_vi);
+    hash_clear(cg_wrap_mask_hash);
+}
+void cg_caller_band_clear_flt() {
+    if (cg_caller_band_regs_flt == 0) {
+        cg_caller_band_regs_flt     = arr_new();
+        cg_caller_band_pair_reg_flt = arr_new();
+        cg_caller_band_pair_vi_flt  = arr_new();
+    }
+    arr_clear(cg_caller_band_regs_flt);
+    arr_clear(cg_caller_band_pair_reg_flt);
+    arr_clear(cg_caller_band_pair_vi_flt);
+}
+
+// Record "variable vi lives on caller-saved band register reg". Called
+// by the chip routing IMMEDIATELY next to its own band push so the
+// mirror's register order matches the chip save-list order by
+// construction. vi -1 marks an always-live occupant (a promoted
+// constant). Fires once per VARIABLE — a register shared by several
+// variables gets one mirror entry and several pairs.
+void cg_caller_band_note(reg, vi) {
+    auto i, n;
+    n = arr_len(cg_caller_band_regs);
+    i = 0;
+    while (i < n && arr_get(cg_caller_band_regs, i) != reg) { i++; }
+    if (i == n) { cg_caller_band_regs = arr_push(cg_caller_band_regs, reg); }
+    cg_caller_band_pair_reg = arr_push(cg_caller_band_pair_reg, reg);
+    cg_caller_band_pair_vi  = arr_push(cg_caller_band_pair_vi, vi);
+}
+void cg_caller_band_note_flt(reg, vi) {
+    auto i, n;
+    n = arr_len(cg_caller_band_regs_flt);
+    i = 0;
+    while (i < n && arr_get(cg_caller_band_regs_flt, i) != reg) { i++; }
+    if (i == n) { cg_caller_band_regs_flt = arr_push(cg_caller_band_regs_flt, reg); }
+    cg_caller_band_pair_reg_flt = arr_push(cg_caller_band_pair_reg_flt, reg);
+    cg_caller_band_pair_vi_flt  = arr_push(cg_caller_band_pair_vi_flt, vi);
 }
 
 // Add a variable to the current scope. Initialises all parallel
@@ -2540,12 +2618,25 @@ cg_emit_call(n) {
     // M2/M4: spill promoted caller-saved regs around the call (no-op unless
     // the allocator put a cross-call value in one). Both chips; empty set on
     // the ones that haven't activated a band. Int and float banks nest
-    // symmetrically (int saved first, restored last).
-    call(p.emit_save_caller_saved_int);
-    call(p.emit_save_caller_saved_flt);
+    // symmetrically (int saved first, restored last). The mask narrows the
+    // wrap to the band entries whose variable is live across THIS call
+    // (regalloc_stamp_call_masks stamped the node); an unstamped call —
+    // hash miss, a spliced clone, a refused analysis — saves everything
+    // (-1), which is exactly the original M2 behaviour.
+    auto _wm, _wmi, _wmf;
+    _wmi = -1; _wmf = -1;
+    _wm = 0;
+    if (cg_wrap_mask_hash != 0) { _wm = hash_get(cg_wrap_mask_hash, n); }
+    if (_wm != 0) {
+        _wm--;
+        _wmi = _wm & 0xFFFF;
+        _wmf = (_wm >> 16) & 0xFFFF;
+    }
+    call(p.emit_save_caller_saved_int, _wmi);
+    call(p.emit_save_caller_saved_flt, _wmf);
     r = call(p.emit_call_full, n);
-    call(p.emit_restore_caller_saved_flt);
-    call(p.emit_restore_caller_saved_int);
+    call(p.emit_restore_caller_saved_flt, _wmf);
+    call(p.emit_restore_caller_saved_int, _wmi);
     return r;
 }
 
@@ -2642,6 +2733,10 @@ void cg_emit_func(fi) {
     // chip widen its promotion pool into caller-saved registers.
     cg_fn_leaf = 1;
     cg_fn_call_wt = 0;
+    // Live-range wrap bookkeeping starts fresh: the chip routing below
+    // re-notes every caller-saved band occupant for this function.
+    cg_caller_band_clear_int();
+    cg_caller_band_clear_flt();
     // Expose the function body + reset the induction state so the pointer-walk
     // pass (cg_iv_detect) can scan the whole function for unsafe base uses.
     cg_cur_body = body_arr;
@@ -2775,12 +2870,19 @@ void cg_emit_func(fi) {
     if (_rg_worse == 0 && _rg_mangled == 0) {
         _rg_split = regalloc_has_any_split(_rg_asn);
         if (_rg_split == 0) {
+            // The apply rebuilds the chip's int band from scratch; reset the
+            // spine mirror in lockstep so its notes match the new push order.
+            // If the apply refuses mid-validate (returns 0 before mutating),
+            // the mirror stays empty and every band bit simply defaults to
+            // "save" — the fail-safe direction.
+            cg_caller_band_clear_int();
             _rg_applied_int = call(p.regalloc_apply, _rg_asn);
         }
     }
     if (_rg_worse_flt == 0 && _rg_mangled == 0) {
         _rg_split_flt = regalloc_has_any_split(_rg_asn_flt);
         if (_rg_split_flt == 0) {
+            cg_caller_band_clear_flt();
             _rg_applied_flt = call(p.regalloc_apply_float, _rg_asn_flt);
         }
     }

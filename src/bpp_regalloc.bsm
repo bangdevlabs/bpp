@@ -2664,3 +2664,147 @@ regalloc_has_any_split(assigns) {
     }
     return 0;
 }
+
+// ── Live-range wrap masks (the M3 refinement's analysis half) ───────
+//
+// The M2/M4 caller-saved wrap saves the whole band at every call site.
+// This pass narrows it: walking the CFG in EXACTLY the position
+// numbering regalloc_compute_intervals used, it stamps every T_CALL
+// node with a bitmask of the band entries whose occupant is live at
+// that statement (interval covers the position). cg_emit_call reads
+// the stamp; the chip save/restore primitives skip masked-out entries.
+//
+// Everything unprovable stays SAVED: a band register with no recorded
+// (reg, var) pair, an always-live occupant (a promoted constant,
+// var -1), a variable with no interval (e.g. beyond the 64-bit
+// liveness window, or a mangled slot Stage A didn't expand), and any
+// call node the emitter meets that this walk never stamped (splice
+// clones, analysis-expanded shapes) — all keep their bit set. The
+// mask can only ever REMOVE a save that liveness proves dead.
+
+// Is band register `reg` provably dead at position `pos`? Dead needs
+// every recorded occupant to be a real variable whose every interval
+// misses `pos`; anything unknown means "assume live".
+static _rg_band_reg_dead(reg, pos, pair_reg, pair_vi, intervals) {
+    auto np, i, vi, ni, k, it: LiveInterval, found, any_pair;
+    any_pair = 0;
+    np = arr_len(pair_reg);
+    ni = arr_struct_count(intervals);
+    for (i = 0; i < np; i++) {
+        if (arr_get(pair_reg, i) != reg) { continue; }
+        any_pair = 1;
+        vi = arr_get(pair_vi, i);
+        if (vi < 0) { return 0; }              // always-live occupant (constant)
+        found = 0;
+        for (k = 0; k < ni; k++) {
+            it = arr_struct_at(intervals, k);
+            if (it.var_idx != vi) { continue; }
+            found = 1;
+            if (pos >= it.start_pos && pos <= it.end_pos) { return 0; }   // live here
+        }
+        if (found == 0) { return 0; }          // no interval — cannot prove dead
+    }
+    if (any_pair == 0) { return 0; }           // untracked register — assume live
+    return 1;
+}
+
+// Compute the packed (int | flt << 16) wrap mask for position `pos`
+// over the spine's band mirrors. Bits default to 1 (save); a bit is
+// cleared only when _rg_band_reg_dead proves its register dead.
+static _rg_wrap_mask_at(pos, intervals) {
+    auto mi, mf, n, i;
+    mi = 0xFFFF; mf = 0xFFFF;
+    n = arr_len(cg_caller_band_regs);
+    for (i = 0; i < n && i < 16; i++) {
+        if (_rg_band_reg_dead(arr_get(cg_caller_band_regs, i), pos,
+                              cg_caller_band_pair_reg, cg_caller_band_pair_vi,
+                              intervals)) {
+            mi = mi & ~(1 << i);
+        }
+    }
+    n = arr_len(cg_caller_band_regs_flt);
+    for (i = 0; i < n && i < 16; i++) {
+        if (_rg_band_reg_dead(arr_get(cg_caller_band_regs_flt, i), pos,
+                              cg_caller_band_pair_reg_flt, cg_caller_band_pair_vi_flt,
+                              intervals)) {
+            mf = mf & ~(1 << i);
+        }
+    }
+    return mi | (mf << 16);
+}
+
+// Stamp every T_CALL in an expression tree with `packed` (mask + 1 in
+// the hash so a legitimate stamp is never confused with a miss).
+// Mirrors _rg_expr_uses' traversal exactly — same node shapes, same
+// child fields.
+static void _rg_stamp_expr(nd, packed) {
+    auto n: Node, t, arr, cnt, i;
+    if (nd == 0) { return; }
+    n = nd; t = n.ntype;
+    if (t == T_CALL) {
+        hash_set(cg_wrap_mask_hash, nd, packed + 1);
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) { _rg_stamp_expr(arr[i], packed); i++; }
+        return;
+    }
+    if (t == T_BINOP) { _rg_stamp_expr(n.b, packed); _rg_stamp_expr(n.c, packed); return; }
+    if (t == T_UNARY) { _rg_stamp_expr(n.b, packed); return; }
+    if (t == T_MEMLD) { _rg_stamp_expr(n.a, packed); return; }
+    if (t == T_ADDR)  { _rg_stamp_expr(n.a, packed); return; }
+    if (t == T_TERNARY) {
+        _rg_stamp_expr(n.a, packed);
+        _rg_stamp_expr(n.b, packed);
+        _rg_stamp_expr(n.c, packed);
+    }
+}
+
+// Stamp every T_CALL in one CFG statement — the same statement shapes
+// _rg_stmt_use_def recognises, with the same fallback (a bare
+// expression statement or a control-flow condition node).
+static void _rg_stamp_stmt(nd, packed) {
+    auto n: Node, t, arr, cnt, i;
+    if (nd == 0) { return; }
+    n = nd; t = n.ntype;
+    if (t == T_ASSIGN) { _rg_stamp_expr(n.b, packed); return; }
+    if (t == T_MEMST)  { _rg_stamp_expr(n.a, packed); _rg_stamp_expr(n.b, packed); return; }
+    if (t == T_RET) {
+        if (n.c > 1) {
+            arr = n.b; cnt = n.c;
+            i = 0;
+            while (i < cnt) { _rg_stamp_expr(arr[i], packed); i++; }
+        } else {
+            _rg_stamp_expr(n.a, packed);
+        }
+        return;
+    }
+    if (t == T_DECL || t == T_BREAK || t == T_CONTINUE || t == T_NOP) { return; }
+    _rg_stamp_expr(nd, packed);
+}
+
+// Walk the CFG in RPO with regalloc_compute_intervals' own position
+// numbering and stamp each statement's calls with the band liveness
+// mask at that position. A full mask (nothing provably dead) is NOT
+// stamped — the emitter's hash-miss default is the full wrap anyway,
+// and skipping keeps the hash small.
+void regalloc_stamp_call_masks(blocks, rpo, intervals) {
+    auto n, i, blk, b: CfgBlock, k, nstmts, pos, packed;
+    n = arr_len(rpo);
+    pos = 0;
+    i = 0;
+    while (i < n) {
+        blk = arr_get(rpo, i);
+        b = arr_struct_at(blocks, blk);
+        nstmts = arr_len(b.stmts);
+        k = 0;
+        while (k < nstmts) {
+            packed = _rg_wrap_mask_at(pos + k, intervals);
+            if (packed != (0xFFFF | (0xFFFF << 16))) {
+                _rg_stamp_stmt(arr_get(b.stmts, k), packed);
+            }
+            k++;
+        }
+        pos = pos + nstmts;
+        i++;
+    }
+}
