@@ -246,6 +246,24 @@ big-league general-quality investment, not a hot-path fix.
   full-function price at promotion time even though emission no longer
   wraps it there. That refinement wants a per-interval crossed-call
   weight computed from the same stamp walk.
+- **M6 — per-range promotion cost. STEP 0 MEASURED 2026-07-10, VERDICT:
+  BUILD** (`f7a9d6b`, the probe). `BPP_M3_PROBE=1` reports every
+  M3-refused candidate a per-crossed-call gate would admit: **151
+  loop-hot refusals (refs >= 1000) across four workloads** — compiler 51
+  (mo_resolve_relocations instr refs=12000 vs crossed cost 8000,
+  topo_sort, regalloc_linear_scan), fps_3d_cpu 41 (_ttf_load_glyph —
+  the asset-load class the pressure study named), pathfind 36,
+  sound_fusion 23. Coherence argument: since M5, the EMISSION side
+  already charges per-range (masked wraps); the promotion gate is the
+  last place still paying the function-wide price. Design notes for the
+  build: (a) stages A-C (CFG/liveness/RPO/intervals) read nothing from
+  B3, so they can move ABOVE b3_select in cg_emit_func, making a
+  cg_caller_saved_worth_range(vi) spine helper available to both the
+  greedy path and the apply; (b) the greedy loop's early-exit
+  monotonicity breaks under per-range costs (a colder var crossing
+  fewer calls can win) — the selection must scan all candidates instead
+  of returning at the first refusal; (c) the probe stays as the
+  validation tool — after the build these hits should collapse to ~0.
 
 ## Gate + measurement per increment
 
