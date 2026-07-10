@@ -2943,3 +2943,70 @@ void regalloc_probe_m3(blocks, rpo, intervals, fn_name) {
     arr_free(pos_arr);
     arr_free(wt_arr);
 }
+
+// ── M6 — per-variable crossed-call weight ───────────────────────────
+//
+// Fills cg_var_crossed_wt: for each variable (up to the 64-bit liveness
+// window), the loop-weighted sum of the real calls its interval(s)
+// cross — the true per-range cost of parking it in a caller-saved
+// register now that the M5 masks make the wrap fire only where the
+// occupant is live. -1 = no interval data (beyond the window, or never
+// touched): consumers fall back to the function-level M3 gate. Runs
+// every function, before b3_select; reuses the probe's collectors.
+void regalloc_compute_crossed_wt(blocks, rpo, intervals) {
+    auto pos_arr, wt_arr, n, i, blk, b: CfgBlock, k, nstmts, pos;
+    auto vi, nvars, ni, it: LiveInterval, c, crossed, has_ivl;
+    if (cg_var_crossed_wt == 0) { cg_var_crossed_wt = arr_new(); }
+    arr_clear(cg_var_crossed_wt);
+    nvars = arr_len(cg_vars);
+    if (nvars > 64) { nvars = 64; }
+    // Leaf functions never pay a wrap — skip the walk, everything -1
+    // (the range gate answers 1 for leaves before ever reading this).
+    if (cg_fn_leaf || cg_fn_call_wt == 0) {
+        vi = 0;
+        while (vi < nvars) { cg_var_crossed_wt = arr_push(cg_var_crossed_wt, -1); vi++; }
+        return;
+    }
+    pos_arr = arr_new(); wt_arr = arr_new();
+    n = arr_len(rpo);
+    pos = 0;
+    i = 0;
+    while (i < n) {
+        blk = arr_get(rpo, i);
+        b = arr_struct_at(blocks, blk);
+        nstmts = arr_len(b.stmts);
+        k = 0;
+        while (k < nstmts) {
+            _rg_probe_collect_stmt(arr_get(b.stmts, k), pos + k, &pos_arr, &wt_arr);
+            k++;
+        }
+        pos = pos + nstmts;
+        i++;
+    }
+    ni = arr_struct_count(intervals);
+    vi = 0;
+    while (vi < nvars) {
+        crossed = 0;
+        has_ivl = 0;
+        k = 0;
+        while (k < ni) {
+            it = arr_struct_at(intervals, k);
+            if (it.var_idx == vi) {
+                has_ivl = 1;
+                c = 0;
+                while (c < arr_len(pos_arr)) {
+                    if (arr_get(pos_arr, c) >= it.start_pos && arr_get(pos_arr, c) <= it.end_pos) {
+                        crossed = crossed + arr_get(wt_arr, c);
+                    }
+                    c++;
+                }
+            }
+            k++;
+        }
+        if (has_ivl == 0) { crossed = -1; }
+        cg_var_crossed_wt = arr_push(cg_var_crossed_wt, crossed);
+        vi++;
+    }
+    arr_free(pos_arr);
+    arr_free(wt_arr);
+}

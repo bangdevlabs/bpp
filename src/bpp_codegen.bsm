@@ -1083,6 +1083,42 @@ cg_caller_saved_worth(refs) {
     return 0;
 }
 
+// M6 — per-range promotion cost. The M5 masks made the EMISSION cost of
+// a caller-saved promotion per-crossed-call (a register is only wrapped
+// at calls its occupant is live across); these two helpers make the
+// PROMOTION gate charge the same price. cg_var_crossed_wt[vi] holds the
+// loop-weighted sum of the calls variable vi's intervals cross
+// (regalloc_compute_crossed_wt), or -1 when no interval data exists —
+// the fallback is the function-level gate, i.e. the old M3 behaviour.
+global cg_var_crossed_wt;
+
+// Is promoting variable `vi` into a caller-saved register worth it,
+// charging only the calls its live range crosses?
+cg_caller_saved_worth_range(vi) {
+    auto crossed, refs;
+    if (cg_fn_leaf) { return 1; }
+    crossed = -1;
+    if (cg_var_crossed_wt != 0 && vi >= 0 && vi < arr_len(cg_var_crossed_wt)) {
+        crossed = arr_get(cg_var_crossed_wt, vi);
+    }
+    refs = arr_get(cg_var_refs, vi);
+    if (crossed < 0) { return cg_caller_saved_worth(refs); }
+    if (refs > crossed * 2) { return 1; }
+    return 0;
+}
+
+// Slot-level twin for the regalloc apply, where several variables share
+// one register: intervals sharing a slot never overlap, so the slot's
+// true wrap cost is the plain SUM of its members' crossed weights (no
+// double counting is possible). `unknown` = any member without interval
+// data — fall back to the function-level gate for the whole slot.
+cg_caller_saved_worth_slot(refs, crossed, unknown) {
+    if (cg_fn_leaf) { return 1; }
+    if (unknown) { return cg_caller_saved_worth(refs); }
+    if (refs > crossed * 2) { return 1; }
+    return 0;
+}
+
 // ── Live-range caller-saved wraps (the M3 refinement) ──────────────
 //
 // The M2/M4 wrap saves the WHOLE caller-saved band at every call site.
@@ -1462,11 +1498,12 @@ cg_b3_walk(nd) {
             w = 1;
             if (cg_b3_loop_depth > 0) { w = 1000; }
             cg_fn_call_wt += w;
-            // M3 probe: remember each call's own weight by node so the
-            // per-range cost study (regalloc_probe_m3) can charge a live
-            // interval only for the calls it actually crosses — the same
-            // currency as cg_fn_call_wt, just positioned.
-            if (cg_m3_probe) { hash_set(cg_call_wt_hash, nd, w + 1); }
+            // Remember each call's own weight by node so the per-range
+            // cost model (regalloc_compute_crossed_wt, M6) can charge a
+            // live interval only for the calls it actually crosses — the
+            // same currency as cg_fn_call_wt, just positioned. The M3
+            // probe reads the same hash.
+            if (cg_call_wt_hash != 0) { hash_set(cg_call_wt_hash, nd, w + 1); }
         }
         arr = n.b; cnt = n.c;
         for (i = 0; i < cnt; i++) { cg_b3_walk(arr[i]); }
@@ -2751,17 +2788,15 @@ void cg_emit_func(fi) {
     // re-notes every caller-saved band occupant for this function.
     cg_caller_band_clear_int();
     cg_caller_band_clear_flt();
-    // M3 probe: one-shot env read, then a per-function reset of the
-    // call-weight hash the B3 walk fills (probe-gated, zero cost off).
+    // Call-weight hash: filled by the B3 walk, read by the M6 per-range
+    // cost pass every function (and by the M3 probe when enabled).
+    if (cg_call_wt_hash == 0) { cg_call_wt_hash = hash_new(64); }
+    hash_clear(cg_call_wt_hash);
     if (cg_m3_probe_init == 0) {
         cg_m3_probe_init = 1;
         cg_m3_probe = 0;
-        if (getenv("BPP_M3_PROBE") != 0) {
-            cg_m3_probe = 1;
-            cg_call_wt_hash = hash_new(64);
-        }
+        if (getenv("BPP_M3_PROBE") != 0) { cg_m3_probe = 1; }
     }
-    if (cg_m3_probe) { hash_clear(cg_call_wt_hash); }
     // Expose the function body + reset the induction state so the pointer-walk
     // pass (cg_iv_detect) can scan the whole function for unsafe base uses.
     cg_cur_body = body_arr;
@@ -2771,28 +2806,21 @@ void cg_emit_func(fi) {
         stmt_i = body_arr[i];
         if (stmt_i != 0) { cg_b3_walk(stmt_i); }
     }
-    call(p.b3_select);
 
     // RegAlloc v2, Stage A (docs/plans/compiler_boost_roadmap.md F.2):
-    // build this function's CFG. Pure analysis — its output isn't
-    // consumed by anything below yet (later stages add liveness,
-    // intervals, and linear-scan before any of this touches a real
-    // register decision) — so this runs unconditionally, same as
-    // cg_b3_walk's own ref-count pass above, with zero effect on the
-    // bytes this function compiles to. The dump-on-demand hook
-    // (regalloc_name_wants_dump) is this stage's own verification tool,
-    // since nothing else observes the CFG yet.
+    // build this function's CFG. Stages A-C read nothing from the B3
+    // selection, so since M6 they run BEFORE it — the per-range cost
+    // pass just below needs the intervals so b3_select's caller-saved
+    // gate can charge only the calls a candidate's range crosses. The
+    // dump-on-demand hook (regalloc_name_wants_dump) is each stage's
+    // own verification tool.
     auto _rg_cfg;
     _rg_cfg = regalloc_build_cfg(body_arr, body_cnt);
     if (regalloc_name_wants_dump(name_p)) {
         regalloc_dump_cfg(_rg_cfg, name_p);
     }
 
-    // Stage B: liveness over the CFG just built. Same "runs
-    // unconditionally, zero effect, dump-on-demand is the only
-    // verification tool" shape as Stage A above — nothing reads
-    // live_in/live_out yet either; Stage C (live intervals) is the
-    // first consumer.
+    // Stage B: liveness over the CFG just built.
     regalloc_compute_liveness(_rg_cfg);
     if (regalloc_name_wants_live_dump(name_p)) {
         regalloc_dump_liveness(_rg_cfg, name_p);
@@ -2800,8 +2828,7 @@ void cg_emit_func(fi) {
 
     // Stage C's prerequisite: RPO (a block's own allocation index isn't
     // faithful to real emission order — see regalloc_compute_rpo's own
-    // comment). Same shape again: unconditional, zero effect, dump-on-
-    // demand verification.
+    // comment).
     auto _rg_rpo;
     _rg_rpo = regalloc_compute_rpo(_rg_cfg);
     if (regalloc_name_wants_rpo_dump(name_p)) {
@@ -2809,14 +2836,21 @@ void cg_emit_func(fi) {
     }
 
     // Stage C: live intervals, flattened from Stage B's per-block
-    // liveness using Stage C's own RPO position units. Same shape
-    // again: unconditional, zero effect, dump-on-demand verification.
-    // Stage D (linear-scan) is the first consumer.
+    // liveness using Stage C's own RPO position units. Stage D
+    // (linear-scan) and the M6 per-range cost pass are the consumers.
     auto _rg_ivl;
     _rg_ivl = regalloc_compute_intervals(_rg_cfg, _rg_rpo);
     if (regalloc_name_wants_ivl_dump(name_p)) {
         regalloc_dump_intervals(_rg_ivl, name_p);
     }
+
+    // M6: per-variable crossed-call weight (the promotion side of the
+    // live-range refinement — the emission side is the M5 masks). Fills
+    // cg_var_crossed_wt for cg_caller_saved_worth_range/_slot, which the
+    // chips' caller-saved routing consults during b3_select below.
+    regalloc_compute_crossed_wt(_rg_cfg, _rg_rpo, _rg_ivl);
+
+    call(p.b3_select);
 
     // Stage D: linear-scan, in SHADOW MODE — computed and dumpable for
     // comparison against B3, but not yet wired into cg_var_promote or
