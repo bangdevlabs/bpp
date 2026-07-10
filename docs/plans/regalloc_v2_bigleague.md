@@ -246,8 +246,16 @@ big-league general-quality investment, not a hot-path fix.
   full-function price at promotion time even though emission no longer
   wraps it there. That refinement wants a per-interval crossed-call
   weight computed from the same stamp walk.
-- **M6 — per-range promotion cost. STEP 0 MEASURED 2026-07-10, VERDICT:
-  BUILD** (`f7a9d6b`, the probe). `BPP_M3_PROBE=1` reports every
+- **M6 — per-range promotion cost. SHIPPED 2026-07-10** (`7f06114` step 1
+  byte-identical: stages A-C moved above b3_select + crossed-weight data;
+  `ffd7b19` step 2 activation: per-candidate gate in both chips' selects,
+  per-slot sum in the applies, constants stay function-level, pass is
+  LAZY — only functions whose routing reaches the caller band pay it).
+  Acceptance: the step-0 probe's loop-hot refusals collapsed 51 → 12 on
+  the compiler's own compile; the residual is budget-bound (losing the
+  4-slot contest to hotter candidates), not cost-refused. Kernels
+  instruction-identical, sf_bench/bench_compile at parity (A/B within
+  noise), full ladder green. Step-0 record below, kept for the method: `BPP_M3_PROBE=1` reports every
   M3-refused candidate a per-crossed-call gate would admit: **151
   loop-hot refusals (refs >= 1000) across four workloads** — compiler 51
   (mo_resolve_relocations instr refs=12000 vs crossed cost 8000,

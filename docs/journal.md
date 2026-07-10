@@ -15996,3 +15996,32 @@ self-host, DSP test 10/10, md5 f61fac72… intact.
 
 Next from the handoff: the separate-compilation arc (mission 1) opens
 with a clean slate.
+
+## 2026-07-10 (later) — M6: the promotion gate learns to charge what M5 emits
+
+The step-0 probe measured the driver in the morning (151 loop-hot
+M3 refusals across four workloads that a per-crossed-call gate would
+admit — `f7a9d6b`); the afternoon built it. Two steps again: stages A-C
+moved above b3_select (they read nothing from B3) and the crossed-weight
+data landed byte-identical 8/8 (`7f06114`); then the activation
+(`ffd7b19`) put the gate INSIDE the candidate scan on both chips — per-
+range costs are not monotone in refs, so an unworthy best candidate
+skips instead of ending the selection — and taught the applies to judge
+a shared slot by the SUM of its members' crossed weights (exact, since
+slot-sharing intervals never overlap). Constants keep the function-level
+gate; the pass is lazy so most functions never pay it.
+
+The acceptance criterion was set before the build: the probe's loop-hot
+hits should collapse. They did — 51 → 12 on the compiler's own compile,
+and the residual is the honest OTHER limit (budget: four band slots,
+candidates losing the refs contest), not cost refusal. profile_print_
+chains' _bm_k (refs=7000, crossed=0) and its siblings now live in
+registers. Two false alarms en route, both settled by the house
+doctrine: bench_compile read +0.05s until the HEAD binary read the same
+elevation on the same Docker-loaded machine (A/B: min equal, median
++0.02s), and biquad/manylive "regressions" evaporated against
+instruction-identical disasms (diff = 0) and interleaved mins. Ladder:
+gen2==gen3, 240/0/12 + 198/0/54, Docker self-host, DSP 10/10, md5
+intact. The RegAlloc v2 arc now charges, at promotion time, exactly the
+price the M5 masks pay at emission time — the model and the machine
+finally agree.
