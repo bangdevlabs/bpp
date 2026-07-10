@@ -1,0 +1,94 @@
+// test_inline_early_ret.bpp — structured early returns inside inlined bodies
+// (inliner lever 1, docs/plans/inliner_frontier_2.md).
+//
+// Every callee below carries an early `return` — the shape the splicer
+// used to disqualify outright. The assertions pin the VALUES, so they
+// hold whether or not a given callee actually inlines at its site; the
+// inlining itself is verified by the bl census in the plan. The guard
+// shapes deliberately mirror the transcendental family's totality
+// guards (exp_f / sin_f / log_f), including a guard that prevents
+// non-termination — the case a guard-to-ternary rewrite would break.
+
+// Leading guard ahead of a straight-line body (the exp_f shape).
+half_or_neg(x) {
+    if (x < 0) { return -1; }
+    return x / 2;
+}
+
+// Two stacked guards, the second protecting the loop below from
+// spinning forever — inlining MUST preserve the short-circuit.
+count_halvings(x: float) {
+    auto n;
+    if (x != x) { return -1; }
+    if (x <= 0.0) { return 0; }
+    n = 0;
+    while (x > 1.0) { x = x * 0.5; n++; }
+    return n;
+}
+
+// Early return from INSIDE a loop (the find-first shape).
+find_first_ge(buf, n, t) {
+    auto i;
+    for (i = 0; i < n; i++) {
+        if (buf[i] >= t) { return i; }
+    }
+    return -1;
+}
+
+// Void callee with an early bare return — the value-less exit.
+void store_if_pos(p, v) {
+    if (v <= 0) { return; }
+    *p = v;
+}
+
+// Multi-value callee with an early multi-return.
+ordered_pair(a, b) {
+    if (a > b) { return b, a; }
+    return a, b;
+}
+
+main() {
+    auto i, acc, buf, slot, lo, hi;
+    auto (f, g): float;
+
+    // Guard shape, hot loop (drives the tier gates at real call sites).
+    acc = 0;
+    for (i = -5; i < 5; i++) { acc = acc + half_or_neg(i * 10); }
+    if (acc != -5 + 0 + 5 + 10 + 15 + 20) { putmsg("FAIL: half_or_neg sum"); return 1; }
+
+    // Non-termination guard: NaN and zero take the early exits, a real
+    // value walks the loop. f != f manufactures NaN at runtime.
+    g = 0.0;
+    f = 0.0 / g;                        // NaN
+    if (count_halvings(f) != -1) { putmsg("FAIL: halvings NaN guard"); return 2; }
+    if (count_halvings(0.0) != 0) { putmsg("FAIL: halvings zero guard"); return 3; }
+    if (count_halvings(8.0) != 3) { putmsg("FAIL: halvings 8.0"); return 4; }
+
+    // Early return from inside the callee's own loop, called in a loop.
+    buf = buf_word(6);
+    for (i = 0; i < 6; i++) { buf[i] = i * i; }   // 0 1 4 9 16 25
+    acc = 0;
+    for (i = 0; i < 30; i += 7) { acc = acc + find_first_ge(buf, 6, i); }
+    // thresholds 0,7,14,21,28 → first idx 0,3,4,5,-1 → sum 11
+    if (acc != 11) { putmsg("FAIL: find_first_ge"); return 5; }
+
+    // Void early return: negative value must NOT store.
+    slot = buf_word(1);
+    *slot = 42;
+    store_if_pos(slot, -3);
+    if (*slot != 42) { putmsg("FAIL: void guard stored"); return 6; }
+    store_if_pos(slot, 7);
+    if (*slot != 7) { putmsg("FAIL: void store"); return 7; }
+
+    // Multi-value early return, both branches, in a loop.
+    acc = 0;
+    for (i = 0; i < 4; i++) {
+        lo, hi = ordered_pair(3 - i, i);
+        acc = acc + lo * 10 + hi;
+    }
+    // pairs: (0,3) (1,2) (1,2) (0,3) → 3 + 12 + 12 + 3 = 30
+    if (acc != 30) { putmsg("FAIL: ordered_pair"); return 8; }
+
+    putmsg("test_inline_early_ret: all PASS");
+    return 0;
+}
