@@ -1100,6 +1100,15 @@ cg_caller_saved_worth(refs) {
 // band register with no recorded pair, a variable with no interval, or
 // a refused/absent analysis all leave the mask bits set (-1 = save
 // everything, the exact M2 behaviour).
+// M3 probe (step 0 of the per-range cost refinement): BPP_M3_PROBE=1 in
+// the environment makes the compiler report, one stderr line per case,
+// every M3-refused promotion candidate that a per-crossed-call cost
+// model WOULD have admitted — the measured driver that decides whether
+// that refinement gets built (Rule 28). Zero effect without the env var.
+global cg_m3_probe;                  // 1 = probing (read once from the env)
+global cg_m3_probe_init;             // one-shot latch for the env read
+global cg_call_wt_hash;              // T_CALL node ptr → loop weight + 1
+
 global cg_caller_band_regs;          // int band mirror: reg per band index
 global cg_caller_band_pair_reg;      // int pairs: register…
 global cg_caller_band_pair_vi;       // …and the variable parked on it (-1 = always)
@@ -1453,6 +1462,11 @@ cg_b3_walk(nd) {
             w = 1;
             if (cg_b3_loop_depth > 0) { w = 1000; }
             cg_fn_call_wt += w;
+            // M3 probe: remember each call's own weight by node so the
+            // per-range cost study (regalloc_probe_m3) can charge a live
+            // interval only for the calls it actually crosses — the same
+            // currency as cg_fn_call_wt, just positioned.
+            if (cg_m3_probe) { hash_set(cg_call_wt_hash, nd, w + 1); }
         }
         arr = n.b; cnt = n.c;
         for (i = 0; i < cnt; i++) { cg_b3_walk(arr[i]); }
@@ -2737,6 +2751,17 @@ void cg_emit_func(fi) {
     // re-notes every caller-saved band occupant for this function.
     cg_caller_band_clear_int();
     cg_caller_band_clear_flt();
+    // M3 probe: one-shot env read, then a per-function reset of the
+    // call-weight hash the B3 walk fills (probe-gated, zero cost off).
+    if (cg_m3_probe_init == 0) {
+        cg_m3_probe_init = 1;
+        cg_m3_probe = 0;
+        if (getenv("BPP_M3_PROBE") != 0) {
+            cg_m3_probe = 1;
+            cg_call_wt_hash = hash_new(64);
+        }
+    }
+    if (cg_m3_probe) { hash_clear(cg_call_wt_hash); }
     // Expose the function body + reset the induction state so the pointer-walk
     // pass (cg_iv_detect) can scan the whole function for unsafe base uses.
     cg_cur_body = body_arr;
@@ -2897,6 +2922,14 @@ void cg_emit_func(fi) {
     // walk when a caller-saved band actually has occupants.
     if (arr_len(cg_caller_band_pair_reg) > 0 || arr_len(cg_caller_band_pair_reg_flt) > 0) {
         regalloc_stamp_call_masks(_rg_cfg, _rg_rpo, _rg_ivl);
+    }
+
+    // M3 probe (BPP_M3_PROBE=1): report every promotion the function-level
+    // cost model refused that a per-crossed-call model would admit. Runs
+    // regardless of band occupancy — the refusals under study are exactly
+    // the ones that LEFT the band empty or short.
+    if (cg_m3_probe) {
+        regalloc_probe_m3(_rg_cfg, _rg_rpo, _rg_ivl, name_p);
     }
 
     // 7b. Persist per-variable location info for the bug debugger.

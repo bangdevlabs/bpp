@@ -2808,3 +2808,138 @@ void regalloc_stamp_call_masks(blocks, rpo, intervals) {
         i++;
     }
 }
+
+// ── M3 probe — the per-range cost study (step 0, BPP_M3_PROBE=1) ────
+//
+// Question under measurement: how often does M3's FUNCTION-level gate
+// (refs > 2 * cg_fn_call_wt) refuse a caller-saved promotion that a
+// PER-RANGE gate (refs > 2 * weight of only the calls the variable's
+// interval actually crosses) would admit? Each hit prints one stderr
+// line; grep -c decides whether the refinement gets built (Rule 28).
+// Pure analysis — nothing here touches a register decision.
+
+// Collect every real call in an expression tree as a (position, weight)
+// pair, weight looked up from the B3 walk's node hash. A miss means the
+// walk never charged this node into cg_fn_call_wt (a leaf-safe builtin,
+// or an analysis clone of an inline-expanded call that emits as a
+// splice) — consistent currency says skip it.
+static void _rg_probe_collect_expr(nd, pos, pos_arr_p, wt_arr_p) {
+    auto n: Node, t, arr, cnt, i, w;
+    if (nd == 0) { return; }
+    n = nd; t = n.ntype;
+    if (t == T_CALL) {
+        w = hash_get(cg_call_wt_hash, nd);
+        if (w != 0) {
+            *pos_arr_p = arr_push(*pos_arr_p, pos);
+            *wt_arr_p  = arr_push(*wt_arr_p, w - 1);
+        }
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) { _rg_probe_collect_expr(arr[i], pos, pos_arr_p, wt_arr_p); i++; }
+        return;
+    }
+    if (t == T_BINOP) { _rg_probe_collect_expr(n.b, pos, pos_arr_p, wt_arr_p); _rg_probe_collect_expr(n.c, pos, pos_arr_p, wt_arr_p); return; }
+    if (t == T_UNARY) { _rg_probe_collect_expr(n.b, pos, pos_arr_p, wt_arr_p); return; }
+    if (t == T_MEMLD) { _rg_probe_collect_expr(n.a, pos, pos_arr_p, wt_arr_p); return; }
+    if (t == T_ADDR)  { _rg_probe_collect_expr(n.a, pos, pos_arr_p, wt_arr_p); return; }
+    if (t == T_TERNARY) {
+        _rg_probe_collect_expr(n.a, pos, pos_arr_p, wt_arr_p);
+        _rg_probe_collect_expr(n.b, pos, pos_arr_p, wt_arr_p);
+        _rg_probe_collect_expr(n.c, pos, pos_arr_p, wt_arr_p);
+    }
+}
+
+// Statement-shape dispatch for the collector — same shapes as
+// _rg_stamp_stmt.
+static void _rg_probe_collect_stmt(nd, pos, pos_arr_p, wt_arr_p) {
+    auto n: Node, t, arr, cnt, i;
+    if (nd == 0) { return; }
+    n = nd; t = n.ntype;
+    if (t == T_ASSIGN) { _rg_probe_collect_expr(n.b, pos, pos_arr_p, wt_arr_p); return; }
+    if (t == T_MEMST)  { _rg_probe_collect_expr(n.a, pos, pos_arr_p, wt_arr_p); _rg_probe_collect_expr(n.b, pos, pos_arr_p, wt_arr_p); return; }
+    if (t == T_RET) {
+        if (n.c > 1) {
+            arr = n.b; cnt = n.c;
+            i = 0;
+            while (i < cnt) { _rg_probe_collect_expr(arr[i], pos, pos_arr_p, wt_arr_p); i++; }
+        } else {
+            _rg_probe_collect_expr(n.a, pos, pos_arr_p, wt_arr_p);
+        }
+        return;
+    }
+    if (t == T_DECL || t == T_BREAK || t == T_CONTINUE || t == T_NOP) { return; }
+    _rg_probe_collect_expr(nd, pos, pos_arr_p, wt_arr_p);
+}
+
+// The probe body. For every B3-eligible variable that ended up in
+// MEMORY while the function-level M3 gate would refuse it, sum the
+// weights of only the calls its interval(s) cross and report when the
+// per-range test flips the verdict.
+void regalloc_probe_m3(blocks, rpo, intervals, fn_name) {
+    auto pos_arr, wt_arr, n, i, blk, b: CfgBlock, k, nstmts, pos;
+    auto vi, nvars, refs, crossed, ni, it: LiveInterval, c, name_p;
+    if (cg_fn_leaf) { return; }        // leaf: M3 never gates anything
+    if (cg_fn_call_wt == 0) { return; }
+    pos_arr = arr_new(); wt_arr = arr_new();
+    n = arr_len(rpo);
+    pos = 0;
+    i = 0;
+    while (i < n) {
+        blk = arr_get(rpo, i);
+        b = arr_struct_at(blocks, blk);
+        nstmts = arr_len(b.stmts);
+        k = 0;
+        while (k < nstmts) {
+            _rg_probe_collect_stmt(arr_get(b.stmts, k), pos + k, &pos_arr, &wt_arr);
+            k++;
+        }
+        pos = pos + nstmts;
+        i++;
+    }
+    ni = arr_struct_count(intervals);
+    nvars = arr_len(cg_vars);
+    if (nvars > 64) { nvars = 64; }    // liveness bits stop at 64 vars
+    vi = 0;
+    while (vi < nvars) {
+        if (cg_b3_eligible(vi) == 0) { vi++; continue; }
+        if (arr_get(cg_var_promote, vi) >= 0) { vi++; continue; }   // promoted anyway
+        refs = arr_get(cg_var_refs, vi);
+        if (refs <= 1) { vi++; continue; }                          // below B3's own bar
+        if (cg_caller_saved_worth(refs)) { vi++; continue; }        // M3 admits — refusal was budget, not cost
+        // M3 refused this candidate. Charge only the crossed calls.
+        crossed = 0;
+        k = 0;
+        while (k < ni) {
+            it = arr_struct_at(intervals, k);
+            if (it.var_idx == vi) {
+                c = 0;
+                while (c < arr_len(pos_arr)) {
+                    if (arr_get(pos_arr, c) >= it.start_pos && arr_get(pos_arr, c) <= it.end_pos) {
+                        crossed = crossed + arr_get(wt_arr, c);
+                    }
+                    c++;
+                }
+            }
+            k++;
+        }
+        if (refs > crossed * 2) {
+            diag_str("M3PROBE ");
+            diag_buf(vbuf + unpack_s(fn_name), unpack_l(fn_name));
+            diag_str(" var=");
+            // Variable names are packed into cg_sbuf (the codegen string
+            // pool), unlike function names which live in vbuf.
+            name_p = arr_get(cg_vars, vi);
+            diag_buf(cg_sbuf + unpack_s(name_p), unpack_l(name_p));
+            diag_str(" refs=");
+            diag_int(refs);
+            diag_str(" fnwt=");
+            diag_int(cg_fn_call_wt);
+            diag_str(" crossed=");
+            diag_int(crossed);
+            diag_newline();
+        }
+        vi++;
+    }
+    arr_free(pos_arr);
+    arr_free(wt_arr);
+}
