@@ -6162,56 +6162,6 @@ void annotate_temps() {
 //      (so substituting an argument can never duplicate side effects;
 //      this lets us skip the bind-to-temp machinery entirely).
 
-// Count AST nodes in a subtree. Originally written for Phase B2's
-// expression-only bodies (`body_cnt == 1, body[0] == T_RET`); S4 P1
-// extends to statement-typed nodes so the same walker can score
-// multi-statement bodies. The `else → return 99` arm stays as the
-// safety net for control-flow nodes (T_IF / T_WHILE / T_SWITCH /
-// T_BLOCK) that S4 explicitly rejects per Q1 caveat — getting one
-// of those back from the count immediately disqualifies the body.
-// Does this statement array contain a T_RET ANYWHERE, at any nesting
-// depth (2026-06-24 — the bug this guards: `is_alpha`/`is_digit`-style
-// "if (cond) { return X; } ... return Y;" leaves use EARLY returns
-// inside their if-bodies, not just a single trailing one. cg_emit_stmt's
-// T_RET handler is unconditional — "evaluate return expression... jump
-// to the epilogue" — it has no notion of "currently splicing an inlined
-// body" and will jump to the OUTER, ENCLOSING function's real epilogue,
-// terminating the wrong function and corrupting control flow. Confirmed
-// the hard way: the self-hosted compiler hung on EVEN a trivial 4-line
-// program once is_alpha (used by the lexer on every character) got
-// inlined with this exact shape — control flow landed somewhere
-// garbage almost immediately. A trailing T_RET is fine — that ONE
-// statement is never walked by cg_emit_stmt's per-statement splice loop;
-// cg_emit_inline_multi pulls its EXPRESSION out and evaluates that
-// directly, no real `ret` involved. Any OTHER T_RET, at any depth
-// inside an if/while/block, is NOT fine — disqualify the whole body
-// rather than try to teach the splice to rewrite early returns into
-// structured control flow (a real future increment, not a one-line fix:
-// it would need to turn "return X" into "result = X; goto/flag done"
-// threaded through every enclosing if/while, restructuring the cloned
-// tree, not just walking it).
-static _inline_body_has_nested_ret(body_arr, body_cnt) {
-    auto i, s: Node;
-    for (i = 0; i < body_cnt; i++) {
-        s = body_arr[i];
-        if (s != 0) {
-            if (s.ntype == T_RET) { return 1; }
-            if (s.ntype == T_IF) {
-                if (_inline_body_has_nested_ret(s.b, s.c)) { return 1; }
-                if (s.e > 0) {
-                    if (_inline_body_has_nested_ret(s.d, s.e)) { return 1; }
-                }
-            }
-            if (s.ntype == T_WHILE) {
-                if (_inline_body_has_nested_ret(s.b, s.c)) { return 1; }
-            }
-            if (s.ntype == T_BLOCK) {
-                if (_inline_body_has_nested_ret(s.b, s.c)) { return 1; }
-            }
-        }
-    }
-    return 0;
-}
 
 // Does `nd` contain an integer literal that needs MORE THAN ONE ARM64
 // mov-immediate instruction (more than one nonzero 16-bit chunk —
@@ -6308,6 +6258,21 @@ static _inline_has_wide_lit_body(body_arr, body_cnt) {
     return 0;
 }
 
+// Disqualification sentinel for _inline_count_nodes/_inline_cost. Used
+// to be 99 — safe while every real body cost stayed below it, broken
+// the day lever 1 made early-return bodies countable (exp_f's real
+// cost crossed 99 and read as "disqualified", exactly the
+// sentinel-doubling-as-measurement trap Inc 8's own postmortem warned
+// about). Now far above every cap so the two can never collide.
+const INLINE_DISQ = 99999;
+
+// Count AST nodes in a subtree. Originally written for Phase B2's
+// expression-only bodies (`body_cnt == 1, body[0] == T_RET`); S4 P1
+// extends to statement-typed nodes so the same walker can score
+// multi-statement bodies. The `else -> return 99` arm stays as the
+// safety net for node shapes the splice cannot emit (T_SWITCH) --
+// getting 99 back immediately disqualifies the body. Early returns
+// are COUNTED, not disqualified, since lever 1 (see the T_RET case).
 static _inline_count_nodes(nd) {
     auto n: Node, t, sum, arr, cnt, i;
     if (nd == 0) { return 0; }
@@ -6393,80 +6358,80 @@ static _inline_count_nodes(nd) {
         }
     }
     T_DECL     { return 1; }
+    // An early return inside the body (is_alpha's "if (cond) { return X; }",
+    // the transcendental totality guards) is a REAL statement since the
+    // lever-1 splice machinery (docs/plans/inliner_frontier_2.md):
+    // cg_emit_stmt's T_RET handler detects an active splice frame and
+    // emits value + jump-to-end-of-splice instead of the enclosing
+    // function's epilogue, so the Inc 7 disqualification is retired and
+    // the return simply carries its node cost.
+    T_RET {
+        auto rt_c, rt_i;
+        sum += 1;
+        if (n.c > 1) {
+            rt_i = 0;
+            while (rt_i < n.c) {
+                rt_c = _inline_count_nodes(*(n.b + rt_i * 8));
+                if (rt_c >= INLINE_DISQ) { return INLINE_DISQ; }
+                sum += rt_c;
+                rt_i++;
+            }
+        } else {
+            rt_c = _inline_count_nodes(n.a);
+            if (rt_c >= INLINE_DISQ) { return INLINE_DISQ; }
+            sum += rt_c;
+        }
+    }
     // Control-flow leaf bodies (2026-06-24, the exp_f/log_f frontier
     // named in docs/plans/inliner_arc.md's "second bl" addendum). T_IF
     // and T_WHILE no longer unconditionally fall to the catch-all
     // sentinel below — ast_clone_subst and cg_emit_stmt already handle
-    // both correctly for STRAIGHT-LINE bodies (proved by the smart-
-    // dispatch outlining arc + this splice's own per-statement
-    // cg_emit_stmt loop). What is NOT handled, and is explicitly
-    // disqualified via _inline_body_has_nested_ret above: an EARLY
-    // return buried inside the if/while body (is_alpha/is_digit's
-    // "if (cond) { return X; }" shape) — cg_emit_stmt's T_RET handler
-    // unconditionally jumps to the CURRENT function's epilogue, which
-    // is the wrong target entirely once this body is spliced into some
-    // other caller. Only a SINGLE TRAILING return (the body's last
-    // top-level statement, never walked by the per-statement splice
-    // loop — cg_emit_inline_multi pulls its expression out directly) is
-    // safe; that invariant already held for every pre-2026-06-24
-    // candidate, this just makes it an explicit, checked gate now that
-    // control flow can hide a return somewhere a human skimming the
-    // body might miss. Recurses via _inline_count_nodes_body (already
-    // does its own 99-propagation per statement) and propagates 99
-    // explicitly rather than summing it in, so a nested disqualifying
-    // shape still disqualifies the whole body. T_SWITCH stays on the
-    // catch-all below — out of scope until a real candidate needs it
-    // (Tonify Rule 28: don't build it before something measured needs
-    // it; _inline_normalize_switch_ret already handles the one switch
-    // shape that DOES need to inline today by rewriting it away before
-    // this counter ever sees a T_SWITCH node).
+    // both correctly, INCLUDING early returns since lever 1 (see the
+    // T_RET case above). T_SWITCH stays on the catch-all below — out of
+    // scope until a real candidate needs it (Tonify Rule 28;
+    // _inline_normalize_switch_ret already rewrites the one switch
+    // shape that needs to inline today).
     T_IF {
         auto if_a, if_b, if_e;
-        if (_inline_body_has_nested_ret(n.b, n.c)) { return 99; }
-        if (n.e > 0) {
-            if (_inline_body_has_nested_ret(n.d, n.e)) { return 99; }
-        }
         if_a = _inline_count_nodes(n.a);
-        if (if_a >= 99) { return 99; }
+        if (if_a >= INLINE_DISQ) { return INLINE_DISQ; }
         if_b = _inline_count_nodes_body(n.b, n.c);
-        if (if_b >= 99) { return 99; }
+        if (if_b >= INLINE_DISQ) { return INLINE_DISQ; }
         sum += if_a + if_b;
         if (n.e > 0) {
             if_e = _inline_count_nodes_body(n.d, n.e);
-            if (if_e >= 99) { return 99; }
+            if (if_e >= INLINE_DISQ) { return INLINE_DISQ; }
             sum += if_e;
         }
     }
     T_WHILE {
         auto wh_a, wh_b, wh_e;
-        if (_inline_body_has_nested_ret(n.b, n.c)) { return 99; }
         // 2026-06-24: a wide integer constant (movz+movk chain) inside
         // a loop body loses hot-constant hoisting once spliced — see
         // _inline_has_wide_lit's own comment for the measured ~2x
         // regression (examples/bench_codegen.bpp's `transform`/xform)
         // this disqualifies.
-        if (_inline_has_wide_lit(n.a)) { return 99; }
-        if (_inline_has_wide_lit_body(n.b, n.c)) { return 99; }
-        if (n.e != 0) { if (_inline_has_wide_lit(n.e)) { return 99; } }
+        if (_inline_has_wide_lit(n.a)) { return INLINE_DISQ; }
+        if (_inline_has_wide_lit_body(n.b, n.c)) { return INLINE_DISQ; }
+        if (n.e != 0) { if (_inline_has_wide_lit(n.e)) { return INLINE_DISQ; } }
         wh_a = _inline_count_nodes(n.a);
-        if (wh_a >= 99) { return 99; }
+        if (wh_a >= INLINE_DISQ) { return INLINE_DISQ; }
         wh_b = _inline_count_nodes_body(n.b, n.c);
-        if (wh_b >= 99) { return 99; }
+        if (wh_b >= INLINE_DISQ) { return INLINE_DISQ; }
         sum += wh_a + wh_b;
         if (n.e != 0) {
             wh_e = _inline_count_nodes(n.e);
-            if (wh_e >= 99) { return 99; }
+            if (wh_e >= INLINE_DISQ) { return INLINE_DISQ; }
             sum += wh_e;
         }
     }
     T_BLOCK {
         auto blk_b;
-        if (_inline_body_has_nested_ret(n.b, n.c)) { return 99; }
         blk_b = _inline_count_nodes_body(n.b, n.c);
-        if (blk_b >= 99) { return 99; }
+        if (blk_b >= INLINE_DISQ) { return INLINE_DISQ; }
         sum += blk_b;
     }
-    else { return 99; }
+    else { return INLINE_DISQ; }
     }
     return sum;
 }
@@ -6790,7 +6755,7 @@ static _inline_count_nodes_body(body_arr, body_cnt) {
     sum = 0;
     for (i = 0; i < body_cnt; i++) {
         s = _inline_count_nodes(body_arr[i]);
-        if (s >= 99) { return 99; }     // unhandled type — disqualify
+        if (s >= INLINE_DISQ) { return INLINE_DISQ; }     // unhandled type — disqualify
         sum += s;
     }
     return sum;
@@ -6980,9 +6945,9 @@ static _inline_cost(fn_idx, args_arr, arg_cnt) {
     fn_rec = funcs[fn_idx];
     body_arr = *(fn_rec + FN_BODY);
     body_cnt = *(fn_rec + FN_BCNT);
-    if (body_arr == 0 || body_cnt == 0) { return 99; }
+    if (body_arr == 0 || body_cnt == 0) { return INLINE_DISQ; }
     nodes = _inline_count_nodes_body(body_arr, body_cnt);
-    if (nodes >= 99) { return 99; }        // disqualified body
+    if (nodes >= INLINE_DISQ) { return INLINE_DISQ; }        // disqualified body
     indirect = _inline_indirect_call_count(body_arr, body_cnt);
     globals  = _inline_global_write_count(body_arr, body_cnt);
     consts   = _inline_const_arg_count(args_arr, arg_cnt);
@@ -8170,7 +8135,7 @@ void classify_inlineable() {
         // had splice support; switch normalisation is a SEPARATE rewrite
         // earlier in this same function, not a splice-time capability).
         is_oversized = 0;
-        if (body_cost >= 99) { continue; }
+        if (body_cost >= INLINE_DISQ) { continue; }
         if (ret_arity > 1) {
             if (body_cost > INLINE_MULTIRET_NODE_CAP_HARD) { continue; }
             if (body_cost > INLINE_MULTIRET_NODE_CAP) { is_oversized = 1; }
