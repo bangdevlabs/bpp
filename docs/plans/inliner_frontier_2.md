@@ -148,3 +148,30 @@ for "don't splice a register-hungry loop body into a
 budget-constrained caller"; true retirement = budget-aware splice
 gating + mangled-slot ref counting (the named future increment,
 together with the tier-4 cap question above).
+
+## Addendum — the tier-4 cap question, answered (2026-07-10 night, `ce685ca`)
+
+Instruments first: **BPP_INLINE_PROBE=1** prints every classification
+(cost/arity) and every tier-4 callsite ADMIT/DENY with cost-vs-threshold;
+**sf_bench_inserts.bpp** is the all-inserts acceptance bench (baseline
+102.9 ms / 29× / ×2.3 vs oracle — levers 2 and 3's real numbers live
+here now: the blondie chain's 90 ms is dominated by the 1024-tap conv,
+loop-bound, inlining-neutral).
+
+The measurement: exp_f 98 / cos_f 101 / log_f 104 / sin_f 106 vs the
+90 hot ceiling — denied by ≤ 16. (log_f is a true leaf today; the
+exp_f-bootstrap note above is stale.) The obvious fix — ×2 threshold
+for true-leaf callees — was tried and **REFUSED by the bench: +27%**
+(30 exp_f sites admitted; ~100-node bodies merged into comp_process /
+sf_channel_process; register budgets diluted). Together with the
+wide-lit finding, that is the SAME mechanism measured twice in one
+night, and it settles the frontier's shape:
+
+**The next inliner increment is budget-aware splice admission** — a
+caller-side pressure account (projected live locals of already-admitted
+splices vs the register budget) consulted at tier-4 admission time,
+replacing both the wide-lit proxy and any flat threshold tuning. Its
+two measured drivers: xform 6.8→11.4 ms (wide-lit off), inserts bench
+102.9→130.5 ms (leaf bonus on). Until it exists, the transcendental
+family stays as honest bl's — cheap ones: the chain they'd collapse is
+worth ~2 bl/sample against a 90 ms conv-dominated render.

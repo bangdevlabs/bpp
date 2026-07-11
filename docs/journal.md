@@ -16065,3 +16065,21 @@ plugin boundary; blondie's chain waits for a real driver.
 
 Full ladder on every commit: gen2==gen3, 241/0/12 + 199/0/54, Docker
 x64 self-host, checksums exact, md5 f61fac72… intact.
+
+## 2026-07-10 (close) — the caps question answers itself: pressure, not size
+
+The tier-4 session opened as "raise the ceilings for exp_f/log_f/sin_f"
+and closed having learned why that is the wrong axis. The new inline
+probe measured the family denied by ≤16 against the 90 hot ceiling; the
+new all-inserts bench (the acceptance instrument levers 2/3 were
+waiting for — 102.9 ms, ×2.3 vs oracle, blondie's conv dominating)
+then refused the leaf-bonus fix at +27%: thirty admitted exp_f sites
+merged ~100-node bodies into the channel chain and diluted its
+register budgets. Second time in one night the same mechanism vetoed a
+splice heuristic — the wide-lit retirement fell to it at dusk, the
+leaf bonus at midnight. Node counts do not model register pressure;
+the reverted bonus, the standing probe, and two paired measurements
+now define the next increment precisely: budget-aware splice
+admission. Everything ships clean — gen2==gen3, 241/0/12 + 199/0/54,
+md5 intact — and the levers close tied: 1 shipped, 4 shipped-reshaped,
+2/3 measured into their real numbers instead of adjectives.

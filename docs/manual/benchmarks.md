@@ -1090,3 +1090,21 @@ bluff (png_decode_to_buf, static x29 78 → 141 under M6) is an
 asset-load function whose loop-weighted DYNAMIC traffic the gate
 certifies as a net win — static instruction counts are no longer the
 right gauge for caller-band functions, loop-weighted refs are.
+
+### 2026-07-10 (night) — the all-inserts DAW bench joins the catalog
+
+`tools/sound_fusion/sf_bench_inserts.bpp`: sf_bench's twin with the
+lead track's full five-slot insert chain engaged (blondie amp +
+moon filter + zener comp + spring + rotary), so the compressor dB math
+and the amp's oversampled-tube + 1024-tap conv chain execute per
+sample instead of hiding behind the demo's defaults. Run it whenever a
+change touches the inliner, the DSP cartridges, or float codegen.
+
+| build | per 3s render | realtime | vs oracle (cc -O2, 45.4 ms) |
+|---|---|---|---|
+| baseline (post lever 1-4) | 102.9-104.6 ms | 29× | **×2.3** |
+
+First measured story it told: a 2x tier-4 threshold bonus for leaf
+callees pushed it to 130.5 ms (+27%) — thirty exp_f splice sites
+diluted the merged callers' register budgets — and was reverted the
+same hour. Node counts don't model pressure; the bench is the judge.
