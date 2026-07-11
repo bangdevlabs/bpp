@@ -6266,6 +6266,25 @@ static _inline_has_wide_lit_body(body_arr, body_cnt) {
 // about). Now far above every cap so the two can never collide.
 const INLINE_DISQ = 99999;
 
+// Budget-aware splice admission (2026-07-11). Two measurements in one
+// night showed the same failure: merging register-hungry spliced
+// bodies into one caller dilutes its promotion budget until hot values
+// fall back to memory (xform 6.8->11.4 ms with the wide-lit refusal
+// off; the all-inserts bench 102.9->130.5 ms under a flat leaf bonus).
+// Node-count thresholds cannot see this — REGISTER PRESSURE can. The
+// account is arr_len(cg_vars) at registration time: the caller's own
+// locals plus every already-admitted splice's mangled slots (pre-reg
+// appends them there, in this same walk). A LOOP-CARRYING callee (its
+// slots are hot by construction) is admitted only while that live
+// count plus its own slot need stays within the cap; straightline
+// callees (the moog chain, the dB wrappers) stay ungated — their
+// slots' heat comes from the callsite, which the tier gates already
+// price. 14 = the a64 non-leaf B3 budget (callee-saved 10 + caller
+// band 4); x64 is tighter (7) but its dilution is bounded by the same
+// splices this cap already refuses. Denial is always safe: the call
+// stays a real bl.
+const INLINE_PRESSURE_CAP = 14;
+
 // Count AST nodes in a subtree. Originally written for Phase B2's
 // expression-only bodies (`body_cnt == 1, body[0] == T_RET`); S4 P1
 // extends to statement-typed nodes so the same walker can score
@@ -7245,6 +7264,77 @@ _inline_register_callee_locals(body_arr, body_cnt, id) {
 // the splice procedure. Returns the assigned id. Does NOT touch any
 // T_CALL node — callers decide separately whose `.e` field (if any)
 // gets stamped with the returned id (see `_inline_register_callsite`
+// Does this body contain a T_WHILE anywhere? A loop-carrying callee's
+// locals are hot on their own, so its splice is the pressure-gated
+// kind (see INLINE_PRESSURE_CAP above).
+static _inline_body_has_loop(body_arr, body_cnt) {
+    auto i, s: Node;
+    for (i = 0; i < body_cnt; i++) {
+        s = body_arr[i];
+        if (s == 0) { continue; }
+        if (s.ntype == T_WHILE) { return 1; }
+        if (s.ntype == T_IF) {
+            if (_inline_body_has_loop(s.b, s.c)) { return 1; }
+            if (s.e > 0) { if (_inline_body_has_loop(s.d, s.e)) { return 1; } }
+        }
+        if (s.ntype == T_BLOCK) {
+            if (_inline_body_has_loop(s.b, s.c)) { return 1; }
+        }
+    }
+    return 0;
+}
+
+// How many caller-frame slots would splicing `fidx` append — its
+// parameters plus every local declared anywhere in its body (the same
+// set _inline_register_callsite_slots / _register_callee_locals
+// create as _inl<id>_* slots).
+static _inline_count_decls(body_arr, body_cnt) {
+    auto i, cnt, s: Node;
+    cnt = 0;
+    for (i = 0; i < body_cnt; i++) {
+        s = body_arr[i];
+        if (s == 0) { continue; }
+        if (s.ntype == T_DECL) { cnt += s.b; }
+        if (s.ntype == T_IF) {
+            cnt += _inline_count_decls(s.b, s.c);
+            if (s.e > 0) { cnt += _inline_count_decls(s.d, s.e); }
+        }
+        if (s.ntype == T_WHILE || s.ntype == T_BLOCK) {
+            cnt += _inline_count_decls(s.b, s.c);
+        }
+    }
+    return cnt;
+}
+static _inline_callee_slot_need(fidx) {
+    auto fn_rec;
+    fn_rec = funcs[fidx];
+    return *(fn_rec + FN_PCNT) + _inline_count_decls(*(fn_rec + FN_BODY), *(fn_rec + FN_BCNT));
+}
+
+// The admission decision. Registration-time ONLY: a denial simply
+// leaves the callsite id at 0 (top-level: .e never stamped; nested:
+// a 0 pushed into nested_ids), and the splice machinery's existing
+// `.e == 0 -> real bl` convention does the rest — consumption never
+// re-runs this check, so the two phases cannot disagree.
+static _inline_pressure_admit(fidx) {
+    auto fn_rec, live, need;
+    fn_rec = funcs[fidx];
+    if (_inline_body_has_loop(*(fn_rec + FN_BODY), *(fn_rec + FN_BCNT)) == 0) { return 1; }
+    live = arr_len(cg_vars);
+    need = _inline_callee_slot_need(fidx);
+    if (live + need <= INLINE_PRESSURE_CAP) { return 1; }
+    if (_inl_probe) {
+        diag_str("INLPROBE pressure DENY callee=");
+        diag_buf(vbuf + unpack_s(*(fn_rec + FN_NAME)), unpack_l(*(fn_rec + FN_NAME)));
+        diag_str(" live=");
+        diag_int(live);
+        diag_str(" need=");
+        diag_int(need);
+        diag_newline();
+    }
+    return 0;
+}
+
 // below for the top-level case, `_inline_register_nested` for the
 // Inc 6 nested case, which deliberately never stamps the SHARED body).
 _inline_register_callsite_slots(fidx) {
@@ -7317,6 +7407,9 @@ _inline_register_callsite_slots(fidx) {
 // exactly one function and is never shared with any other caller.
 void _inline_register_callsite(call_node, fidx) {
     auto cn: Node, id;
+    // Budget-aware admission: a pressure denial leaves .e at 0 and the
+    // call site stays a real bl (see INLINE_PRESSURE_CAP).
+    if (_inline_pressure_admit(fidx) == 0) { return; }
     cn = call_node;
     id = _inline_register_callsite_slots(fidx);
     cn.e = id;
@@ -7521,6 +7614,15 @@ void _inline_register_nested(outer_id, body_arr, body_cnt, owner_fidx) {
     while (i < arr_len(found)) {
         n = arr_get(found, i);
         fidx = find_func_idx(n.a);
+        // Budget-aware admission: a denied nested call keeps its
+        // positional slot in `ids` as 0 so splice-time stamping stays
+        // aligned — the clone's .e gets 0 and the call emits as a real
+        // bl, the exact convention un-stamped calls already follow.
+        if (_inline_pressure_admit(fidx) == 0) {
+            ids = arr_push(ids, 0);
+            i++;
+            continue;
+        }
         nested_id = _inline_register_callsite_slots(fidx);
         ids = arr_push(ids, nested_id);
         i++;
