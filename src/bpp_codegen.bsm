@@ -1446,6 +1446,114 @@ cg_const_record(packed) {
     return 0;
 }
 
+// ── Lever 4: constant discovery inside inlineable callees ───────────
+//
+// The B3 walk runs on the CALLER's own body, so a wide integer literal
+// living inside a callee that will be SPLICED here was invisible to
+// hot-constant promotion — the exact hole behind the 2026-06-24 xform
+// 2x regression, patched then by refusing to inline any loop body
+// carrying a wide literal (_inline_has_wide_lit). This walker retires
+// that refusal: at a T_CALL whose callee is inline-eligible, descend
+// into the callee's body and record its integer literals into the
+// caller's constant table at the CURRENT loop weight (cg_const_record
+// reads cg_b3_loop_depth, so the weight is inherited for free). Only
+// constants are collected — variables, leaf-ness and call weights keep
+// their existing owners. cg_b3_desc_seen breaks is_alpha-class
+// recursion cycles; tier-4 callees are descended unconditionally even
+// though their splice is per-callsite cost-gated (a site that ends up
+// NOT splicing merely over-weights a constant — at worst one spare
+// callee-saved register is spent on it).
+global cg_b3_desc_seen;
+
+static void _cg_b3_desc_expr(nd) {
+    auto n: Node, t, arr, cnt, i;
+    if (nd == 0) { return; }
+    n = nd; t = n.ntype;
+    if (t == T_LIT) { cg_const_record(n.a); return; }
+    if (t == T_BINOP) { _cg_b3_desc_expr(n.b); _cg_b3_desc_expr(n.c); return; }
+    if (t == T_UNARY) { _cg_b3_desc_expr(n.b); return; }
+    if (t == T_MEMLD) { _cg_b3_desc_expr(n.a); return; }
+    if (t == T_ADDR)  { _cg_b3_desc_expr(n.a); return; }
+    if (t == T_TERNARY) {
+        _cg_b3_desc_expr(n.a); _cg_b3_desc_expr(n.b); _cg_b3_desc_expr(n.c);
+        return;
+    }
+    if (t == T_CALL) {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { _cg_b3_desc_expr(arr[i]); }
+        cg_b3_desc_consts(n);
+    }
+}
+
+static void _cg_b3_desc_stmt(nd) {
+    auto n: Node, t, arr, cnt, i;
+    if (nd == 0) { return; }
+    n = nd; t = n.ntype;
+    if (t == T_ASSIGN) { _cg_b3_desc_expr(n.b); return; }
+    if (t == T_MEMST)  { _cg_b3_desc_expr(n.a); _cg_b3_desc_expr(n.b); return; }
+    if (t == T_RET) {
+        if (n.c > 1) {
+            arr = n.b; cnt = n.c;
+            for (i = 0; i < cnt; i++) { _cg_b3_desc_expr(arr[i]); }
+        } else {
+            _cg_b3_desc_expr(n.a);
+        }
+        return;
+    }
+    if (t == T_IF) {
+        _cg_b3_desc_expr(n.a);
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { _cg_b3_desc_stmt(arr[i]); }
+        if (n.e > 0) {
+            arr = n.d; cnt = n.e;
+            for (i = 0; i < cnt; i++) { _cg_b3_desc_stmt(arr[i]); }
+        }
+        return;
+    }
+    if (t == T_WHILE) {
+        // Mirror cg_b3_walk's own loop-depth tracking: a constant inside
+        // the CALLEE's loop is hot once spliced, whatever the callsite's
+        // own depth — without this the xform regression returns (the
+        // spliced loop's wide literal recorded at weight 1, below the
+        // promotion threshold).
+        cg_b3_loop_depth = cg_b3_loop_depth + 1;
+        _cg_b3_desc_expr(n.a);
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { _cg_b3_desc_stmt(arr[i]); }
+        if (n.e != 0) { _cg_b3_desc_stmt(n.e); }
+        cg_b3_loop_depth = cg_b3_loop_depth - 1;
+        return;
+    }
+    if (t == T_BLOCK) {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { _cg_b3_desc_stmt(arr[i]); }
+        return;
+    }
+    if (t == T_DECL || t == T_NOP || t == T_BREAK || t == T_CONTINUE) { return; }
+    _cg_b3_desc_expr(nd);
+}
+
+// Descend into `call_node`'s callee if it is inline-eligible, recording
+// its body's constants at the current loop weight. Called from
+// cg_b3_walk's own T_CALL case and from the nested descent above.
+static void cg_b3_desc_consts(call_node) {
+    auto n: Node, fidx, fn_rec, body_arr, body_cnt, i;
+    n = call_node;
+    fidx = find_func_idx(n.a);
+    if (fidx < 0) { return; }
+    if (arr_get(fn_inlineable, fidx) == 0 && arr_get(fn_void_inlineable, fidx) == 0) { return; }
+    if (cg_b3_desc_seen == 0) { cg_b3_desc_seen = arr_new(); }
+    for (i = 0; i < arr_len(cg_b3_desc_seen); i++) {
+        if (arr_get(cg_b3_desc_seen, i) == fidx) { return; }   // cycle guard
+    }
+    cg_b3_desc_seen = arr_push(cg_b3_desc_seen, fidx);
+    fn_rec = funcs[fidx];
+    body_arr = *(fn_rec + FN_BODY);
+    body_cnt = *(fn_rec + FN_BCNT);
+    for (i = 0; i < body_cnt; i++) { _cg_b3_desc_stmt(body_arr[i]); }
+    arr_pop(cg_b3_desc_seen);
+}
+
 // A T_CALL to an inlined memory builtin (the peek/poke family) emits only a
 // load or store — no `call`/`syscall` instruction, no caller-saved-register
 // clobber — so it must NOT disqualify a function from the leaf register budget.
@@ -1528,6 +1636,10 @@ cg_b3_walk(nd) {
             // probe reads the same hash.
             if (cg_call_wt_hash != 0) { hash_set(cg_call_wt_hash, nd, w + 1); }
         }
+        // Lever 4: an inline-eligible callee's own constants land in
+        // THIS function once spliced — record them at this loop weight
+        // so hot-constant promotion sees them (cg_b3_desc_consts).
+        cg_b3_desc_consts(n);
         arr = n.b; cnt = n.c;
         for (i = 0; i < cnt; i++) { cg_b3_walk(arr[i]); }
     }
