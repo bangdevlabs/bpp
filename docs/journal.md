@@ -16025,3 +16025,43 @@ gen2==gen3, 240/0/12 + 198/0/54, Docker self-host, DSP 10/10, md5
 intact. The RegAlloc v2 arc now charges, at promotion time, exactly the
 price the M5 masks pay at emission time — the model and the machine
 finally agree.
+
+## 2026-07-10 (night) — the inliner arc reopens: early returns fall, and two walls fall with them
+
+The frontier study's lever 1 shipped the way the plan's own "heavier
+increment" described: every splice carries an end-of-splice label, and
+a `return` met inside an inlined body emits its value (coerced to the
+callee's declared type, discarded for void, stored to the caller-side
+targets for multi-assign) and JUMPS — never touching the enclosing
+epilogue. The guard short-circuit survives as a real branch, which is
+why the study's guard→ternary sketch was rejected: exp_f's guards
+exist to prevent non-termination, and a rewrite that runs the body
+first would hang on the very inputs the guards catch.
+
+Landing it knocked down three latent walls. The new test's
+ordered_pair made the compiler SEGFAULT before the flip — the
+guard/switch normalisers fold `if (c) { return X; } return Y;` into a
+ternary without checking arity, silently dropping results 2..N of a
+multi-value return (`2c2178b`). The flip then inflated process_file's
+frame past 4095 bytes and the a64 encoder put the immediate's 13th bit
+on the SH field: `sub sp, sp, #0x1510` emitted as a 5 MB frame, stack
+overflow two import levels deep — read straight off bug --disasm,
+fixed with enc_add/sub_imm_any (`2f0975b`). And the 99 cost sentinel
+collided with the first real body cost past 99 (exp_f + its new
+guards), the exact sentinel trap Inc 8's postmortem warned about —
+INLINE_DISQ = 99999.
+
+Census after: the compressor chain drops 6 bl → 3 (zener_process,
+amp_to_db_f and db_to_amp_f all spliced), lfo_set_rate spliced into
+rotary_tick. Lever 4 (`6b39179`) then made spliced callees' constants
+visible to hot-constant promotion — but its planned second half, the
+wide-lit refusal retirement, was REFUSED BY THE MEASUREMENT: xform ran
+~1.6x slow even with constants visible, and the disasm showed why —
+movz+movk chains re-materializing inside the loop because the merged
+caller's register budget was spent. The refusal stays, its real reason
+finally named: budget dilution, not constant visibility. Levers 2/3
+close as verdicts: the insert dispatch layer keeps its honest one-bl
+plugin boundary; blondie's chain waits for a real driver.
+
+Full ladder on every commit: gen2==gen3, 241/0/12 + 199/0/54, Docker
+x64 self-host, checksums exact, md5 f61fac72… intact.

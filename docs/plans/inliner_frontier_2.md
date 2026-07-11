@@ -106,3 +106,45 @@ this study's journal entry; it is the acceptance metric for any
 reopened increment — bl/sample per chain, then sf_bench + a
 compressor-active + a blondie-active bench variant so the inactive-in-
 demo chains stop hiding.
+
+## Execution record — 2026-07-10, levers 1-4
+
+**Lever 1 SHIPPED** (`2fd8077` mechanism byte-identical, `2c2178b`
+normaliser arity fix + test, `2f0975b` flip). Structured early returns:
+splice frames carry an end label; T_RET inside a splice emits value
+(coerced to the callee's declared type / discarded / stored to
+multi-assign targets) + jump. Three latent bugs fell during landing:
+(1) the guard/switch normalisers silently DROPPED results 2..N of
+multi-value returns (compiler segfault, pre-existing, found by the new
+test); (2) the a64 encoder corrupted frames past 4095 bytes — the 13th
+immediate bit landed on SH and a 5392-byte frame became 5 MB
+(enc_add/sub_imm_any now split); (3) the 99 cost sentinel collided with
+real early-ret body costs (INLINE_DISQ = 99999). Census: compressor
+chain 6 bl → 3 (zener + both dB wrappers spliced), lfo_set_rate
+spliced. Remaining: exp_f / log_f / sin_f / lfo_value — tier-4 cap
+question, measure before raising.
+
+**Lever 2 verdict — leave the insert dispatch layer.** The 4 surviving
+sf_channel_process bls (blondie, comp, spring, rotary) are big
+multi-return control-flow bodies over every cap; the xform lesson
+below says merging register-hungry bodies into one budget is how
+regressions happen. One bl per active insert per sample is the honest
+plugin-boundary price today.
+
+**Lever 3 verdict — deferred, low priority.** blondie's amp_process
+(5 bl/sample when active: oversample pair, stage_chain ×2, conv_tick)
+is inactive in the bench and the DAW holds 122×+ realtime; conv_tick
+is loop-bound (inlining buys nothing). Revisit with a blondie-active
+bench when the plugin ships in a project.
+
+**Lever 4 SHIPPED with its target renamed** (`6b39179`).
+cg_b3_desc_consts makes spliced callees' constants visible to
+hot-constant promotion (loop-depth mirrored — without it the constants
+recorded at weight 1). But the wide-lit refusal STAYS: with it off,
+xform ran ~11.4ms vs its 6.6-7.8 band even with constants visible —
+bug --disasm showed movz+movk chains re-materializing IN-loop because
+the merged caller's B3 budget was exhausted. The refusal is a proxy
+for "don't splice a register-hungry loop body into a
+budget-constrained caller"; true retirement = budget-aware splice
+gating + mangled-slot ref counting (the named future increment,
+together with the tier-4 cap question above).
