@@ -7015,6 +7015,8 @@ static _inline_caller_fanout(caller_idx) {
     return arr_len(callers);
 }
 
+
+
 static _inline_threshold(callee_idx, caller_idx, call_node) {
     auto n: Node, threshold;
     threshold = INLINE_BASE_THRESHOLD;
@@ -7369,7 +7371,20 @@ _inline_find_nested_calls(nd, out_arr, owner_fidx) {
                 // spliced into comp_process) — fn_hot_transitive[owner_fidx]
                 // is what lets exp_f clear here once db_to_amp_f's own
                 // hotness has propagated up from the real DSP loop.
-                if (_inline_cost(fidx, n.b, n.c) <= _inline_threshold(fidx, owner_fidx, n)) {
+                auto _ip_c, _ip_t;
+                _ip_c = _inline_cost(fidx, n.b, n.c);
+                _ip_t = _inline_threshold(fidx, owner_fidx, n);
+                if (_inl_probe) {
+                    diag_str("INLPROBE t4-nested callee=");
+                    diag_buf(vbuf + unpack_s(n.a), unpack_l(n.a));
+                    diag_str(_ip_c <= _ip_t ? " ADMIT" : " DENY");
+                    diag_str(" cost=");
+                    diag_int(_ip_c);
+                    diag_str(" thr=");
+                    diag_int(_ip_t);
+                    diag_newline();
+                }
+                if (_ip_c <= _ip_t) {
                     out_arr = arr_push(out_arr, n);
                 }
             } else {
@@ -7554,7 +7569,20 @@ void _inline_pre_reg_walk(nd) {
                 // threshold — exp_f (cost 78) clears at a call site
                 // proven hot via fn_hot_transitive (threshold -> 90),
                 // and stays a real `bl` at any call site that isn't.
-                if (_inline_cost(fidx, n.b, n.c) <= _inline_threshold(fidx, cg_cur_fn_idx, n)) {
+                auto _ip2_c, _ip2_t;
+                _ip2_c = _inline_cost(fidx, n.b, n.c);
+                _ip2_t = _inline_threshold(fidx, cg_cur_fn_idx, n);
+                if (_inl_probe) {
+                    diag_str("INLPROBE t4-site callee=");
+                    diag_buf(vbuf + unpack_s(n.a), unpack_l(n.a));
+                    diag_str(_ip2_c <= _ip2_t ? " ADMIT" : " DENY");
+                    diag_str(" cost=");
+                    diag_int(_ip2_c);
+                    diag_str(" thr=");
+                    diag_int(_ip2_t);
+                    diag_newline();
+                }
+                if (_ip2_c <= _ip2_t) {
                     _inline_register_callsite(n, fidx);
                 }
             } else if (arr_get(fn_inlineable, fidx)) {
@@ -7975,12 +8003,20 @@ static _inline_normalize_switch_ret(fn_rec) {
 //      once (Phase B2's substitute-without-bind invariant; the
 //      multi-statement splice in P3b will alpha-rename args
 //      into temps and relax this).
+// BPP_INLINE_PROBE=1: report each function's inline classification
+// (cost / arity / tier) and every tier-4 per-callsite admit/deny with
+// the exact cost-vs-threshold numbers — the measurement tool for cap
+// and threshold questions (the M3 probe's inliner twin).
+global _inl_probe;
+
 void classify_inlineable() {
     auto i, fn_rec, body_arr, body_cnt, params, pcnt;
     auto last_stmt: Node, ret_stmt: Node, ret_expr, j, ok, refs;
     auto phase, body_cost, want_void, want_bind, was_guard, has_float_param;
     auto ret_arity, is_oversized;
     auto fp_changed, fp_iter, fp_sum_before, fp_sum_after, fp_si;
+    _inl_probe = 0;
+    if (getenv("BPP_INLINE_PROBE") != 0) { _inl_probe = 1; }
     while (arr_len(fn_inlineable) < func_cnt) {
         fn_inlineable = arr_push(fn_inlineable, 0);
     }
@@ -8135,6 +8171,15 @@ void classify_inlineable() {
         // had splice support; switch normalisation is a SEPARATE rewrite
         // earlier in this same function, not a splice-time capability).
         is_oversized = 0;
+        if (_inl_probe) {
+            diag_str("INLPROBE fn=");
+            diag_buf(vbuf + unpack_s(*(fn_rec + FN_NAME)), unpack_l(*(fn_rec + FN_NAME)));
+            diag_str(" cost=");
+            diag_int(body_cost);
+            diag_str(" arity=");
+            diag_int(ret_arity);
+            diag_newline();
+        }
         if (body_cost >= INLINE_DISQ) { continue; }
         if (ret_arity > 1) {
             if (body_cost > INLINE_MULTIRET_NODE_CAP_HARD) { continue; }
