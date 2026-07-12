@@ -402,6 +402,22 @@ void x64_enc_imul(dst, src) {
     x64_enc_modrm(3, dst, src);
 }
 
+// IMUL r64, r/m64, imm — three-operand form: dst = src * imm (low 64 bits).
+// Uses the imm8 opcode (0x6B) when the constant fits a signed byte, otherwise
+// imm32 (0x69). dst and src are independent operands, so dst may equal src.
+void x64_enc_imul_imm(dst, src, imm) {
+    x64_enc_rex(1, (dst >> 3) & 1, 0, (src >> 3) & 1);
+    if (imm >= -128 && imm < 128) {
+        x64_enc_emit8(0x6B);
+        x64_enc_modrm(3, dst, src);
+        x64_enc_emit8(imm & 0xFF);
+    } else {
+        x64_enc_emit8(0x69);
+        x64_enc_modrm(3, dst, src);
+        x64_enc_emit32(imm);
+    }
+}
+
 // IDIV r64. Divides RDX:RAX by src. Quotient in RAX, remainder in RDX.
 // The caller must sign-extend RAX into RDX via CQO before calling this.
 void x64_enc_idiv(src) {
@@ -590,6 +606,24 @@ void x64_enc_lea(dst, base, disp) {
     x64_enc_rex(1, (dst >> 3) & 1, 0, (base >> 3) & 1);
     x64_enc_emit8(0x8D);
     x64_enc_mem(dst, base, disp);
+}
+
+// LEA r64, [base + index*(2^scale_log2)] — a scaled-index address with no
+// displacement, used to fold a small-constant multiply into one instruction
+// (e.g. x*3 = [x + x*2], x*5 = [x + x*4], x*9 = [x + x*8]). scale_log2 is
+// 1, 2, or 3 (SIB scale 2/4/8). REX.X carries the index's high bit and REX.B
+// the base's. When the base is RBP/R13 (low 3 bits == 5) a mod=00 SIB means
+// "no base, disp32", so force mod=01 with an explicit zero disp8 instead —
+// the same quirk x64_enc_mem handles for the plain memory form.
+void x64_enc_lea_sib(dst, base, index, scale_log2) {
+    auto b3, mod;
+    b3 = base & 7;
+    mod = b3 == 5 ? 1 : 0;
+    x64_enc_rex(1, (dst >> 3) & 1, (index >> 3) & 1, (base >> 3) & 1);
+    x64_enc_emit8(0x8D);                                          // LEA
+    x64_enc_emit8((mod << 6) | ((dst & 7) << 3) | 4);            // ModR/M: rm=100 (SIB follows)
+    x64_enc_emit8((scale_log2 << 6) | ((index & 7) << 3) | b3);  // SIB: scale | index | base
+    if (mod == 1) { x64_enc_emit8(0); }                          // zero disp8 for RBP/R13 base
 }
 
 // LEA r64, [RIP + rel32-to-label]. Loads the absolute address of an

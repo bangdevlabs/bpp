@@ -494,6 +494,8 @@ struct ChipPrimitives {
                               //   op: 0=add 1=sub 2=mul 3=sdiv 4=and 5=orr 6=eor
     emit_iload_mem_into,      // (dreg) — ldr x<dreg>, [x<dreg>] (full-word load)
     emit_ishl_imm_into,       // (dreg, src, amt) — x<dreg> = x<src> << amt (strength-reduced multiply)
+    emit_imul_shladd_into,    // (dreg, src, k) — x<dreg> = x<src> + (x<src> << k), i.e. multiply by 2^k+1 as one shifted-add (a64) / lea (x64)
+    emit_imul_shlsub_into,    // (dreg, src, k) — x<dreg> = (x<src> << k) - x<src>, i.e. multiply by 2^k-1 (a64 shift+sub via IP0; x64 imul-immediate)
     emit_imadd,               // (op, dreg, n, m, a) — x<dreg> = a +/- n*m (integer fused multiply-add)
     int_temp_alloc,           // () → a free GP temp reg, or -1
     int_temp_free,            // (reg) — return a temp to the pool
@@ -4641,6 +4643,54 @@ cg_const_pow2(nd) {
     return k;
 }
 
+// If `nd` is an integer literal equal to 2^k + 1 for k in [1,63], return k;
+// otherwise -1. Lets `x * (2^k + 1)` become `x + (x << k)` — a single
+// shifted-add (a64 `add xd, xn, xn, lsl #k`) or `lea` (x64), replacing a
+// multiply on the critical dependency path with a 1-cycle op. Covers the
+// common small multipliers 3 (k=1), 5 (k=2), 9 (k=3), 17 (k=4), ... The
+// value is congruent mod 2^64, so the rewrite is exact for signed and
+// unsigned operands alike (`x + (x<<k)` and `x * (2^k+1)` share their low
+// 64 bits under two's-complement wraparound).
+cg_const_shl_add(nd) {
+    auto n: Node, v, p, k;
+    if (nd == 0) { return -1; }
+    n = nd;
+    if (n.ntype != T_LIT) { return -1; }
+    if (peek(cg_sbuf + unpack_s(n.a)) == '"') { return -1; }   // string literal
+    if (cg_is_float_lit(n.a) == 1) { return -1; }               // float literal
+    v = cg_parse_int(n.a);
+    p = v - 1;                                                   // must be a power of two
+    if (p < 2) { return -1; }                                   // v < 3: v=2 is pure 2^k (handled by cg_const_pow2)
+    if ((p & (p - 1)) != 0) { return -1; }                      // p not a power of two
+    k = 0;
+    while (p > 1) { p = p >> 1; k++; }
+    if (k < 1 || k > 63) { return -1; }
+    return k;
+}
+
+// If `nd` is an integer literal equal to 2^k - 1 for k in [2,63], return k;
+// otherwise -1. Lets `x * (2^k - 1)` become `(x << k) - x` — a shift plus a
+// subtract, replacing a multiply on the critical path. Covers 7 (k=3), 15
+// (k=4), 31 (k=5), ... The value 3 is also 2^2-1, but cg_const_shl_add matches
+// it first (as 2^1+1), so this path only sees 7 and up. Exact for signed and
+// unsigned operands (same low 64 bits under two's-complement wraparound).
+cg_const_shl_sub(nd) {
+    auto n: Node, v, p, k;
+    if (nd == 0) { return -1; }
+    n = nd;
+    if (n.ntype != T_LIT) { return -1; }
+    if (peek(cg_sbuf + unpack_s(n.a)) == '"') { return -1; }   // string literal
+    if (cg_is_float_lit(n.a) == 1) { return -1; }               // float literal
+    v = cg_parse_int(n.a);
+    p = v + 1;                                                   // must be a power of two
+    if (p < 4) { return -1; }                                   // v < 3: nothing useful below 2^2-1
+    if ((p & (p - 1)) != 0) { return -1; }                      // p not a power of two
+    k = 0;
+    while (p > 1) { p = p >> 1; k++; }
+    if (k < 2 || k > 63) { return -1; }
+    return k;
+}
+
 // Emit an eligible integer tree (validated/budgeted by cg_int_tree_need)
 // directly into x<dreg>: the left operand reuses dreg down the left spine,
 // each right operand lands in a freshly allocated GP temp, the op writes
@@ -4742,13 +4792,39 @@ cg_emit_int_into(nd, dreg) {
     // Strength reduction: `x * 2^k` is emitted as `x << k`. The left operand
     // (promoted leaf or computed into dreg) is shifted into dreg directly.
     if (c0 == '*') {
-        auto _p2k;
+        auto _p2k, _sak;
         _p2k = cg_const_pow2(n.c);
         if (_p2k >= 0) {
             lk = cg_int_leaf_kind(n.b);
             if (lk > 0) { lsrc = lk; }
             else { cg_emit_int_into(n.b, dreg); lsrc = dreg; }
             call(p.emit_ishl_imm_into, dreg, lsrc, _p2k);
+            return 0;
+        }
+        // `x * (2^k + 1)` → `x + (x << k)`. The left operand is read as a
+        // register (or computed into dreg for a non-leaf left); the shifted-add
+        // reads it twice and writes dreg last, so it is safe even when dreg is
+        // the left source (`x = x * 3`). No freelist temp is consumed — the
+        // multiplier is folded into the shift amount.
+        _sak = cg_const_shl_add(n.c);
+        if (_sak >= 0) {
+            lk = cg_int_leaf_kind(n.b);
+            if (lk > 0) { lsrc = lk; }
+            else { cg_emit_int_into(n.b, dreg); lsrc = dreg; }
+            call(p.emit_imul_shladd_into, dreg, lsrc, _sak);
+            return 0;
+        }
+        // `x * (2^k - 1)` → `(x << k) - x`. Same aliasing safety as the
+        // shifted-add: the left operand is read from a register (or computed
+        // into dreg first), and the chip primitive keeps the pre-shifted value
+        // out of dreg (a64 uses the IP0 scratch, x64 folds it into imul), so
+        // dreg may be the left source (`x = x * 7`).
+        _sak = cg_const_shl_sub(n.c);
+        if (_sak >= 0) {
+            lk = cg_int_leaf_kind(n.b);
+            if (lk > 0) { lsrc = lk; }
+            else { cg_emit_int_into(n.b, dreg); lsrc = dreg; }
+            call(p.emit_imul_shlsub_into, dreg, lsrc, _sak);
             return 0;
         }
     }
