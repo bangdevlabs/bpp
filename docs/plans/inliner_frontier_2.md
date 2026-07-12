@@ -175,3 +175,44 @@ two measured drivers: xform 6.8→11.4 ms (wide-lit off), inserts bench
 102.9→130.5 ms (leaf bonus on). Until it exists, the transcendental
 family stays as honest bl's — cheap ones: the chain they'd collapse is
 worth ~2 bl/sample against a 90 ms conv-dominated render.
+
+## Budget-aware splice admission — SHIPPED 2026-07-11
+
+The named next increment, in two byte-checked steps.
+
+**Step A (`0e9e924`) — the pressure account.** At registration time a
+LOOP-CARRYING callee is admitted only while `arr_len(cg_vars)` (the
+caller's own locals + every already-admitted splice's mangled slots,
+which pre-reg appends there) plus the candidate's own slot need stays
+within `INLINE_PRESSURE_CAP` (14 = a64 non-leaf B3 budget). Straightline
+callees stay ungated (their slot heat comes from the callsite, already
+priced by the tier gates). Denial is registration-only: top-level
+leaves `.e` at 0, nested pushes a 0 into the positional `nested_ids`
+array — both land on the existing `.e == 0 → real bl` convention, so
+registration and splice-time consumption cannot disagree. Measured:
+all-inserts bench 102.9 → 93.4 ms (the gate refuses lever-1-era loop
+splices that were quietly diluting their hosts).
+
+**Step B (`396096c`) — the two heuristics pressure now makes safe.**
+Wide-lit refusal retired (pressure does its real job; constants visible
+via lever 4). True-leaf threshold bonus reinstated (first landing
+refused at +27% by the all-inserts bench; pressure now denies the
+fat-host splices that caused it). Exposed and fixed a latent RegAlloc
+v2 degenerate-interval bug (see journal 2026-07-11 / `_rg_var_span_degenerate`).
+
+**What the gate refuses today** (BPP_INLINE_PROBE census, all-inserts
+bench): _json_skip_ws (live 28 + need 4), delay_reset (16+3),
+exp_f into a fat host (14+8), sin_f (12+10) — the register-hungry loop
+bodies. exp_f STILL inlines into its thin wrapper db_to_amp_f (7+8 ≤ 14),
+which is exactly the hierarchy the measurements wanted: the transcendental
+collapses one level (into the small wrapper) but the wrapper stays a bl
+in the fat channel host. The pressure account is the mechanism the two
+prior refusals (wide-lit, first leaf bonus) were both proxies for.
+
+**Remaining named frontier:** none measured today. The insert dispatch
+layer (lever 2) and blondie chain (lever 3) close as verdicts (plugin
+boundary / conv-loop-bound). x64 uses the same INLINE_PRESSURE_CAP=14
+though its budget is 7 — conservative-correct (admits more than x64 can
+hold, but the dilution is bounded by the same splices a64 already
+refuses); tightening to a per-chip cap is a future micro-lever if an
+x64 workload ever shows pressure, not built speculatively.

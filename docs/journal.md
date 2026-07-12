@@ -16083,3 +16083,53 @@ now define the next increment precisely: budget-aware splice
 admission. Everything ships clean — gen2==gen3, 241/0/12 + 199/0/54,
 md5 intact — and the levers close tied: 1 shipped, 4 shipped-reshaped,
 2/3 measured into their real numbers instead of adjectives.
+
+## 2026-07-11 — budget-aware splice admission closes the inliner arc, and a stale gate teaches decomposition
+
+The inliner's named next increment shipped in two byte-checked steps.
+Step A (`0e9e924`): a register-PRESSURE account replaces node-count
+proxies at splice-admission time — a loop-carrying callee is admitted
+only while the caller's live slot count (its own locals plus every
+already-admitted splice's mangled slots, which pre-reg maintains in
+cg_vars for free) plus the candidate's own need stays within
+INLINE_PRESSURE_CAP (14, the a64 non-leaf budget). Denial is
+registration-only and rides the existing `.e == 0 → real bl`
+convention, so registration and splice can't disagree by construction.
+Step B (`396096c`): with pressure bounding blast radius, the two
+heuristics the measurements refused the night before are now safe —
+the 2026-06-24 wide-lit refusal retired (pressure does its real job
+now; constants stay visible via lever 4's descent), and the true-leaf
+threshold bonus lands for the second time (the first was refused at
++27% by the all-inserts bench; the pressure gate now denies the fat-
+host splices that caused that while admitting the thin wrappers).
+
+Step B exposed a latent RegAlloc v2 bug — newly admitting hot_if(fp, x)
+to inline SEGFAULTed test_float_branch_fusion. A struct-pointer inline
+local (auto f: Filt; f = fp;) got a DEGENERATE single-point interval
+[4,4] from Stage A (it saw the def, missed the f.a/f.b field reads);
+the linear scan then freed its register to an overlapping slot and they
+collided into a null deref. B3, promoting on ref count, DID see the
+uses — so B3 and Stage A disagreed about liveness, the exact
+inconsistency the mangled-slot gate exists to catch, except it only
+checked "has an interval" not "has a real span". Fixed by refusing the
+swap on any promoted mangled slot whose total live span is one position
+(_rg_var_span_degenerate) — always safe, falls back to B3. Found the
+proper way: bug --disasm showed the x20 reuse, the IVL dump showed the
+[4,4].
+
+Then the user caught me hand-waving. bench_ecs_sparse_query's 10%
+bucket flickered FAIL and I first called it "noise." Pushed to actually
+answer WHY, the decomposition was clean: the gate (2.5×, set 2026-05-12
+against ~2.85×) had gone stale because two months of compiler work sped
+the flat legacy scan (−33%) more than the pointer-chasing archetype
+walk (−23%) — the archetype's RELATIVE advantage compressed to ~2.46×,
+right at the threshold. Proven not a regression: ecs_query_each is
+instruction-identical and time-identical across the change. Gate
+recalibrated to 2.1× (`ead2589`). The lesson worth keeping: a ratio
+gate against an improving baseline decays on its own; when it flickers,
+split numerator from denominator before touching code — and don't call
+a FAIL "noise" until the split proves it.
+
+Full ladder green throughout: gen2==gen3, native 241/0/12, C-emit
+199/0/54, Docker x64 self-host gen1==gen2, catalog at parity/band,
+audio md5 f61fac72 intact.

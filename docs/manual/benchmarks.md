@@ -1108,3 +1108,52 @@ First measured story it told: a 2x tier-4 threshold bonus for leaf
 callees pushed it to 130.5 ms (+27%) — thirty exp_f splice sites
 diluted the merged callers' register budgets — and was reverted the
 same hour. Node counts don't model pressure; the bench is the judge.
+
+## 2026-07-11 — full catalog after budget-aware splice admission + the sparse-query gate recalibration
+
+The régua, run end to end after the inliner's budget-aware admission
+arc (pressure account + wide-lit retirement + leaf bonus, and the
+RegAlloc v2 degenerate-interval fix it exposed). min-of-3/5, checksums
+on every kernel, machine quieted for the readings.
+
+| Benchmark | Result | Verdict |
+|---|---|---|
+| `bench_compile.sh` bootstrap | 0.35s min | historical band |
+| `bench_codegen` biquad | 41.9 ms | parity (checksum -0.2285) |
+| `bench_codegen` lcg | 18.0 ms | parity (8843630203987260673) |
+| `bench_codegen` xform | 6.6 ms | band (−231170789772321) |
+| `bench_codegen` manylive | 99.7 ms | band (108041794099160) |
+| `sf_bench` (stereo) | 12311 µs / ~244× | band |
+| `sf_bench_flat` | 5099 µs | band |
+| `sf_bench_inserts` (all 5 inserts) | 95452 µs vs pre-budget 95546 (A/B min-3) | tied — budget-aware is neutral on the render, its win is the general-code splices it declines |
+| `bench_conv` (1024-tap FIR) | 86 ms vs oracle 84 ms = 1.02× | parity, checksum 2412 exact |
+| `bench_compose` | 3× | PASS (compose == scalar) |
+| `bench_outline` | 5× vs serial | healthy |
+| `bench_simd_raw` | checksums exact (3.7500) | unchanged |
+| `bench_autovec_gate.sh` | PASS (9 vector ops) | — |
+| `bench_mixed_auto.sh` | PASS (native == --c) | — |
+| `bench_ecs_iter` | 0.97 informational | in band |
+| `bench_ecs_physics_simd` | PASS, positions bit-exact | unchanged |
+| `bench_ecs_scheduler` | 57% of sequential, PASS | band |
+| `bench_ecs_sparse_query` | **10% bucket 2.4-2.6× (gate recalibrated 2.5→2.1×), 2% bucket ~12×** | see below |
+| `bench_stbflow` | 5× | PASS |
+| `tablah` / `tablah_opt` | 24544 filtered both | unchanged |
+| audio md5 | `f61fac72be5077a6e9ef9cae21dde2a1` | exact |
+
+**The one real finding — the sparse-query gate was stale, not a
+regression (recalibrated `ead2589`).** Its 10% bucket flickered FAIL
+around the 2.5× threshold. Root cause, run to ground rather than
+hand-waved: the gate (2026-05-12) assumed ~2.85× (legacy 88ms /
+archetype 31ms), but two months of compiler work sped the FLAT legacy
+bitmap scan (−33%) more than the pointer-chasing archetype walk (−23%)
+— register allocation + compute-in-place + loop-control fusion land
+hard on the tight legacy loop and lightly on the memory-latency-bound
+archetype indirection. So archetype's relative advantage compressed to
+~2.46×, right at the old gate. Proven not a regression: the archetype
+walk (`ecs_query_each`) is **instruction-identical** (`bug --disasm`,
+addresses normalized) and time-identical (~24k µs) across the change
+that first tripped it. Gate lowered to 2.1× — still catches a genuine
+archetype slowdown, now reflects the compiler the archetype is measured
+against. The lesson: a RATIO gate against an improving baseline decays
+on its own; when it flickers, decompose numerator vs denominator before
+touching anything.
