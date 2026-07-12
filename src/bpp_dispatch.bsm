@@ -6163,100 +6163,8 @@ void annotate_temps() {
 //      this lets us skip the bind-to-temp machinery entirely).
 
 
-// Does `nd` contain an integer literal that needs MORE THAN ONE ARM64
-// mov-immediate instruction (more than one nonzero 16-bit chunk —
-// anything beyond a single movz, i.e. a movz+movk chain) anywhere in
-// its subtree? Generic expression walker, reused by the loop-body
-// variant below.
-//
-// Why this matters (found 2026-06-24, measured via bench_codegen.bpp's
-// `transform`, the xform kernel — real ~2x regression, not a guess):
-// "Stage 2a" hot-constant promotion (cg_const_val/cg_const_wt in
-// bpp_codegen.bsm) runs ONCE per function, on the CALLER's own body,
-// BEFORE any inline splice happens — it hoists a loop's expensive
-// constants to dedicated registers, materialised once after the
-// PROLOGUE. A constant arriving later, via a spliced callee's body, was
-// never seen by that pass and never gets hoisted: it gets rematerialised
-// via its full movz+movk chain on EVERY loop iteration instead of once.
-// `transform`'s two 64-bit LCG constants (each a 4-instruction
-// movz+movk×3 chain) cost ~8 extra instructions per element — over
-// 65536 elements × 320 outer reps, that is the entire ~2x. Disqualifying
-// here is the scoped fix; re-running hot-constant promotion on a
-// spliced subtree is a structural undertaking on the same scale as
-// RegAlloc v2's "sees through inlined calls" arc, not a one-line fix.
-// Float literals are NOT affected (always memory-loaded via a single
-// `ldr` from the literal pool, hoisting is a non-issue either way) —
-// this check is integer-literal-specific on purpose.
-static _inline_has_wide_lit(nd) {
-    auto n: Node, t, arr, cnt, i, val, chunks;
-    if (nd == 0) { return 0; }
-    n = nd;
-    t = n.ntype;
-    if (t == T_LIT) {
-        // is_int_lit_node filters float ('.') and string ('"') literals
-        // — calling parse_int_lit_value on a float literal's text would
-        // silently skip the '.' and misread it as some large integer,
-        // which would WRONGLY disqualify exp_f/log_f's own loops (full
-        // of float constants like 0.6931471805599453) — exactly the
-        // candidates Inc 7/8 just made inlineable. Float literals are
-        // always memory-loaded via a single `ldr` from the literal
-        // pool regardless of hoisting, so they never had this problem.
-        if (is_int_lit_node(n) == 0) { return 0; }
-        val = parse_int_lit_value(n.a);
-        if (val < 0) { val = 0 - val; }
-        chunks = 0;
-        if (val & 0xffff) { chunks++; }
-        if ((val >> 16) & 0xffff) { chunks++; }
-        if ((val >> 32) & 0xffff) { chunks++; }
-        if ((val >> 48) & 0xffff) { chunks++; }
-        return chunks > 1;
-    }
-    switch (t) {
-    T_BINOP   { return _inline_has_wide_lit(n.b) || _inline_has_wide_lit(n.c); }
-    T_UNARY   { return _inline_has_wide_lit(n.b); }
-    T_MEMLD   { return _inline_has_wide_lit(n.a); }
-    T_ADDR    { return _inline_has_wide_lit(n.a); }
-    T_TERNARY { return _inline_has_wide_lit(n.a) || _inline_has_wide_lit(n.b) || _inline_has_wide_lit(n.c); }
-    T_CALL {
-        arr = n.b; cnt = n.c;
-        for (i = 0; i < cnt; i++) { if (_inline_has_wide_lit(arr[i])) { return 1; } }
-        return 0;
-    }
-    T_ASSIGN  { return _inline_has_wide_lit(n.a) || _inline_has_wide_lit(n.b); }
-    T_MEMST   { return _inline_has_wide_lit(n.a) || _inline_has_wide_lit(n.b); }
-    T_RET {
-        if (n.c > 1) {
-            arr = n.b; cnt = n.c;
-            for (i = 0; i < cnt; i++) { if (_inline_has_wide_lit(arr[i])) { return 1; } }
-            return 0;
-        }
-        return _inline_has_wide_lit(n.a);
-    }
-    T_IF {
-        if (_inline_has_wide_lit(n.a)) { return 1; }
-        if (_inline_has_wide_lit_body(n.b, n.c)) { return 1; }
-        if (n.e > 0) { if (_inline_has_wide_lit_body(n.d, n.e)) { return 1; } }
-        return 0;
-    }
-    T_WHILE {
-        if (_inline_has_wide_lit(n.a)) { return 1; }
-        if (_inline_has_wide_lit_body(n.b, n.c)) { return 1; }
-        if (n.e != 0) { return _inline_has_wide_lit(n.e); }
-        return 0;
-    }
-    T_BLOCK   { return _inline_has_wide_lit_body(n.b, n.c); }
-    else { return 0; }
-    }
-    return 0;
-}
 
-static _inline_has_wide_lit_body(body_arr, body_cnt) {
-    auto i;
-    for (i = 0; i < body_cnt; i++) {
-        if (_inline_has_wide_lit(body_arr[i])) { return 1; }
-    }
-    return 0;
-}
+
 
 // Disqualification sentinel for _inline_count_nodes/_inline_cost. Used
 // to be 99 — safe while every real body cost stayed below it, broken
@@ -6425,14 +6333,12 @@ static _inline_count_nodes(nd) {
     }
     T_WHILE {
         auto wh_a, wh_b, wh_e;
-        // 2026-06-24: a wide integer constant (movz+movk chain) inside
-        // a loop body loses hot-constant hoisting once spliced — see
-        // _inline_has_wide_lit's own comment for the measured ~2x
-        // regression (examples/bench_codegen.bpp's `transform`/xform)
-        // this disqualifies.
-        if (_inline_has_wide_lit(n.a)) { return INLINE_DISQ; }
-        if (_inline_has_wide_lit_body(n.b, n.c)) { return INLINE_DISQ; }
-        if (n.e != 0) { if (_inline_has_wide_lit(n.e)) { return INLINE_DISQ; } }
+        // The 2026-06-24 wide-literal refusal is RETIRED: its true job —
+        // keeping register-hungry loop bodies out of budget-constrained
+        // callers — is now done directly by the pressure account
+        // (_inline_pressure_admit), and the constants themselves are
+        // visible to hot-constant promotion via cg_b3_desc_consts.
+        // bench_codegen's xform is the standing gate for this class.
         wh_a = _inline_count_nodes(n.a);
         if (wh_a >= INLINE_DISQ) { return INLINE_DISQ; }
         wh_b = _inline_count_nodes_body(n.b, n.c);
@@ -7036,6 +6942,63 @@ static _inline_caller_fanout(caller_idx) {
 
 
 
+
+// Does this body contain ANY T_CALL, at any depth? A callee with none
+// is a TRUE LEAF: splicing it can never cascade further bodies in —
+// the tier-4 threshold grants leaves extra room (see _inline_threshold).
+static _inline_expr_has_any_call(nd) {
+    auto n: Node, t;
+    if (nd == 0) { return 0; }
+    n = nd; t = n.ntype;
+    if (t == T_CALL) { return 1; }
+    if (t == T_BINOP) { return _inline_expr_has_any_call(n.b) || _inline_expr_has_any_call(n.c); }
+    if (t == T_UNARY) { return _inline_expr_has_any_call(n.b); }
+    if (t == T_MEMLD || t == T_ADDR) { return _inline_expr_has_any_call(n.a); }
+    if (t == T_TERNARY) {
+        return _inline_expr_has_any_call(n.a) || _inline_expr_has_any_call(n.b) || _inline_expr_has_any_call(n.c);
+    }
+    return 0;
+}
+static _inline_body_has_any_call(body_arr, body_cnt) {
+    auto i, k, s: Node;
+    for (i = 0; i < body_cnt; i++) {
+        s = body_arr[i];
+        if (s == 0) { continue; }
+        if (s.ntype == T_ASSIGN) { if (_inline_expr_has_any_call(s.b)) { return 1; } continue; }
+        if (s.ntype == T_MEMST) {
+            if (_inline_expr_has_any_call(s.a)) { return 1; }
+            if (_inline_expr_has_any_call(s.b)) { return 1; }
+            continue;
+        }
+        if (s.ntype == T_RET) {
+            if (s.c > 1) {
+                for (k = 0; k < s.c; k++) { if (_inline_expr_has_any_call(*(s.b + k * 8))) { return 1; } }
+            } else {
+                if (_inline_expr_has_any_call(s.a)) { return 1; }
+            }
+            continue;
+        }
+        if (s.ntype == T_IF) {
+            if (_inline_expr_has_any_call(s.a)) { return 1; }
+            if (_inline_body_has_any_call(s.b, s.c)) { return 1; }
+            if (s.e > 0) { if (_inline_body_has_any_call(s.d, s.e)) { return 1; } }
+            continue;
+        }
+        if (s.ntype == T_WHILE) {
+            if (_inline_expr_has_any_call(s.a)) { return 1; }
+            if (_inline_body_has_any_call(s.b, s.c)) { return 1; }
+            if (s.e != 0) { if (_inline_expr_has_any_call(s.e)) { return 1; } }
+            continue;
+        }
+        if (s.ntype == T_BLOCK) {
+            if (_inline_body_has_any_call(s.b, s.c)) { return 1; }
+            continue;
+        }
+        if (_inline_expr_has_any_call(s)) { return 1; }
+    }
+    return 0;
+}
+
 static _inline_threshold(callee_idx, caller_idx, call_node) {
     auto n: Node, threshold;
     threshold = INLINE_BASE_THRESHOLD;
@@ -7056,6 +7019,21 @@ static _inline_threshold(callee_idx, caller_idx, call_node) {
     if (caller_idx >= 0 && caller_idx < arr_len(fn_hot_transitive)) {
         if (arr_get(fn_hot_transitive, caller_idx)) {
             threshold = threshold * INLINE_HOT_TRANSITIVE_MULT;
+        }
+    }
+    // Leaf bonus, second landing (2026-07-11): the guarded
+    // transcendental family (exp_f 98 / cos_f 101 / log_f 104 /
+    // sin_f 106) sits just past the 90 hot ceiling; a TRUE LEAF cannot
+    // cascade further bodies in, so its threshold doubles. The first
+    // landing (without the pressure account) was refused by the
+    // all-inserts bench at +27% — thirty admitted sites diluted the
+    // merged callers. The pressure gate now bounds exactly that: a fat
+    // host denies the splice, a thin wrapper admits it.
+    auto _lf_rec;
+    if (callee_idx >= 0) {
+        _lf_rec = funcs[callee_idx];
+        if (_inline_body_has_any_call(*(_lf_rec + FN_BODY), *(_lf_rec + FN_BCNT)) == 0) {
+            threshold = threshold * 2;
         }
     }
     return threshold;

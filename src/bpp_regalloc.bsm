@@ -2525,6 +2525,40 @@ static _rg_is_known_substituted(var_names, vi) {
 // The "promoted" register is reserved yet genuinely untouched by B3,
 // so linear-scan handing that same physical register to one of its
 // own variables collides with nothing real.
+// True iff `vi` appears in `intervals` but its ENTIRE live span is a
+// single statement position (every interval is one point AND they all
+// sit at the same position — max end == min start). Stage A produces
+// this shape for an inlined body whose local it saw DEFINED but whose
+// real uses its expansion did not reconstruct (a struct-pointer local
+// like `auto f: Filt; f = fp;` whose later `f.a`/`f.b` field reads the
+// analysis missed). B3, promoting purely on ref count, DID see those
+// uses — so a degenerate span on a B3-promoted slot means the two
+// disagree about liveness, and trusting the linear scan's picture
+// would let it share the slot's register with an overlapping variable
+// (found via `bug --disasm`: `_inl_f` interval [4,4] freed x20 to
+// `_inl_n` [5,18], a null-deref crash in test_float_branch_fusion once
+// the inliner started splicing hot_if). Returns 0 for a var with no
+// intervals (that is the caller's separate "uncovered" case).
+static _rg_var_span_degenerate(intervals, vi) {
+    auto n, i, it: LiveInterval, seen, lo, hi;
+    n = arr_struct_count(intervals);
+    seen = 0; lo = 0; hi = 0;
+    i = 0;
+    while (i < n) {
+        it = arr_struct_at(intervals, i);
+        if (it.var_idx == vi) {
+            if (seen == 0) { lo = it.start_pos; hi = it.end_pos; seen = 1; }
+            else {
+                if (it.start_pos < lo) { lo = it.start_pos; }
+                if (it.end_pos > hi)   { hi = it.end_pos; }
+            }
+        }
+        i++;
+    }
+    if (seen == 0) { return 0; }
+    return hi <= lo;
+}
+
 regalloc_has_uncovered_mangled_promoted(b3_promote, var_names, ivl_int, ivl_flt) {
     auto n, vi;
     n = arr_len(b3_promote);
@@ -2533,6 +2567,14 @@ regalloc_has_uncovered_mangled_promoted(b3_promote, var_names, ivl_int, ivl_flt)
         if (arr_get(b3_promote, vi) >= 0 && _rg_is_mangled_inline_slot(var_names, vi) != 0) {
             if (_rg_var_in_intervals(ivl_int, vi) == 0 && _rg_var_in_intervals(ivl_flt, vi) == 0) {
                 if (_rg_is_known_substituted(var_names, vi) == 0) { return 1; }
+            }
+            // A mangled slot WITH intervals but a single-point total
+            // span is Stage A undercounting a spliced local's liveness
+            // — refuse rather than let the linear scan share its
+            // register (see _rg_var_span_degenerate).
+            if (_rg_is_known_substituted(var_names, vi) == 0) {
+                if (_rg_var_span_degenerate(ivl_int, vi) != 0) { return 1; }
+                if (_rg_var_span_degenerate(ivl_flt, vi) != 0) { return 1; }
             }
         }
         vi++;
