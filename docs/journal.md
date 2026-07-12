@@ -16133,3 +16133,60 @@ a FAIL "noise" until the split proves it.
 Full ladder green throughout: gen2==gen3, native 241/0/12, C-emit
 199/0/54, Docker x64 self-host gen1==gen2, catalog at parity/band,
 audio md5 f61fac72 intact.
+
+## 2026-07-12 — manylive taken apart: the multiply win ships, the reassociation wall is named, and two perf-neutral levers are told apart by measurement
+
+Started from a plain question — how do we reach parity on manylive, the
+last codegen kernel behind gcc -O2 (~100 vs ~73 ms, 1.35×). The session
+was mostly about NOT guessing which lever helps, and a hard correction
+on backend parity in the middle.
+
+**The correction first, because it matters.** Asked how x64 stood, I
+claimed "RegAlloc v2 is a64-only" from a stale June benchmark note. The
+user called it — the whole preceding week (M1–M6, journal 07-08..07-10)
+was exactly the arc that brought x64's integer linear-scan, caller-saved
+band, and cross-call float to parity. Reading the journal and
+`backend_parity.md` set the record straight: RegAlloc v2 integer is
+parity; the only permanent x64 gaps are the float family (SysV has no
+callee-saved XMM) and int-MAC. Lesson re-learned the expensive way:
+verify parity claims against the journal + parity table, never a
+four-line bench note.
+
+**What shipped (`43c6dc9`, both backends): small-constant multiply
+strength reduction.** `x*(2^k+1) → x + (x<<k)` (a64 shifted-add, x64
+`lea`); `x*(2^k−1) → (x<<k) − x` (a64 `lsl x16,·; sub`, x64
+three-operand `imul`-immediate). New chip primitives on both chips
+(`emit_imul_shladd_into`, `emit_imul_shlsub_into`), a new x64 SIB-LEA
+encoder and imul-immediate encoder, driven by a spine detector that
+extends the B0 pow2 path. It builds on `312da1f` (const-leaf CIP gate,
+committed earlier the same session) so `var = var * const` computes
+straight into the target register. manylive 100 → 86.5 ms, 1.35× →
+1.18×; checksums exact; x64 self-host and native/C-emit suites green.
+
+**The anatomy, which is the deliverable's real content.** manylive is a
+LATENCY-bound serial chain, so only critical-path work counts:
+
+- Removing the three `mul`s from the chain — the real win above.
+- Copy-back elision (`312da1f`) and immediate-operand folding (built,
+  then REVERTED) both removed instructions OFF the critical path; the
+  OoO core mov-eliminates or hides them, so each moved the clock 0 ms.
+  Kept 1a (it is what makes the multiply lever fire); dropped the
+  immediate lever (no measured win, +128 bytes).
+- The last 86.5 → 73 ms is gcc reassociating `(carry+1)*3 − 7` into
+  `3*carry − 4` — an algebraic constant-fold that shortens the
+  dependency chain. That is an optimizer pass, not a peephole, and is
+  left named-but-unbuilt.
+
+A 1-cycle-oscillation scare is worth recording: the etapa-2 x64 self-host
+read gen1 ≠ gen2 with an 80% byte difference, which looked like a
+host-dependent codegen bug. It was the textbook oscillation — `./bpp`
+was still the etapa-1 seed, so gen1 carried the old `*7` codegen and
+gen2 the new. gen2 == gen3 (the real criterion) held all along;
+reinstalling the seed made gen1 == gen2. Use gen2==gen3, or reinstall
+before the cross-check.
+
+Also written this session: `docs/manual/compiler_internals.md` — a
+study-and-orientation map of the whole compiler (pipeline, the spine +
+chip-primitive architecture, every optimization phase, the key
+functions and where they live), so the next reader (human or agent)
+situates fast instead of re-deriving it from 370 KB of dispatch.

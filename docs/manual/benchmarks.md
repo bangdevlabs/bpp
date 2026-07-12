@@ -1157,3 +1157,57 @@ archetype slowdown, now reflects the compiler the archetype is measured
 against. The lesson: a RATIO gate against an improving baseline decays
 on its own; when it flickers, decompose numerator vs denominator before
 touching anything.
+
+## 2026-07-12 — manylive dissected: small-constant multiply strength reduction (the achievable win) and the reassociation wall
+
+The `manylive` kernel (a pure 15-op integer dependency chain, the
+RegAlloc-v2 motivating shape) sat at ~100 ms vs gcc -O2's ~73 ms
+(1.35×). This session took it apart by measurement and closed the part
+that a codegen lever can close.
+
+**What actually shipped (`43c6dc9`, both backends): small-constant
+multiply strength reduction.** `x * (2^k ± 1)` no longer emits `mul`:
+
+| form | a64 | x64 |
+|---|---|---|
+| `x*3 / x*5 / x*9` (2^k+1) | `add xd, xn, xn, lsl #k` | `lea d, [s + s*2^k]` |
+| `x*7 / x*15` (2^k−1) | `lsl x16, s, #k; sub d, x16, s` | `imul d, s, (2^k−1)` |
+
+manylive **100.05 → 91.13 (×3,×5) → 86.49 ms (×7)**, checksum
+`108041794099160` exact throughout, x64 self-host gen1==gen2 and
+gen2==gen3, native 241/0/12, C-emit 199/0/54, audio md5 `f61fac72…`.
+**1.35× → 1.18×.** This is a general win — any small-constant multiply
+benefits, not just this kernel.
+
+**The anatomy, which is the real lesson — manylive is LATENCY-bound.**
+Two other levers were built and MEASURED to be perf-neutral, then
+treated accordingly:
+
+- **Copy-back elision** (admit a constant right-operand into the
+  destination-driven integer CIP, `312da1f`): removes the
+  `add xN, x0, #0` accumulator shuttle — but the copies are
+  mov-eliminated (zero-latency) on an out-of-order core, so the wall
+  clock did not move. Kept anyway, because it is FOUNDATIONAL: the
+  multiply strength reduction only fires because this gate lets
+  `var = var * const` compute straight into the target register.
+- **Immediate operands** (`add/sub xd, xn, #imm` instead of
+  `mov x13,#imm; add`): removes ~7 movs/iter, 33 → 23 instructions —
+  and moved the clock by **0 ms** (86.7). The movs are independent, so
+  the ~8-wide OoO engine hides them behind the dependency chain. This
+  lever was REVERTED: no measured win, +128 bytes of compiler code.
+
+- **The residual 86.5 → 73 ms is algebraic reassociation, not a
+  peephole.** gcc folds `(carry+1)*3 − 7` into `3*carry − 4` — it
+  reassociates the constant arithmetic and drops `a1` from the critical
+  chain, shortening the serial dependency path. b++ has no such pass.
+  Closing it would be a constant-folding/reassociation optimizer (a real
+  feature, with signed-overflow correctness care), not a lever.
+
+**Method worth keeping: on a latency-bound kernel, count critical-path
+LATENCY, not instructions.** Instruction-count reductions off the
+critical path (copy-backs, constant movs) look like wins on paper and
+are invisible on the clock because the OoO engine absorbs them. Only two
+things helped manylive — removing the `mul`s from the chain, and (the
+part we can't do yet) shortening the chain algebraically. Disassemble
+BOTH sides and identify what is actually on the dependency path before
+building a lever.
