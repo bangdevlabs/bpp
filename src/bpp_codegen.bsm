@@ -4546,9 +4546,19 @@ cg_assign_into_dest_ok(rhs) {
             cg_int_leaf_kind(r.b) > 0 && cg_int_leaf_kind(r.c) > 0 && cg_int_leaf_kind(l) > 0 &&
             cg_const_pow2(r.c) < 0) { return 1; }
     }
-    // single binop over two promoted-register leaves.
+    // single binop into the destination register. The LEFT operand must be a
+    // promoted register (leaf_kind > 0): it is read directly, so the target
+    // register is never written before the final op reads its sources. The
+    // RIGHT operand may also be a constant or a frame leaf (leaf_kind >= 0) —
+    // it is materialised into a fresh freelist temp first, so it can alias
+    // neither the destination nor the left source. This admits the `var OP
+    // const` shape (manylive's phase arithmetic `a2 = a1 * 3`), which without
+    // this relaxation fell back to the accumulator shuttle and paid a
+    // copy-back (`op x0, r, k; add dest, x0, #0`) the CIP now drops. The
+    // temp requirement is honoured by the caller's cg_int_tree_need budget
+    // check, so a shallow freelist (x64) never over-commits.
     if (c0 == '+' || c0 == '-' || c0 == '*' || c0 == '&' || c0 == '|' || c0 == '^') {
-        if (cg_int_leaf_kind(l) > 0 && cg_int_leaf_kind(r) > 0) { return 1; }
+        if (cg_int_leaf_kind(l) > 0 && cg_int_leaf_kind(r) >= 0) { return 1; }
     }
     return 0;
 }
@@ -5774,10 +5784,15 @@ void cg_emit_stmt(nd) {
             _ad_vi = cg_var_idx(lhs.a);
             if (_ad_vi >= 0) {
                 _ad_reg = arr_get(cg_var_promote, _ad_vi);
-                // int_temp_count >= 0 gates out backends without integer CIP
-                // (x64 returns -1) — cg_emit_int_into uses the CIP primitives.
+                // A backend without integer CIP returns int_temp_count -1, and
+                // cg_int_tree_need is always >= 0, so the budget test below
+                // also gates those backends out (no separate >= 0 check needed).
+                // The budget test guarantees the freelist can supply every temp
+                // the now-admissible `var OP const` shape needs — the register-
+                // only shapes still compute in zero temps, so their behaviour is
+                // unchanged.
                 if (_ad_reg >= 0 && cg_var_is_float(_ad_vi) == 0 && arr_get(cg_var_stack, _ad_vi) == 0 &&
-                    call(p.int_temp_count) >= 0 && cg_assign_into_dest_ok(n.b)) {
+                    cg_assign_into_dest_ok(n.b) && cg_int_tree_need(n.b) <= call(p.int_temp_count)) {
                     cg_emit_int_into(n.b, _ad_reg);
                     return 0;
                 }
