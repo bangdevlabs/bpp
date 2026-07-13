@@ -4854,6 +4854,12 @@ cg_emit_int_into(nd, dreg) {
 global cg_iv_active;       // count of live induction pointers for the current loop
 global cg_iv_base;         // arr of base variable indices
 global cg_iv_reg;          // arr of their promoted registers (walking pointers)
+global cg_iv_in_walk_loop; // set by the safety scan: 1 while examining the
+                           // walking loop's own statement, 0 for every other
+                           // statement. A `base[idx]` access counts as a safe
+                           // walk access ONLY inside the loop — anywhere else
+                           // it reads base's register, which the walk has
+                           // permanently advanced (see cg_iv_bare_uses).
 global cg_iv_idx;          // the induction variable index
 global cg_iv_tmp_bases;    // scratch base-collection array (detection only)
 global cg_cur_body;        // current function's statement array (whole-function scan)
@@ -4888,7 +4894,8 @@ cg_iv_bare_uses(nd, bvi) {
     auto n: Node, t, c, arr, cnt, i, l: Node, r: Node, rl: Node, rr: Node;
     if (nd == 0) { return 0; }
     n = nd; t = n.ntype;
-    if (t == T_BINOP && unpack_l(n.a) == 1 && peek(cg_sbuf + unpack_s(n.a)) == '+') {
+    if (cg_iv_in_walk_loop != 0 &&
+        t == T_BINOP && unpack_l(n.a) == 1 && peek(cg_sbuf + unpack_s(n.a)) == '+') {
         l = n.b; r = n.c;
         if (l != 0 && l.ntype == T_VAR && cg_var_idx(l.a) == bvi &&
             r != 0 && r.ntype == T_BINOP && unpack_l(r.a) == 1 && peek(cg_sbuf + unpack_s(r.a)) == '*') {
@@ -5076,12 +5083,23 @@ cg_iv_detect(while_nd) {
     for (i = 0; i < arr_len(cg_iv_tmp_bases); i++) {
         bvi = arr_get(cg_iv_tmp_bases, i);
         if (arr_get(cg_var_promote, bvi) < 0) { continue; }
-        // Every reference to bvi in the WHOLE function must be a bvi[idx] access.
+        // Every reference to bvi must be a bvi[idx] access INSIDE this loop.
+        // The walk permanently advances base's register, so a use of base in
+        // any OTHER statement — a second loop over the same array, the
+        // _zh_build zlib case — would read the advanced register and run off
+        // the end. cg_iv_bare_uses treats bvi[idx] as safe only while
+        // cg_iv_in_walk_loop is set, which happens only for the walking loop's
+        // own statement; elsewhere bvi[idx] counts as an unsafe use.
         j = 0;
         for (j = 0; j < cg_cur_bcnt; j++) {
-            if (cg_iv_bare_uses(*(cg_cur_body + j * 8), bvi) != 0) { break; }
+            auto _iv_st;
+            _iv_st = *(cg_cur_body + j * 8);
+            cg_iv_in_walk_loop = 0;
+            if (_iv_st == while_nd) { cg_iv_in_walk_loop = 1; }
+            if (cg_iv_bare_uses(_iv_st, bvi) != 0) { break; }
         }
-        if (j < cg_cur_bcnt) { continue; }       // a bare use was found
+        cg_iv_in_walk_loop = 0;
+        if (j < cg_cur_bcnt) { continue; }       // an unsafe use was found
         cg_iv_base = arr_push(cg_iv_base, bvi);
         cg_iv_reg  = arr_push(cg_iv_reg, arr_get(cg_var_promote, bvi));
         found++;
