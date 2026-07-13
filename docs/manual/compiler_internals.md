@@ -30,15 +30,35 @@ decides purity and inlineability once, so both CPU backends inherit the
 verdict. By the time codegen runs, most of the hard decisions are already
 made and recorded on the AST or in side tables.
 
-The code generator itself is, at its floor, a **stack + accumulator
-machine** (an unoptimized C compiler's shape): every expression evaluates
-into one accumulator — `x0`/`rax` for ints, `d0`/`xmm0` for floats — and
-operands that must survive a subexpression push onto a **value stack**.
-Every optimization is a *gate that proves it is safe to skip part of that
-round-trip*: keep a hot local in a register, compute a tree straight into
-its destination, share one register between two non-overlapping locals,
-drop a call frame. `x0`/`rax` in a hot loop is the tell that a gate
-declined.
+The code generator is **a floor plus layers** — this is the key thing to
+get right, because the floor alone would be an unoptimized compiler and it
+is emphatically *not* the whole story.
+
+The **floor** is a stack + accumulator machine — the fallback that is
+always available and always correct: an expression evaluates into one
+accumulator (`x0`/`rax` for ints, `d0`/`xmm0` for floats), and operands
+that must survive a subexpression push onto a **value stack**. The floor
+by itself is roughly `gcc -O0`.
+
+The **layers** sit on top and do the real work: register promotion,
+compute-in-place (evaluate a tree straight into its destination register,
+no accumulator), strength reduction, inlining, sharing one register
+between two non-overlapping locals, `fmadd`/SIMD fusion. Each layer is a
+*gate that proves it is safe to skip part of the accumulator round-trip*.
+On a **tight inner loop the gates all fire at once** — the locals are
+register-resident, the arithmetic computes in place and fuses, the calls
+inline away — and the result reaches **`gcc -O2` parity** (this is where
+the biquad / lcg / conv parity numbers come from). The floor only
+resurfaces where a gate *declines* — a spilled local, an expression shape
+no gate covers — so **`x0`/`rax` in a hot loop is exactly the tell that a
+layer gave up there** (and the place to look for the next optimization).
+
+Two honesty notes this framing forces. "`gcc -O2` parity" is a claim about
+hot inner loops where every layer fires, not about cold or glue code
+(which sits nearer `-O0`, and is not the bottleneck). And where a layer
+simply does not exist yet — `manylive` needs algebraic reassociation the
+compiler has no pass for — there is a real, measured gap; the benchmark
+catalog shows both sides.
 
 One binary targets two CPUs. Machine-independent decisions live in a
 single **spine**; CPU-specific emission is reached through a **table of
