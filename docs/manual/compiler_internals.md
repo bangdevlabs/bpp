@@ -165,27 +165,52 @@ the symbol tables.
 
 ## 5. Type inference — `infer_module(mi)`
 
-Runs per module. It first rebuilds the function-name hash, then registers
+Runs per module. It rebuilds the function-name hash and registers
 **extern return types** (a signature ending `double` → `TY_FLOAT`,
 `float` → `TY_FLOAT_H`, else `TY_WORD`) so calls into other modules know
-their result width. It then walks each body inferring a type for every
-node and local, propagating float-ness through arithmetic (a float leaf
-makes its binop float; the compiler chooses int vs float instructions
-from this).
+their result width, then infers each function through `infer_one_func`.
 
-The load-bearing mechanism is **the compiler writing annotations back**:
-a local that is inferred to hold a float has `: float` written into its
-own declaration (unless the programmer locked it with an explicit hint).
-That single fact is what both codegen (float register homes, `d`-register
-CIP) and dispatch read downstream — the type is on the declaration, not
-re-derived at every use. A second pass, `infer_str_params`, settles
-string-parameter types by consensus across all call sites (a parameter
-used as a string at any call becomes a str parameter everywhere).
+**Per-node inference — `add_type(nd)`.** A bottom-up recursion that
+returns a node's type and stamps it on `n.itype` for later passes to read.
+The rules:
 
-The products consumed later are the per-local types (`cg_var_forced_ty`
-via `ty_set_var_type`) and the function signature tables (`fn_ret_types`
-/ `fn_par_types`, read through `get_fn_ret_type` / `get_fn_par_type`),
-which drive type-correct loads/stores and the float-vs-int codegen split.
+- `T_LIT` → `type_of_lit` (float vs int from the literal's shape and
+  magnitude).
+- `T_VAR` → the local's type from the scope table, falling back to a
+  global's declared type.
+- `T_BINOP` → infer both operands, then **`promote(lt, rt)`** — the type
+  join, where float is sticky (`promote(float, anything)` is float, so one
+  float leaf makes the whole tree float) and pointer types stay pointer.
+  Two deliberate exceptions return `TY_WORD` regardless of operands: a
+  comparison/relational operator (`<`, `>`, `<=`, `>=`, `==`, `!=`)
+  produces a boolean, and a pointer *difference* (`ptr - ptr`) is a
+  ptrdiff. This is exactly what tells codegen to pick integer vs float
+  instructions.
+- `T_ASSIGN` propagates the RHS type onto the local (via `promote` across
+  every assignment to it), which is how a local acquires its type from
+  use.
+
+**Locking.** An explicit programmer hint (`x: word`, a `: float` the
+programmer wrote) *locks* the variable — later inference cannot widen it.
+Everything else is open to inference.
+
+**The write-back — `save_fn_types`.** The load-bearing move: after the
+body walk, a local inferred to hold a full-width float — not locked, with
+a real declaration slot, no hint already there — gets `: float` written
+back into its own declaration. From then on every downstream consumer
+(codegen's float register homes and `d`-register CIP, the C emitter's
+`double`, `put`'s type dispatch) behaves as if the programmer wrote it.
+The compiler annotates; the programmer only annotates intent.
+
+**Cross-function propagation.** `propagate_in_node` runs a fixpoint that
+carries return and parameter types across call boundaries; `infer_str_params`
+then settles string parameters by *consensus* — a parameter is inferred a
+str only when every direct call site passes a string (a single dissenting
+caller keeps it a word), which avoids breaking mixed callers.
+
+The products consumed later are the per-local types (`cg_var_forced_ty`)
+and the signature tables (`fn_ret_types` / `fn_par_types`, read through
+`get_fn_ret_type` / `get_fn_par_type`).
 
 ---
 
@@ -214,14 +239,36 @@ Accepted call sites are pre-registered later, inside `cg_emit_func`, via
 `_inline_pre_reg_walk` (§13). It runs to a fixpoint (a splice can expose
 the next candidate).
 
-**Outlining (auto-parallelization).** `find_dispatch_candidates` finds
-`@safe` loops eligible to run in parallel; `synthesize_loop_fn` builds a
-worker function from the loop body; `rewrite_dispatch_loops` rewrites the
-loop into a parallel dispatch over the worker (real threads on macOS,
-serial-correct on Linux until ELF threads ship). This is a source-to-
-source AST transform that runs *before* per-chip emit, so both backends
-inherit it for free. `run_dispatch` then makes the per-loop dispatch
-decisions per function (`analyze_body`), skipping cached bodies.
+**Outlining (auto-parallelization).** A source-to-source AST transform in
+three functions, run before per-chip emit so both backends inherit it:
+
+- **`find_dispatch_candidates`** scans each `@safe`, non-address-taken
+  function's loops for a parallelizable shape and records, per candidate:
+  the `while` node, the loop variable, its start/stride, any reduction
+  variable + operator, and the **captures** — the caller-frame variables
+  the body reads or writes. A loop shaped for dispatch that is *not*
+  captured as a candidate raises **W033** (the `@safe` promise the loop
+  cannot keep).
+- **`synthesize_loop_fn`** builds a worker function per candidate. A
+  reduction (`sum += …`, additive `+` only for now) becomes a body that
+  accumulates a per-chunk partial keyed by a `__cid` chunk id from the
+  operator's identity element. A **map with captures** (outlining) becomes
+  a worker taking `(loop_var, _end)` that wraps the body in
+  `while (loop_var < _end) { body; loop_var++; }`, with the captured
+  caller-frame variables restored from a struct
+  (`_outline_restore_captures_from_struct`); a plain map with no captures
+  becomes a per-iteration worker taking `(idx)`. Non-zero start or
+  non-unit stride is left serial (no chunked variant yet).
+- **`rewrite_dispatch_loops`** replaces the original loop in the caller
+  with a call into the runtime scheduler — `job_parallel_for_data`
+  (chunked, one call per worker, passing the capture struct) for the
+  outlining shape, `job_parallel_for` (per-iteration) for a plain map —
+  and, for a reduction, folds the per-worker partials after the dispatch.
+  Real worker threads on macOS; serial-correct on Linux until ELF threads
+  ship.
+
+`run_dispatch` then makes the remaining per-loop decisions per function
+(`analyze_body`), skipping cached bodies.
 
 After this stage the AST is typed, classified, and rewritten; `run_validate`
 emits the diagnostics and `diag_check_errors` aborts on any error.
