@@ -4771,22 +4771,38 @@ cg_emit_int_into(nd, dreg) {
         // here), so fusing it would lose the shift.
         if (_fop >= 0 && cg_const_pow2(_prod.c) < 0 && call(p.has_int_madd)) {
             auto _fa: Node, _fb: Node, _asrc, _nsrc, _msrc, _ta, _tn, _tm, _alk, _nlk, _mlk;
+            auto _fa_t, _fb_t, _peak, _peak2;
             _fa = _prod.b; _fb = _prod.c;
-            _alk = cg_int_leaf_kind(_add);
-            if (_alk > 0) { _asrc = _alk; }
-            else { cg_emit_int_into(_add, dreg); _asrc = dreg; }
-            _nlk = cg_int_leaf_kind(_fa);
-            _tn = -1;
-            if (_nlk > 0) { _nsrc = _nlk; }
-            else { _tn = call(p.int_temp_alloc); cg_emit_int_into(_fa, _tn); _nsrc = _tn; }
-            _mlk = cg_int_leaf_kind(_fb);
-            _tm = -1;
-            if (_mlk > 0) { _msrc = _mlk; }
-            else { _tm = call(p.int_temp_alloc); cg_emit_int_into(_fb, _tm); _msrc = _tm; }
-            call(p.emit_imadd, _fop, dreg, _nsrc, _msrc, _asrc);
-            if (_tm >= 0) { call(p.int_temp_free, _tm); }
-            if (_tn >= 0) { call(p.int_temp_free, _tn); }
-            return 0;
+            // The fusion holds BOTH multiplicands in freelist temps at once (an
+            // unfused mul instead reuses dreg for the left operand, one fewer
+            // temp). cg_int_tree_need models the unfused path, so in a
+            // register-tight function the freelist can be one short of the
+            // fusion's real peak — and then int_temp_alloc returns -1 and the
+            // encoder emits a garbage word (SIGILL). Only fuse when the peak
+            // fits; otherwise fall through to the general path, which reuses
+            // dreg for the left operand and needs one fewer temp.
+            _fa_t = 0; if (cg_int_leaf_kind(_fa) <= 0) { _fa_t = 1; }
+            _fb_t = 0; if (cg_int_leaf_kind(_fb) <= 0) { _fb_t = 1; }
+            _peak  = _fa_t + cg_int_tree_need(_fa);             // _tn + computing _fa
+            _peak2 = _fa_t + _fb_t + cg_int_tree_need(_fb);     // _tn held while _fb -> _tm
+            if (_peak2 > _peak) { _peak = _peak2; }
+            if (_peak <= call(p.int_temp_count)) {
+                _alk = cg_int_leaf_kind(_add);
+                if (_alk > 0) { _asrc = _alk; }
+                else { cg_emit_int_into(_add, dreg); _asrc = dreg; }
+                _nlk = cg_int_leaf_kind(_fa);
+                _tn = -1;
+                if (_nlk > 0) { _nsrc = _nlk; }
+                else { _tn = call(p.int_temp_alloc); cg_emit_int_into(_fa, _tn); _nsrc = _tn; }
+                _mlk = cg_int_leaf_kind(_fb);
+                _tm = -1;
+                if (_mlk > 0) { _msrc = _mlk; }
+                else { _tm = call(p.int_temp_alloc); cg_emit_int_into(_fb, _tm); _msrc = _tm; }
+                call(p.emit_imadd, _fop, dreg, _nsrc, _msrc, _asrc);
+                if (_tm >= 0) { call(p.int_temp_free, _tm); }
+                if (_tn >= 0) { call(p.int_temp_free, _tn); }
+                return 0;
+            }
         }
     }
     // Strength reduction: `x * 2^k` is emitted as `x << k`. The left operand
