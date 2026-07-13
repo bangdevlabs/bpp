@@ -16190,3 +16190,62 @@ study-and-orientation map of the whole compiler (pipeline, the spine +
 chip-primitive architecture, every optimization phase, the key
 functions and where they live), so the next reader (human or agent)
 situates fast instead of re-deriving it from 370 KB of dispatch.
+
+## 2026-07-13 — the pre-push shakedown: two pre-existing native codegen bugs that only real games could find
+
+A full pass over every game before pushing, and it earned its keep: two
+latent native-codegen miscompiles surfaced, neither caught by the test
+suite (241/0/12 the whole time), both pre-existing (they reproduce on old
+compilers — the recent const-leaf-CIP / multiply-strength-reduction work
+is clean), and both cracked the same way — **compile the same source
+through `--c` to prove it is codegen and not the code, then `bug --disasm`
+straight to the bad instruction.**
+
+**The platformer — SIGSEGV in the PNG Huffman builder (`da9902a`).** The
+induction-variable pointer walk optimises `base[i]` in a counted loop by
+walking base's OWN promoted register (`add x19, x19, #8` per iteration),
+which permanently advances it. Its whole-function safety scan rejected
+only *bare* uses of base, treating any `base[idx]` access as safe — but
+`_zh_build` (stbpixels' zlib decoder) has two loops over `sizelist`: loop
+one got the walk and left x19 = sizelist+num*8; loop two (which can't walk
+— it has a nested `while`) then read `sizelist[i]` off the advanced x19,
+past the array, giving a garbage code length and a wild `next_code[s]`
+load. `bpp --c` -> gcc decoded the same PNG fine (no IV walk there), which
+named it codegen. Fix: `base[idx]` is a safe walk access only *inside* the
+walking loop — a cg_iv_in_walk_loop flag set per-statement in the scan;
+base referenced in any other statement now disables the walk.
+
+**rts2 — SIGILL in the ECS gather tick (`3ad61fe`).** `bug --disasm` on
+`_gather_visit` showed undecodable words (0xffffffff / 0xffff01ef) in the
+code stream — the encoder handed register -1. The integer madd fusion for
+`grid[a*b + c]` holds both multiplicands in freelist temps at once, but
+the budget gate cg_int_tree_need models the *unfused* mul (which reuses
+dreg for the left operand, one fewer temp). In a leaf-widened function —
+_gather_visit promoted 9 locals into callee-saved + x9..x12, shrinking the
+B1 freelist — the pool was one short, the second int_temp_alloc returned
+-1, and that -1 landed in a register field. The exact class the handoff
+warned about ("an encoder given reg -1 emits garbage") and the same shape
+as the 2026-07-10 spring-segv. Fix: compute the fusion's true peak temp
+need and only fuse when the freelist supplies it; else fall to the general
+mul+add, which reuses dreg and fits.
+
+Both fixes: a64 fixpoint gen2==gen3==gen4, native 241/0/12, C-emit
+199/0/54, x64 self-host gen1==gen2, audio md5 f61fac72 intact, the IV walk
+/ madd fusion still firing where they are safe (no benchmark regression).
+
+One more find, non-crash: a `put_err(path)` W032 in stbasset. The wrong
+instinct is `putstr_err` — it bypasses the smart put/put_err dispatch the
+language is built on. The right fix is one `: str` on the parameter (Rule
+13): put_err reads the argument's TYPE, and the str-consensus inference
+already types almost every other path in stb, so only the one that flows
+from a stored slot field (which consensus can't trace) needed the hint.
+Recorded because I first swept 60 sites to putstr_err before the user
+pointed at the float-faxina doctrine — annotate only what inference can't
+reach, never what it already gets.
+
+The rest of the day: the README cut 955 -> 95 lines (tsoding-tight — one
+tagline, hello-world + a game snippet, quickstart, "what's in the box",
+the four books, honest status), and `compiler_internals.md` deepened
+end-to-end (front half traced to the source, the RegAlloc five-pass
+pipeline and the Mach-O/ELF writers filled in). Full shakedown green:
+every game, Bang 9, mini synth, sound fusion + its plugins.
