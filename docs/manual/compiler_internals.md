@@ -395,21 +395,57 @@ Two allocators cooperate through `cg_var_promote`:
   notion of *when* a local is alive, so with more locals than registers it
   spills some even if they are never all live at once. Always runs, always
   valid.
-- **The linear scan** (`bpp_regalloc.bsm`) is liveness-based: CFG →
-  liveness → live intervals → scan, letting two locals with
-  non-overlapping intervals *share* one register. Its result replaces
-  B3's only when the three gates of §8 step 6 clear. It also promotes into
-  a caller-saved band in non-leaf functions and saves/restores across each
-  call — a cost model (`cg_caller_saved_worth`, shared in the spine)
-  decides when that per-call save pays (`refs > 2× loop-weighted call
-  count`), and a call-liveness mask skips band entries provably dead at a
-  call.
+- **The linear scan** (`bpp_regalloc.bsm`) is liveness-based, letting two
+  locals with non-overlapping live ranges *share* one register. Its result
+  replaces B3's only when the three gates of §8 step 6 clear. It also
+  promotes into a caller-saved band in non-leaf functions and
+  saves/restores across each call — a cost model (`cg_caller_saved_worth`,
+  shared in the spine) decides when that per-call save pays (`refs > 2×
+  loop-weighted call count`), and a call-liveness mask skips band entries
+  provably dead at a call.
 
-The invariant the gates protect: inlined mangled slots are pre-registered
-and B3-promoted, but the interval builder must see *all* their uses — a
-struct-pointer inline local showing a def but no field reads gets a
-degenerate single-point interval, and the swap is refused on any such slot
-(`_rg_var_span_degenerate`) rather than freeing a still-live register.
+The scan is five passes, all in `bpp_regalloc.bsm`, run from
+`cg_emit_func` step 4:
+
+1. **`regalloc_build_cfg`** walks the body into `CfgBlock` records:
+   control flow (`T_IF`/`T_WHILE`) splits blocks and wires successor edges
+   (break/continue via stacks), and inline call sites are *expanded in
+   place* — the callee's statements are cloned with its locals translated
+   to the caller's mangled slots (`_rg_clone_translate`), so the CFG sees
+   inlined code exactly as it will be emitted.
+2. **`regalloc_compute_liveness`** first computes each block's own
+   use/def bitsets with kill-then-gen sequencing (a read is a block-level
+   *use* only if no earlier statement in the block already defined that
+   variable), then solves backward dataflow to a fixpoint:
+   `live_out = ∪ successors' live_in`, `live_in = use ∪ (live_out & ~def)`,
+   looping until nothing changes. Variables are tracked as bits in one
+   64-bit word — **so a function with more than 64 locals falls back to
+   B3** (the scan simply doesn't cover it).
+3. **`regalloc_compute_rpo`** orders blocks in reverse post-order, giving
+   each statement a global *position* faithful to emission order.
+4. **`regalloc_compute_intervals`** turns liveness into `LiveInterval`
+   records: for each block (in RPO), a backward pass reconstructs each
+   statement's "live-after" set from `live_out`, then a forward pass
+   *touches* every live variable at its own global position, opening and
+   extending intervals. A variable alive in two disjoint stretches gets
+   two sub-intervals (a *split*).
+5. **`regalloc_linear_scan(intervals, budget, refs)`** sorts intervals by
+   start position and walks them: **expire** active entries whose end has
+   passed (freeing their slot), then **allocate** a free slot or, if none,
+   **spill** the worst active interval (ranked by reference count and end
+   position). Split variables are handled by holding a slot through the
+   whole *envelope* (max end across the variable's sub-intervals) and a
+   `var_decided` cache so every sub-interval of one variable reaches the
+   same slot. Output is `RegAssign` records (var_idx → slot, or −1 =
+   spill), which the chip's `regalloc_apply` maps to physical registers
+   (`_a64_b3_reg_at`) and writes into `cg_var_promote`.
+
+The invariant the swap gates protect: inlined mangled slots are
+pre-registered and B3-promoted, but the interval builder must see *all*
+their uses — a struct-pointer inline local showing a def but no field
+reads gets a degenerate single-point interval, and the swap is refused on
+any such slot (`_rg_var_span_degenerate`) rather than freeing a
+still-live register.
 
 ---
 
@@ -451,15 +487,44 @@ result slot. Trivial single-return callees take a faster path in the chip
 
 ## 15. The back of the pipeline — encoders and writers
 
-A primitive like `_a64_emit_iop_into` ends in an encoder call
-(`enc_add_reg`, `enc_lsl_imm`, …) that packs the instruction into
-`enc_buf` at `enc_pos`; the buffer grows geometrically. Not-yet-known
-branch/call targets are recorded as fixups and patched later
-(`enc_patch32`); cross-module calls resolve after all modules emit
-(`bo_resolve_calls_*`). The binary writer (`a64_macho.bsm` /
-`x64_elf.bsm`) consumes `enc_buf` plus the string, float, and global
-tables and lays out the Mach-O or ELF file (sections, relocations, symbol
-table, entry point).
+**Encoders.** A primitive like `_a64_emit_iop_into` ends in an encoder
+call (`enc_add_reg`, `enc_lsl_imm`, …) that packs the instruction into the
+code buffer `enc_buf` at `enc_pos`; the buffer grows geometrically.
+Targets not yet known — forward branches, calls — are recorded as fixups
+and patched once their label resolves (`enc_patch32`); cross-module calls
+are resolved after every module has emitted (`bo_resolve_calls_*`), and
+external (FFI) references are recorded as relocations against a GOT.
+
+**The Mach-O writer** (`backend/target/aarch64_macos/a64_macho.bsm`,
+`write_macho(filename, main_label, gl_names, gl_count)`): it takes
+`code_size = enc_pos`, calls `mo_compute_layout` to assign file offsets
+and virtual addresses to every section, sets the entry point to `_main`'s
+offset, and resolves relocations now that addresses are known
+(`mo_resolve_relocations` patches the ADRP+ADD pairs that reference
+globals/strings/floats and the GOT). It then writes the header and load
+commands: `__PAGEZERO` (a 4 GB unmapped guard at address 0), `__TEXT`
+(header + load commands + `__text` code, at base `0x1_0000_0000`),
+`__DATA` (the `__data` section = globals + floats + strings + GOT, plus a
+`__minisym` blob the runtime reads for symbolication), and `__LINKEDIT`;
+then `LC_SYMTAB` (the `nlist_64` symbol table), `LC_MAIN` (the entry
+offset), one `LC_LOAD_DYLIB` per linked library (`libSystem` is ordinal
+1), `LC_UUID` (carrying the build id so the `bug` debugger can match a
+binary to its `.bug` map), and chained-fixups commands. A SHA-256 pass
+(`sha256`, implemented in-file) fills the code-signature slot so macOS
+will run the binary unsigned-but-adhoc.
+
+**The ELF writer** (`backend/target/x86_64_linux/x64_elf.bsm`,
+`write_elf` / `write_elf_dyn`): base address `0x400000`; the file is the
+ELF header + program headers, then a `PT_NOTE` region (always present —
+it carries the build id), then the code and data. It emits two or three
+program headers: `PT_LOAD` for text (`r-x`), `PT_LOAD` for data (`rw-`,
+only if there is any), and the note. `e_entry` is the entry virtual
+address. A purely static program uses `write_elf`; a program with FFI
+externs uses `write_elf_dyn`, which adds the dynamic-linking machinery
+(PLT/GOT, `.dynamic`, `.dynsym`, relocations) so `ld.so` resolves the
+external symbols at load. Both writers consume the same `enc_buf` and the
+same string/float/global tables — only the container format differs,
+which is the whole point of keeping code emission (§8–14) format-agnostic.
 
 ---
 
